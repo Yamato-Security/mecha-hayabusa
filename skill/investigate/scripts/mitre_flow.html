@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic",
+                 "Noto Sans CJK JP", "Segoe UI", sans-serif;
+    background: #fafafa;
+  }
+  #chart { width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script>{{ECHARTS_JS}}</script>
+<script>
+(function() {
+  /* ---- data injected by Python ---- */
+  var TITLE = {{TITLE_JSON}};
+  var NODES = {{NODES_JSON}};
+  var LINKS = {{LINKS_JSON}};
+
+  /* ---- tooltip formatter ---- */
+  function tooltipFormatter(params) {
+    if (!params.data) return '';
+    // Tactic node
+    if (params.data.tacticInfo) {
+      var t = params.data.tacticInfo;
+      var html = '<div style="max-width:420px;word-wrap:break-word;">'
+        + '<b style="font-size:14px;">' + t.name + '</b> <span style="color:#888;">(' + t.id + ')</span><br/>';
+      if (t.event_count) html += '<span style="color:#666;">Events:</span> ' + t.event_count + '<br/>';
+      if (t.time_range) html += '<span style="color:#666;">Time:</span> ' + t.time_range + '<br/>';
+      if (t.hosts && t.hosts.length) html += '<span style="color:#666;">Hosts:</span> ' + t.hosts.join(', ') + '<br/>';
+      if (t.techniques && t.techniques.length) {
+        html += '<span style="color:#666;">Techniques:</span><br/>';
+        t.techniques.forEach(function(tech) {
+          html += '&nbsp;&nbsp;• ' + tech + '<br/>';
+        });
+      }
+      html += '</div>';
+      return html;
+    }
+    // Technique node
+    if (params.dataType === 'node') {
+      return '<b>' + params.data.name + '</b>';
+    }
+    return '';
+  }
+
+  /* ---- build ECharts option ---- */
+  var option = {
+    title: {
+      text: TITLE,
+      left: 'center',
+      top: 10,
+      textStyle: { fontSize: 16, fontWeight: 'bold' }
+    },
+    tooltip: {
+      trigger: 'item',
+      formatter: tooltipFormatter,
+      backgroundColor: 'rgba(255,255,255,0.95)',
+      borderColor: '#ccc',
+      textStyle: { fontSize: 12 },
+      extraCssText: 'max-width:450px;white-space:normal;'
+    },
+    legend: [{
+      bottom: 10,
+      data: [
+        { name: 'Tactic', icon: 'circle' },
+        { name: 'Technique', icon: 'circle' }
+      ]
+    }],
+    series: [{
+      type: 'graph',
+      layout: 'none',
+      roam: true,
+      draggable: true,
+      focusNodeAdjacency: true,
+      edgeSymbol: ['none', 'arrow'],
+      edgeSymbolSize: [0, 10],
+      categories: [
+        { name: 'Tactic' },
+        { name: 'Technique' }
+      ],
+      nodes: NODES,
+      links: LINKS,
+      lineStyle: { opacity: 0.8 },
+      emphasis: {
+        focus: 'adjacency',
+        lineStyle: { width: 4 }
+      }
+    }]
+  };
+
+  /* ---- init chart ---- */
+  var chart = echarts.init(document.getElementById('chart'));
+  chart.setOption(option);
+  window.addEventListener('resize', function() { chart.resize(); });
+})();
+</script>
+</body>
+</html>

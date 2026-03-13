@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic",
+                 "Noto Sans CJK JP", "Segoe UI", sans-serif;
+    background: #fafafa;
+  }
+
+  /* ---- toolbar ---- */
+  #toolbar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+    background: #fff; border-bottom: 1px solid #e0e0e0; flex-wrap: wrap;
+  }
+  #toolbar label { font-size: 13px; color: #555; font-weight: 600; }
+  #toolbar input[type="date"] {
+    padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;
+  }
+  #toolbar .sep { color: #999; font-size: 13px; }
+  #toolbar button {
+    padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px;
+    background: #fff; font-size: 12px; cursor: pointer; white-space: nowrap;
+  }
+  #toolbar button:hover { background: #f0f0f0; }
+  #toolbar button.active { background: #1976D2; color: #fff; border-color: #1976D2; }
+  #date-buttons { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+  #date-buttons .date-btn { font-size: 11px; padding: 3px 8px; }
+  #summary { font-size: 12px; color: #666; margin-left: auto; white-space: nowrap; }
+
+  /* ---- phase list (vertical blocks) ---- */
+  #phase-list {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    padding: 8px 16px; background: #fff; border-bottom: 1px solid #eee;
+  }
+  #phase-list:empty { display: none; }
+  .phase-block {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 12px; border-radius: 4px;
+    font-size: 12px; color: #333; cursor: default;
+    border-left: 4px solid;
+  }
+  .phase-block .phase-name { font-weight: 600; }
+  .phase-block .phase-time { color: #777; font-size: 11px; }
+
+  /* ---- chart wrapper ---- */
+  #chart-wrap { }
+  #chart { width: 100%; height: 600px; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <label>期間:</label>
+  <input type="date" id="date-start">
+  <span class="sep">〜</span>
+  <input type="date" id="date-end">
+  <button id="btn-apply" onclick="applyRange()">適用</button>
+  <button id="btn-reset" onclick="resetRange()">全期間</button>
+  <div id="date-buttons"></div>
+  <div id="summary"></div>
+</div>
+
+<div id="phase-list"></div>
+
+<div id="chart-wrap">
+  <div id="chart"></div>
+</div>
+
+<script>{{ECHARTS_JS}}</script>
+<script>
+(function() {
+  /* ---- data injected by Python ---- */
+  var ALL_EVENTS = {{ALL_EVENTS_JSON}};
+  var PHASES     = {{PHASES_JSON}};
+  var TIME_GAPS  = {{TIME_GAPS_JSON}};
+  var SEGMENTS   = {{SEGMENTS_JSON}};
+  var TITLE      = {{TITLE_JSON}};
+
+  /* ---- constants ---- */
+  var LEVEL_STYLES = {
+    crit: { color: '#DC143C', symbol: 'diamond',  size: 18, label: 'Critical' },
+    high: { color: '#FF8C00', symbol: 'circle',   size: 14, label: 'High' },
+    med:  { color: '#FFD700', symbol: 'rect',     size: 12, label: 'Medium' },
+    low:  { color: '#4682B4', symbol: 'triangle', size: 10, label: 'Low' },
+    info: { color: '#A9A9A9', symbol: 'circle',   size: 8,  label: 'Info' }
+  };
+  var PHASE_COLORS = [
+    '#E57373','#64B5F6','#81C784','#FFD54F','#BA68C8','#F06292','#4DD0E1','#FFB74D'
+  ];
+  var PHASE_BG_COLORS = [
+    'rgba(229,115,115,0.12)','rgba(100,181,246,0.12)','rgba(129,199,132,0.12)',
+    'rgba(255,213,79,0.12)','rgba(186,104,200,0.12)','rgba(240,98,146,0.12)',
+    'rgba(77,208,225,0.12)','rgba(255,183,77,0.12)'
+  ];
+  var GAP_DISPLAY_MS = 3600000; /* compressed gap = 1 hour visual width */
+
+  /* ---- DOM refs ---- */
+  var inputStart = document.getElementById('date-start');
+  var inputEnd   = document.getElementById('date-end');
+  var chartDom   = document.getElementById('chart');
+  var phaseList  = document.getElementById('phase-list');
+  var chart      = null;
+
+  /* ================================================================
+   *  Time compression: map real timestamps to display coordinates
+   *  that skip over large gaps between segments
+   * ================================================================ */
+  function buildTimeMap(segs) {
+    if (!segs || segs.length === 0) return null;
+    var ranges = [];
+    var offset = 0;
+    for (var i = 0; i < segs.length; i++) {
+      var realSpan = segs[i][1] - segs[i][0];
+      ranges.push({
+        realStart: segs[i][0], realEnd: segs[i][1],
+        dispStart: offset, dispEnd: offset + realSpan
+      });
+      offset += realSpan;
+      if (i < segs.length - 1) offset += GAP_DISPLAY_MS;
+    }
+    return {
+      ranges: ranges,
+      totalSpan: offset,
+      toDisp: function(ts) {
+        for (var i = 0; i < ranges.length; i++) {
+          var r = ranges[i];
+          if (ts <= r.realEnd) {
+            if (ts < r.realStart) return r.dispStart;
+            return r.dispStart + (ts - r.realStart);
+          }
+          if (i < ranges.length - 1 && ts < ranges[i+1].realStart) {
+            /* inside a gap — map to gap midpoint */
+            return r.dispEnd + GAP_DISPLAY_MS * 0.5;
+          }
+        }
+        return ranges[ranges.length - 1].dispEnd;
+      },
+      toReal: function(disp) {
+        for (var i = 0; i < ranges.length; i++) {
+          var r = ranges[i];
+          if (disp >= r.dispStart && disp <= r.dispEnd) {
+            return r.realStart + (disp - r.dispStart);
+          }
+        }
+        return NaN; /* in a gap — no valid timestamp */
+      },
+      hasMultipleSegments: function() { return ranges.length > 1; }
+    };
+  }
+
+  /* Build global time map from all segments */
+  var globalTimeMap = buildTimeMap(SEGMENTS);
+
+  /* Should we use compression? Only when multiple segments exist */
+  function useCompression(filtered) {
+    if (!globalTimeMap || !globalTimeMap.hasMultipleSegments()) return false;
+    /* Check if filtered events span multiple segments */
+    if (!filtered || filtered.length < 2) return false;
+    var ts = filtered.map(function(e) { return new Date(e.timestamp).getTime(); });
+    var mn = Math.min.apply(null, ts), mx = Math.max.apply(null, ts);
+    var segsInRange = 0;
+    for (var i = 0; i < SEGMENTS.length; i++) {
+      if (SEGMENTS[i][1] >= mn && SEGMENTS[i][0] <= mx) segsInRange++;
+    }
+    return segsInRange > 1;
+  }
+
+  function fmtMs(ms) {
+    var d = new Date(ms);
+    var mm = ('0'+(d.getUTCMonth()+1)).slice(-2);
+    var dd = ('0'+d.getUTCDate()).slice(-2);
+    var hh = ('0'+d.getUTCHours()).slice(-2);
+    var mi = ('0'+d.getUTCMinutes()).slice(-2);
+    return mm+'/'+dd+' '+hh+':'+mi;
+  }
+  function fmtDate(ms) {
+    var d = new Date(ms);
+    return ('0'+(d.getUTCMonth()+1)).slice(-2)+'/'+('0'+d.getUTCDate()).slice(-2);
+  }
+
+  /* ---- tooltip formatter ---- */
+  function tooltipFormatter(params) {
+    if (!params.data || !params.data.event) return '';
+    var e = params.data.event;
+    var lc = { crit:'#DC143C', high:'#FF8C00', med:'#FFD700', low:'#4682B4', info:'#A9A9A9' };
+    var c = lc[e.level] || '#666';
+    return '<div style="max-width:400px;word-wrap:break-word;">'
+      + '<b style="color:' + c + '">[' + e.level.toUpperCase() + ']</b> '
+      + '<b>' + (e.rule || '') + '</b><br/>'
+      + '<span style="color:#666">Host:</span> ' + e.host + '<br/>'
+      + '<span style="color:#666">Time:</span> ' + e.timestamp + '<br/>'
+      + (e.mitre ? '<span style="color:#666">MITRE:</span> ' + e.mitre + '<br/>' : '')
+      + '</div>';
+  }
+
+  /* ---- date bookkeeping ---- */
+  var dateMap = {};
+  ALL_EVENTS.forEach(function(e) {
+    var d = e.timestamp.substring(0, 10);
+    if (!dateMap[d]) dateMap[d] = { total:0, crit:0, high:0 };
+    dateMap[d].total++;
+    if (e.level === 'crit') dateMap[d].crit++;
+    if (e.level === 'high') dateMap[d].high++;
+  });
+  var dates = Object.keys(dateMap).sort();
+
+  if (dates.length) {
+    inputStart.value = dates[0]; inputEnd.value = dates[dates.length-1];
+    inputStart.min = dates[0];   inputStart.max = dates[dates.length-1];
+    inputEnd.min   = dates[0];   inputEnd.max   = dates[dates.length-1];
+  }
+
+  /* ---- date quick-select buttons ---- */
+  var btnContainer = document.getElementById('date-buttons');
+  dates.forEach(function(d) {
+    var info = dateMap[d];
+    var btn = document.createElement('button');
+    btn.className = 'date-btn';
+    btn.textContent = d;
+    if (info.crit > 0) btn.style.borderColor = '#DC143C';
+    else if (info.high > 0) btn.style.borderColor = '#FF8C00';
+    btn.title = 'Total: ' + info.total + ' (crit: ' + info.crit + ', high: ' + info.high + ')';
+    btn.onclick = function() { selectDate(d); };
+    btnContainer.appendChild(btn);
+  });
+
+  /* ---- format timestamp ---- */
+  function fmtTime(ts) {
+    var m = ts.match(/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    if (!m) return ts;
+    return m[2] + '/' + m[3] + ' ' + m[4] + ':' + m[5];
+  }
+
+  /* ---- phase list ---- */
+  function renderPhaseList() {
+    phaseList.innerHTML = '';
+    if (!PHASES.length) return;
+    PHASES.forEach(function(p, i) {
+      var block = document.createElement('div');
+      block.className = 'phase-block';
+      var c = PHASE_COLORS[i % PHASE_COLORS.length];
+      block.style.borderLeftColor = c;
+      block.style.background = PHASE_BG_COLORS[i % PHASE_BG_COLORS.length];
+      var name = document.createElement('span');
+      name.className = 'phase-name';
+      name.textContent = p.name;
+      block.appendChild(name);
+      var time = document.createElement('span');
+      time.className = 'phase-time';
+      time.textContent = fmtTime(p.start) + ' ~ ' + fmtTime(p.end);
+      block.appendChild(time);
+      phaseList.appendChild(block);
+    });
+  }
+
+  /* ---- build ECharts option ---- */
+  function buildOption(filtered) {
+    var compressed = useCompression(filtered);
+    var tmap = compressed ? globalTimeMap : null;
+
+    var hosts = [];
+    filtered.forEach(function(e) {
+      if (hosts.indexOf(e.host) === -1) hosts.push(e.host);
+    });
+
+    /* Jitter: offset overlapping markers at the same (timestamp, host) */
+    var LEVEL_ORDER = ['crit','high','med','low','info'];
+    var tsHostLevels = {};
+    filtered.forEach(function(e) {
+      var key = e.timestamp + '|' + e.host;
+      if (!tsHostLevels[key]) tsHostLevels[key] = {};
+      tsHostLevels[key][e.level] = true;
+    });
+
+    /* Compute x-axis span to determine jitter amount in display units */
+    var allXVals = filtered.map(function(e) {
+      var realTs = new Date(e.timestamp).getTime();
+      return tmap ? tmap.toDisp(realTs) : realTs;
+    });
+    var xSpan = Math.max.apply(null, allXVals) - Math.min.apply(null, allXVals);
+    var jitterStep = xSpan * 0.006; /* small fraction of visible range */
+
+    var seriesByLevel = {};
+    filtered.forEach(function(e) {
+      var realTs = new Date(e.timestamp).getTime();
+      var xVal = tmap ? tmap.toDisp(realTs) : realTs;
+      var key = e.timestamp + '|' + e.host;
+      var levels = tsHostLevels[key];
+      var count = Object.keys(levels).length;
+      if (count > 1) {
+        /* Find this level's position among overlapping levels */
+        var present = LEVEL_ORDER.filter(function(l) { return levels[l]; });
+        var idx = present.indexOf(e.level);
+        /* Center the group: offset = (idx - (count-1)/2) * step */
+        xVal += (idx - (count - 1) / 2) * jitterStep;
+      }
+      if (!seriesByLevel[e.level]) seriesByLevel[e.level] = [];
+      seriesByLevel[e.level].push({
+        value: [xVal, hosts.indexOf(e.host)],
+        event: e
+      });
+    });
+
+    var series = [];
+    ['crit','high','med','low','info'].forEach(function(lv) {
+      if (!seriesByLevel[lv]) return;
+      var st = LEVEL_STYLES[lv];
+      series.push({
+        name: st.label, type: 'scatter',
+        symbolSize: st.size, symbol: st.symbol,
+        itemStyle: { color: st.color, borderColor: '#333', borderWidth: 0.5, opacity: 0.85 },
+        data: seriesByLevel[lv],
+        z: ['crit','high','med','low','info'].indexOf(lv) + 1
+      });
+    });
+
+    /* mark areas: phase bands */
+    var markData = [];
+    PHASES.forEach(function(p, i) {
+      var ps = tmap ? tmap.toDisp(new Date(p.start).getTime()) : new Date(p.start).getTime();
+      var pe = tmap ? tmap.toDisp(new Date(p.end).getTime()) : new Date(p.end).getTime();
+      markData.push([
+        { xAxis: ps, itemStyle: { color: PHASE_BG_COLORS[i % PHASE_BG_COLORS.length] }, label: { show: false } },
+        { xAxis: pe }
+      ]);
+    });
+    /* gap indicators (only in compressed mode) */
+    if (tmap) {
+      for (var i = 0; i < tmap.ranges.length - 1; i++) {
+        var gStart = tmap.ranges[i].dispEnd;
+        var gEnd = tmap.ranges[i+1].dispStart;
+        markData.push([
+          { xAxis: gStart, itemStyle: { color: 'rgba(200,200,200,0.35)', borderColor: '#aaa', borderWidth: 1, borderType: 'dashed' }, label: { show: true, position: 'insideTop', formatter: '⋯', fontSize: 16, color: '#999' } },
+          { xAxis: gEnd }
+        ]);
+      }
+    }
+    if (markData.length && series.length) {
+      series[0].markArea = { silent: true, data: markData };
+    }
+
+    /* markLine: date labels at the start of each date's data */
+    var dateFirstTs = {};
+    filtered.forEach(function(e) {
+      var dateStr = e.timestamp.substring(0, 10); /* YYYY-MM-DD */
+      var ts = new Date(e.timestamp).getTime();
+      if (dateFirstTs[dateStr] === undefined || ts < dateFirstTs[dateStr]) {
+        dateFirstTs[dateStr] = ts;
+      }
+    });
+    var markLineData = [];
+    Object.keys(dateFirstTs).sort().forEach(function(dateStr) {
+      var realTs = dateFirstTs[dateStr];
+      var xVal = tmap ? tmap.toDisp(realTs) : realTs;
+      var parts = dateStr.split('-');
+      var lbl = parts[1] + '/' + parts[2];
+      markLineData.push({
+        xAxis: xVal,
+        label: { show: true, formatter: lbl, fontSize: 11, fontWeight: 'bold', color: '#555', position: 'start' },
+        lineStyle: { color: '#bbb', type: 'dashed', width: 1 }
+      });
+    });
+    if (markLineData.length && series.length) {
+      series[0].markLine = { silent: true, symbol: 'none', data: markLineData, animation: false };
+    }
+
+    /* x-axis config */
+    var xAxisCfg;
+    if (tmap) {
+      /* Compressed mode: value axis with custom labels */
+      xAxisCfg = {
+        type: 'value',
+        min: tmap.ranges[0].dispStart,
+        max: tmap.ranges[tmap.ranges.length - 1].dispEnd,
+        axisLabel: { show: false },
+        axisTick: { show: false },
+        splitLine: { show: true, lineStyle: { type: 'dashed', opacity: 0.3 } }
+      };
+    } else {
+      /* Normal mode: time axis */
+      xAxisCfg = {
+        type: 'time', name: 'Time (UTC)', nameLocation: 'center', nameGap: 35,
+        axisLabel: { fontSize: 10 },
+        splitLine: { show: true, lineStyle: { type: 'dashed', opacity: 0.3 } }
+      };
+    }
+
+    return {
+      tooltip: {
+        trigger: 'item', formatter: tooltipFormatter,
+        backgroundColor: 'rgba(255,255,255,0.95)', borderColor: '#ccc',
+        textStyle: { fontSize: 12 }
+      },
+      legend: { bottom: 4, data: series.map(function(s) { return s.name; }) },
+      grid: { left: 140, right: 40, top: 20, bottom: 90 },
+      xAxis: xAxisCfg,
+      yAxis: {
+        type: 'category', data: hosts,
+        axisLabel: { fontSize: 11, fontWeight: 'bold' },
+        splitLine: { show: true, lineStyle: { opacity: 0.1 } }
+      },
+      dataZoom: [
+        { type: 'inside', xAxisIndex: 0 },
+        { type: 'slider', xAxisIndex: 0, bottom: 30, height: 20,
+          labelFormatter: tmap
+            ? function(val) { var r = tmap.toReal(val); return isNaN(r) ? '' : fmtMs(r); }
+            : '' }
+      ],
+      series: series
+    };
+  }
+
+  /* ---- filter / UI helpers ---- */
+  function filterEvents(startDate, endDate) {
+    var s = new Date(startDate + 'T00:00:00Z').getTime();
+    var e = new Date(endDate   + 'T23:59:59Z').getTime();
+    return ALL_EVENTS.filter(function(ev) {
+      var t = new Date(ev.timestamp).getTime();
+      return t >= s && t <= e;
+    });
+  }
+
+  function updateSummary(filtered) {
+    var c = { crit:0, high:0, med:0, low:0, info:0 };
+    filtered.forEach(function(e) { if (c[e.level] !== undefined) c[e.level]++; });
+    document.getElementById('summary').textContent =
+      filtered.length + '件 (crit:' + c.crit + ' high:' + c.high +
+      ' med:' + c.med + ' low:' + c.low + ' info:' + c.info + ')';
+  }
+
+  function clearActiveButtons() {
+    document.querySelectorAll('#date-buttons .date-btn').forEach(function(b) {
+      b.classList.remove('active');
+    });
+  }
+
+  function resizeChartHeight() {
+    var used = document.getElementById('toolbar').offsetHeight + phaseList.offsetHeight;
+    chartDom.style.height = Math.max(window.innerHeight - used - 8, 300) + 'px';
+  }
+
+  function render(filtered) {
+    if (!filtered.length) { if (chart) chart.clear(); updateSummary(filtered); return; }
+    resizeChartHeight();
+    if (!chart) chart = echarts.init(chartDom);
+    chart.resize();
+    chart.setOption(buildOption(filtered), true);
+    updateSummary(filtered);
+  }
+
+  /* ---- public actions ---- */
+  window.applyRange = function() {
+    clearActiveButtons();
+    render(filterEvents(inputStart.value, inputEnd.value));
+  };
+  window.resetRange = function() {
+    clearActiveButtons();
+    if (dates.length) { inputStart.value = dates[0]; inputEnd.value = dates[dates.length-1]; }
+    render(ALL_EVENTS);
+  };
+  window.selectDate = function(d) {
+    clearActiveButtons();
+    document.querySelectorAll('#date-buttons .date-btn').forEach(function(b) {
+      if (b.textContent === d) b.classList.add('active');
+    });
+    inputStart.value = d; inputEnd.value = d;
+    render(filterEvents(d, d));
+  };
+
+  inputStart.addEventListener('keydown', function(e) { if (e.key === 'Enter') applyRange(); });
+  inputEnd.addEventListener('keydown',   function(e) { if (e.key === 'Enter') applyRange(); });
+
+  /* ---- initial render ---- */
+  renderPhaseList();
+  requestAnimationFrame(function() { render(ALL_EVENTS); });
+  window.addEventListener('resize', function() {
+    resizeChartHeight();
+    if (chart) chart.resize();
+  });
+})();
+</script>
+</body>
+</html>
