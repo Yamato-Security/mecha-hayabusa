@@ -24,7 +24,7 @@ SEARCH_RESULT_COLUMNS = ("Timestamp", "Computer", "RuleTitle", "Level", "Channel
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f %z"
 
 class _WideDisplayDataFrame(pd.DataFrame):
-    """parse_details_field 専用 DataFrame。str/repr 時のみ全カラム・全幅で表示する。"""
+    """DataFrame dedicated to parse_details_field. Displays all columns at full width only during str/repr."""
 
     @property
     def _constructor(self):
@@ -61,25 +61,25 @@ IOC_FIELD_CATEGORIES = {
 }
 
 TACTICS_MAP = {
-    "InitAccess": "初期アクセス",
-    "Exec": "実行",
-    "Persis": "永続化",
-    "PrivEsc": "特権昇格",
-    "Evas": "防御回避",
-    "CredAccess": "認証情報窃取",
-    "Disc": "偵察",
-    "LatMov": "横方向移動",
-    "Collect": "収集",
-    "C2": "C2通信",
-    "Exfil": "データ持ち出し",
-    "Impact": "影響",
-    "Recon": "偵察",
-    "ResDev": "リソース開発",
+    "InitAccess": "Initial Access",
+    "Exec": "Execution",
+    "Persis": "Persistence",
+    "PrivEsc": "Privilege Escalation",
+    "Evas": "Defense Evasion",
+    "CredAccess": "Credential Access",
+    "Disc": "Discovery",
+    "LatMov": "Lateral Movement",
+    "Collect": "Collection",
+    "C2": "Command and Control",
+    "Exfil": "Exfiltration",
+    "Impact": "Impact",
+    "Recon": "Reconnaissance",
+    "ResDev": "Resource Development",
 }
 
 
 class DuckDBRepository:
-    """DuckDB操作をまとめたユーティリティラッパー。"""
+    """Utility wrapper consolidating DuckDB operations."""
 
     def __init__(self, db_path: pathlib.Path) -> None:
         self.db_path = db_path
@@ -145,7 +145,7 @@ class DuckDBRepository:
             con.execute("DELETE FROM mcp_state WHERE key IN ('dataset_path', 'loaded_at')")
 
     def query_dataframe(self, sql: str, params: Sequence[object] | None = None) -> pd.DataFrame:
-        """read_only接続でSELECT結果をDataFrameに変換する。"""
+        """Execute a SELECT query via read-only connection and return the result as a DataFrame."""
         with duckdb.connect(str(self.db_path), read_only=True) as con:
             if params:
                 return con.execute(sql, params).df()
@@ -242,11 +242,11 @@ _LOG_COLUMNS_CACHE: set[str] | None = None
 
 def init_db(dataset: pathlib.Path) -> None:
     """
-    指定されたCSVデータセットを読み込み、DuckDBデータベースを初期化します。
-    既存のlogsテーブルがある場合は置き換えます。
+    Load the specified CSV dataset and initialize the DuckDB database.
+    Replaces the existing logs table if one exists.
 
     Parameters:
-        dataset: 読み込むCSVファイルのパス
+        dataset: Path to the CSV file to load
     """
     global _LOG_COLUMNS_CACHE
     row_count = repo.load_csv_dataset(dataset)
@@ -275,7 +275,7 @@ def _status_to_dataframe(status: dict[str, object]) -> pd.DataFrame:
 def _quote_identifier(name: str) -> str:
     stripped = name.strip()
     if not stripped or '"' in stripped:
-        raise ValueError(f"不正なカラム名です: {name}")
+        raise ValueError(f"Invalid column name: {name}")
     return f'"{stripped}"'
 
 
@@ -288,10 +288,10 @@ def _get_logs_columns() -> set[str]:
 
 def _ensure_database_ready() -> None:
     if not repo.is_initialised():
-        raise RuntimeError("Hayabusa DB が初期化されていません。switch_dataset ツールでCSVをロードしてください。")
+        raise RuntimeError("Hayabusa DB is not initialized. Please load a CSV using the switch_dataset tool.")
     columns = _get_logs_columns()
     if not columns:
-        raise RuntimeError("logs テーブルが見つかりません。switch_dataset ツールでCSVをロードしてください。")
+        raise RuntimeError("logs table not found. Please load a CSV using the switch_dataset tool.")
 
 
 def _ensure_columns_exist(columns: Sequence[str], context: str) -> None:
@@ -303,8 +303,8 @@ def _ensure_columns_exist(columns: Sequence[str], context: str) -> None:
     missing_label = ", ".join(sorted(set(missing)))
     available_label = ", ".join(sorted(existing))
     raise ValueError(
-        f"{context}: 必要なカラムが存在しません ({missing_label})。"
-        f" 利用可能カラム: {available_label}"
+        f"{context}: Required columns are missing ({missing_label})."
+        f" Available columns: {available_label}"
     )
 
 
@@ -326,11 +326,11 @@ def _resolve_pagination(
 
     if resolved_size <= 0 or resolved_size > max_page_size:
         raise ValueError(
-            f"page_size は 1 〜 {max_page_size} の範囲で指定してください。"
-            f"（互換引数 {legacy_name} も同範囲）"
+            f"page_size must be between 1 and {max_page_size}."
+            f" (legacy argument {legacy_name} has the same range)"
         )
     if page_offset < 0:
-        raise ValueError("page_offset は 0 以上で指定してください。")
+        raise ValueError("page_offset must be 0 or greater.")
     return resolved_size, page_offset
 
 
@@ -344,7 +344,7 @@ def _query_with_pagination(
 ) -> tuple[pd.DataFrame, int | None]:
     normalized_sql = sql.strip().rstrip(";").strip()
     if not normalized_sql:
-        raise ValueError("SQLが空です。")
+        raise ValueError("SQL is empty.")
 
     total_count: int | None = None
     if include_total:
@@ -465,41 +465,41 @@ def _collect_plan_sources(plan_nodes: Sequence[dict[str, object]]) -> tuple[set[
 
 def _validate_select_on_logs_only(sql: str) -> str:
     if not sql or not sql.strip():
-        raise ValueError("SQLを入力してください。")
+        raise ValueError("Please enter a SQL statement.")
 
     try:
         statements = duckdb.extract_statements(sql)
     except duckdb.Error as exc:
-        raise ValueError(f"SQLの構文が不正です: {exc}") from exc
+        raise ValueError(f"Invalid SQL syntax: {exc}") from exc
 
     if len(statements) != 1:
-        raise ValueError("run_sql は単一の SELECT 文のみ実行できます。")
+        raise ValueError("run_sql can only execute a single SELECT statement.")
 
     statement = statements[0]
     if statement.type != duckdb.StatementType.SELECT:
-        raise ValueError("run_sql は SELECT 文のみ実行できます。")
+        raise ValueError("run_sql can only execute SELECT statements.")
 
     normalized_sql = statement.query.strip().rstrip(";").strip()
     if not normalized_sql:
-        raise ValueError("SQLを入力してください。")
+        raise ValueError("Please enter a SQL statement.")
 
     try:
         plan_nodes = repo.explain_json(normalized_sql)
     except duckdb.Error as exc:
-        raise ValueError("run_sql は logs テーブルを参照する SELECT 文のみ実行できます。") from exc
+        raise ValueError("run_sql can only execute SELECT statements that reference the logs table.") from exc
 
     scanned_tables, scanned_functions = _collect_plan_sources(plan_nodes)
 
     if scanned_functions:
         refs = ", ".join(sorted(scanned_functions))
-        raise ValueError(f"run_sql ではテーブル関数/システム関数は使用できません: {refs}")
+        raise ValueError(f"run_sql does not allow table functions or system functions: {refs}")
 
     if not scanned_tables:
-        raise ValueError("run_sql は logs テーブルを参照する SELECT 文のみ実行できます。")
+        raise ValueError("run_sql can only execute SELECT statements that reference the logs table.")
 
     if scanned_tables != {"logs"}:
         refs = ", ".join(sorted(scanned_tables))
-        raise ValueError(f"run_sql は logs テーブルのみ参照できます。検出参照: {refs}")
+        raise ValueError(f"run_sql can only reference the logs table. Detected references: {refs}")
 
     return normalized_sql
 
@@ -534,18 +534,18 @@ def _search_csv_files(base_dir: pathlib.Path, recursive: bool, name_filter: str 
 def _resolve_dataset_target(target: str, search_root: str = ".", recursive: bool = True, search_limit: int = DATASET_LIST_MAX_ROWS) -> pathlib.Path:
     target_text = target.strip()
     if not target_text:
-        raise ValueError("target を指定してください。")
+        raise ValueError("Please specify a target.")
 
     explicit = pathlib.Path(target_text).expanduser()
     if explicit.exists() and explicit.is_file():
         resolved = explicit.resolve()
         if resolved.suffix.lower() != ".csv":
-            raise ValueError(f"CSVファイルを指定してください: {resolved}")
+            raise ValueError(f"Please specify a CSV file: {resolved}")
         return resolved
 
     root = pathlib.Path(search_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise ValueError(f"search_root が不正です: {root}")
+        raise ValueError(f"Invalid search_root: {root}")
 
     target_lower = target_text.lower()
     matches: list[pathlib.Path] = []
@@ -568,27 +568,27 @@ def _resolve_dataset_target(target: str, search_root: str = ".", recursive: bool
 
     if not matches:
         raise ValueError(
-            f"CSV候補が見つかりません: {target_text}. "
-            "list_datasets で候補を確認してください。"
+            f"No CSV candidates found: {target_text}. "
+            "Please check candidates using list_datasets."
         )
 
     if len(matches) > 1:
         candidates = ", ".join(_format_path_for_display(path) for path in matches[:5])
         raise ValueError(
-            f"候補が複数あります: {target_text}. "
-            f"より具体的なパスを指定してください。候補例: {candidates}"
+            f"Multiple candidates found: {target_text}. "
+            f"Please specify a more specific path. Candidates: {candidates}"
         )
 
     return matches[0]
 
 
 # ──────────────────────────────────────────
-# ツール定義
+# Tool definitions
 # ──────────────────────────────────────────
 @app.tool()
 def get_dataset_status():
     """
-    現在ロードされているデータセット状態を返します。
+    Returns the status of the currently loaded dataset.
     """
     status = repo.get_dataset_status()
     return _status_to_dataframe(status)
@@ -604,15 +604,15 @@ def list_datasets(
     limit: int | None = None,
 ):
     """
-    解析候補のCSVファイル一覧を返します。
+    Returns a list of CSV files available for analysis.
 
     Parameters:
-        search_root (str): 探索開始ディレクトリ
-        recursive (bool): サブディレクトリを再帰探索するか
-        name_filter (str): ファイル名部分一致フィルタ
-        page_size (int): 1ページあたりの件数（1〜500）
-        page_offset (int): 取得開始オフセット（0以上）
-        limit (int | None): 後方互換用。指定時は page_size として扱う
+        search_root (str): Starting directory for search
+        recursive (bool): Whether to recursively search subdirectories
+        name_filter (str): Partial match filter for file names
+        page_size (int): Number of items per page (1-500)
+        page_offset (int): Starting offset for retrieval (0 or greater)
+        limit (int | None): Legacy parameter. When specified, treated as page_size
     """
     page_size, page_offset = _resolve_pagination(
         page_size,
@@ -625,7 +625,7 @@ def list_datasets(
 
     root = pathlib.Path(search_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise ValueError(f"search_root が不正です: {root}")
+        raise ValueError(f"Invalid search_root: {root}")
 
     files = _search_csv_files(root, recursive=recursive, name_filter=name_filter)
     paged_files = files[page_offset : page_offset + page_size]
@@ -650,7 +650,7 @@ def list_datasets(
                 page_size=page_size,
                 page_offset=page_offset,
                 status="no_data",
-                message="指定ページにCSV候補はありません",
+                message="No CSV candidates on the specified page",
             )
         return _attach_pagination_metadata(
             pd.DataFrame(),
@@ -658,7 +658,7 @@ def list_datasets(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="CSVが見つかりませんでした",
+            message="No CSV files found",
         )
 
     return _attach_pagination_metadata(
@@ -672,12 +672,12 @@ def list_datasets(
 @app.tool()
 def switch_dataset(target: str = "", search_root: str = ".", recursive: bool = True):
     """
-    指定したCSVに解析対象を切り替えます。
+    Switch the analysis target to the specified CSV.
 
     Parameters:
-        target (str): CSVのパス / ファイル名 / エイリアス（stem）
-        search_root (str): targetがパスでない場合の探索起点
-        recursive (bool): サブディレクトリ探索を行うか
+        target (str): CSV path / filename / alias (stem)
+        search_root (str): Search starting point when target is not a path
+        recursive (bool): Whether to search subdirectories
     """
     global _LOG_COLUMNS_CACHE
 
@@ -692,7 +692,7 @@ def switch_dataset(target: str = "", search_root: str = ".", recursive: bool = T
 @app.tool()
 def unload_dataset():
     """
-    現在の `logs` テーブルをアンロードします。
+    Unload the current `logs` table.
     """
     global _LOG_COLUMNS_CACHE
     repo.unload_dataset()
@@ -712,23 +712,23 @@ def dataset_profile(
     page_offset: int = 0,
 ):
     """
-    現在の解析対象データセットの概要を返します。
+    Returns an overview of the current analysis target dataset.
 
     Parameters:
-        top_n (int): 上位表示件数（Level/Computer/RuleTitle）
-        section (str): 取得セクション。'all', 'overview', 'levels', 'computers', 'rules' から選択
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        top_n (int): Number of top items to display (Level/Computer/RuleTitle)
+        section (str): Section to retrieve. Choose from 'all', 'overview', 'levels', 'computers', 'rules'
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=100, max_page_size=MAX_PAGE_SIZE)
     if top_n <= 0 or top_n > 100:
-        raise ValueError("top_n は 1 〜 100 の範囲で指定してください。")
+        raise ValueError("top_n must be between 1 and 100.")
 
     section = section.strip().lower()
     if section not in PROFILE_SECTIONS:
         allowed = ", ".join(sorted(PROFILE_SECTIONS))
-        raise ValueError(f"section は {allowed} から選択してください。")
+        raise ValueError(f"section must be one of: {allowed}")
 
     columns = _get_logs_columns()
     status = repo.get_dataset_status()
@@ -761,14 +761,14 @@ def dataset_profile(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data" if paged.empty else "ok",
-            message="指定ページにデータはありません" if paged.empty else "",
+            message="No data on the specified page" if paged.empty else "",
         ))
 
     if section == "levels":
         if "Level" not in columns:
             return _WideDisplayDataFrame(_attach_pagination_metadata(
                 pd.DataFrame(), total_count=0, page_size=page_size, page_offset=page_offset,
-                status="no_data", message="Level カラムが存在しません",
+                status="no_data", message="Level column does not exist",
             ))
         level_df = repo.query_dataframe(
             """
@@ -783,14 +783,14 @@ def dataset_profile(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data" if paged.empty else "ok",
-            message="指定ページにデータはありません" if paged.empty else "",
+            message="No data on the specified page" if paged.empty else "",
         ))
 
     if section == "computers":
         if "Computer" not in columns:
             return _WideDisplayDataFrame(_attach_pagination_metadata(
                 pd.DataFrame(), total_count=0, page_size=page_size, page_offset=page_offset,
-                status="no_data", message="Computer カラムが存在しません",
+                status="no_data", message="Computer column does not exist",
             ))
         host_df = repo.query_dataframe(
             """
@@ -805,14 +805,14 @@ def dataset_profile(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data" if paged.empty else "ok",
-            message="指定ページにデータはありません" if paged.empty else "",
+            message="No data on the specified page" if paged.empty else "",
         ))
 
     if section == "rules":
         if "RuleTitle" not in columns:
             return _WideDisplayDataFrame(_attach_pagination_metadata(
                 pd.DataFrame(), total_count=0, page_size=page_size, page_offset=page_offset,
-                status="no_data", message="RuleTitle カラムが存在しません",
+                status="no_data", message="RuleTitle column does not exist",
             ))
         rule_df = repo.query_dataframe(
             """
@@ -827,7 +827,7 @@ def dataset_profile(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data" if paged.empty else "ok",
-            message="指定ページにデータはありません" if paged.empty else "",
+            message="No data on the specified page" if paged.empty else "",
         ))
 
     # section == "all": original behavior
@@ -893,7 +893,7 @@ def dataset_profile(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
         ))
     return _WideDisplayDataFrame(_attach_pagination_metadata(
         paged,
@@ -917,18 +917,18 @@ def run_sql(
     wide_display: bool = True,
 ):
     """
-    📊 テーブル `logs` に対して **読み取り専用 SELECT** を実行し、DataFrame で返します。
+    Execute a **read-only SELECT** against the `logs` table and return the result as a DataFrame.
 
-    制限:
-        - SQLはAST検証され、SELECTかつlogsテーブル参照のみ許可
-        - テーブル関数/システム関数参照は不可
-        - 返却件数は page_size で指定（最大500行）
-        - max_rows は後方互換用（指定時は page_size として扱う）
-        - page_offset > 0 の場合は ORDER BY 必須（ページ再現性のため）
-        - include_total=False で毎ページの COUNT(*) を省略可能
-        - total_count_hint/query_hash_hint/dataset_version_hint を渡すと
-          include_total=False でも has_more 判定を正確化できる
-        - wide_display=True（デフォルト）で全カラム・全幅表示の _WideDisplayDataFrame を返す
+    Restrictions:
+        - SQL is AST-validated; only SELECT referencing the logs table is allowed
+        - Table functions/system function references are not permitted
+        - Number of returned rows is specified by page_size (max 500 rows)
+        - max_rows is for backward compatibility (treated as page_size when specified)
+        - ORDER BY is required when page_offset > 0 (for page reproducibility)
+        - include_total=False can skip the per-page COUNT(*)
+        - Passing total_count_hint/query_hash_hint/dataset_version_hint enables
+          accurate has_more determination even with include_total=False
+        - wide_display=True (default) returns a _WideDisplayDataFrame with full column/width display
     """
     _ensure_database_ready()
     wrap = _WideDisplayDataFrame if wide_display else lambda df: df
@@ -943,7 +943,7 @@ def run_sql(
 
     validated_sql = _validate_select_on_logs_only(sql)
     if page_offset > 0 and not _has_order_by_clause(validated_sql):
-        raise ValueError("run_sql で page_offset を使う場合は、再現性のため ORDER BY を必ず指定してください。")
+        raise ValueError("When using page_offset with run_sql, ORDER BY must be specified for reproducibility.")
 
     query_hash = _query_hash(validated_sql)
     dataset_version = _dataset_version()
@@ -961,16 +961,16 @@ def run_sql(
     else:
         if total_count_hint is not None:
             if total_count_hint < 0:
-                raise ValueError("total_count_hint は 0 以上で指定してください。")
+                raise ValueError("total_count_hint must be 0 or greater.")
             if not query_hash_hint or not dataset_version_hint:
                 raise ValueError(
-                    "total_count_hint を使う場合は query_hash_hint と dataset_version_hint も指定してください。"
+                    "When using total_count_hint, query_hash_hint and dataset_version_hint must also be specified."
                 )
             if query_hash_hint != query_hash:
-                raise ValueError("query_hash_hint が現在のSQLと一致しません。count_sql を再実行してください。")
+                raise ValueError("query_hash_hint does not match the current SQL. Please re-execute count_sql.")
             if dataset_version_hint != dataset_version:
                 raise ValueError(
-                    "dataset_version_hint が現在のデータセットと一致しません。count_sql を再実行してください。"
+                    "dataset_version_hint does not match the current dataset. Please re-execute count_sql."
                 )
             total_count = int(total_count_hint)
             count_source = "hint"
@@ -996,7 +996,7 @@ def run_sql(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="クエリ結果は0件でした",
+            message="Query returned 0 results",
             extra_meta=extra_meta,
         ))
     if result_df.empty:
@@ -1006,7 +1006,7 @@ def run_sql(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
             extra_meta=extra_meta,
         ))
     return wrap(_attach_pagination_metadata(
@@ -1024,19 +1024,19 @@ def get_event_detail(
     sql_filter: str = "",
 ):
     """
-    単一イベントの全フィールドを Field/Value 形式で展開して返します。
+    Expands all fields of a single event in Field/Value format and returns them.
 
     Parameters:
-        record_id (str): RecordID で指定（排他）
-        sql_filter (str): WHERE句相当のSQL条件で指定（排他）。
-                          例: "Level = 'crit'" → SELECT * FROM logs WHERE Level = 'crit' LIMIT 1
+        record_id (str): Specify by RecordID (mutually exclusive)
+        sql_filter (str): Specify by SQL condition equivalent to WHERE clause (mutually exclusive).
+                          Example: "Level = 'crit'" -> SELECT * FROM logs WHERE Level = 'crit' LIMIT 1
     """
     _ensure_database_ready()
 
     if record_id.strip() and sql_filter.strip():
-        raise ValueError("record_id と sql_filter は同時に指定できません。どちらか一方を指定してください。")
+        raise ValueError("record_id and sql_filter cannot be specified at the same time. Please specify one or the other.")
     if not record_id.strip() and not sql_filter.strip():
-        raise ValueError("record_id または sql_filter のいずれかを指定してください。")
+        raise ValueError("Please specify either record_id or sql_filter.")
 
     if record_id.strip():
         _ensure_columns_exist(["RecordID"], context="get_event_detail")
@@ -1054,7 +1054,7 @@ def get_event_detail(
             page_size=1,
             page_offset=0,
             status="no_data",
-            message="条件に一致するイベントはありませんでした",
+            message="No events matched the specified condition",
         ))
 
     row = row_df.iloc[0]
@@ -1097,16 +1097,16 @@ def search_all_fields(
     include_hit_columns: bool = True,
 ):
     """
-    logsテーブルの全カラム（または指定カラム）を横断してキーワード検索します。
+    Search across all columns (or specified columns) in the logs table by keyword.
 
     Parameters:
-        query (str): 検索文字列
-        columns (Sequence[str] | None): 検索対象カラム。Noneなら全カラム
+        query (str): Search string
+        columns (Sequence[str] | None): Columns to search. None searches all columns
         match_mode (str): `contains` / `exact` / `prefix` / `regex`
-        case_sensitive (bool): 大文字小文字を区別するか
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
-        include_hit_columns (bool): どのカラムでヒットしたかを返却するか
+        case_sensitive (bool): Whether to distinguish between upper and lower case
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
+        include_hit_columns (bool): Whether to return which columns matched
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=100, max_page_size=MAX_PAGE_SIZE)
@@ -1119,7 +1119,7 @@ def search_all_fields(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="query を指定してください",
+            message="Please specify a query",
         )
 
     existing_columns = sorted(_get_logs_columns())
@@ -1130,7 +1130,7 @@ def search_all_fields(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="検索対象カラムが見つかりません",
+            message="No searchable columns found",
         )
 
     if columns is None:
@@ -1147,7 +1147,7 @@ def search_all_fields(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="columns が空です",
+            message="columns is empty",
         )
 
     _ensure_columns_exist(target_columns, context="search_all_fields")
@@ -1156,7 +1156,7 @@ def search_all_fields(
     allowed_modes = {"contains", "exact", "prefix", "regex"}
     if normalized_mode not in allowed_modes:
         allowed_label = ", ".join(sorted(allowed_modes))
-        raise ValueError(f"match_mode は {allowed_label} から選択してください。")
+        raise ValueError(f"match_mode must be one of: {allowed_label}")
 
     if case_sensitive:
         needle_value = keyword
@@ -1240,7 +1240,7 @@ def search_all_fields(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="一致するデータはありませんでした",
+            message="No matching data found",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
@@ -1249,7 +1249,7 @@ def search_all_fields(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df,
@@ -1266,17 +1266,17 @@ def analyze_mitre_tactics(
     page_offset: int = 0,
 ):
     """
-    MITRE ATT&CKタクティクスに基づいた攻撃フェーズの分析を行います。
+    Perform attack phase analysis based on MITRE ATT&CK tactics.
 
     Parameters:
-        filter_tactics (Sequence[str], optional): 分析対象の戦術リスト
-                                                 例: ['InitAccess', 'PrivEsc']
-                                                 Noneの場合は全戦術を分析
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        filter_tactics (Sequence[str], optional): List of tactics to analyze
+                                                 Example: ['InitAccess', 'PrivEsc']
+                                                 Analyzes all tactics when None
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
 
     Returns:
-        pandas.DataFrame: 攻撃フェーズの分析結果（時系列順）
+        pandas.DataFrame: Attack phase analysis results (in chronological order)
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=100, max_page_size=MAX_PAGE_SIZE)
@@ -1293,7 +1293,7 @@ def analyze_mitre_tactics(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="対象のタクティクスが指定されていません",
+            message="No target tactics specified",
         )
 
     values_clause = ", ".join("(?, ?)" for _ in target_tactics)
@@ -1345,7 +1345,7 @@ def analyze_mitre_tactics(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="対象のタクティクスは見つかりませんでした",
+            message="No matching tactics found",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
@@ -1354,7 +1354,7 @@ def analyze_mitre_tactics(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df,
@@ -1373,33 +1373,33 @@ def summarize_events(
     page_offset: int = 0,
 ):
     """
-    ログイベントの集計を行います。
+    Aggregate log events.
 
     Parameters:
-        groupby_field (str): グループ化するフィールド名 (デフォルト: 'RuleTitle')
-                           例: 'Computer', 'RuleTitle', 'Level', 'EventID' など
-        filter_level (str, optional): フィルタする重要度レベル ('info', 'low', 'med', 'high', 'crit')
-        top_n (int | None): 後方互換用の上位件数制限。Noneなら全件対象
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        groupby_field (str): Field name to group by (default: 'RuleTitle')
+                           Example: 'Computer', 'RuleTitle', 'Level', 'EventID', etc.
+        filter_level (str, optional): Severity level to filter by ('info', 'low', 'med', 'high', 'crit')
+        top_n (int | None): Legacy top-N limit. None targets all records
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
 
     Returns:
-        pandas.DataFrame: イベント集計結果
+        pandas.DataFrame: Event aggregation results
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=100, max_page_size=MAX_PAGE_SIZE)
 
     available_fields = _available_summary_fields()
     if not available_fields:
-        raise ValueError("summarize_events: 集計対象フィールドが見つかりません。")
+        raise ValueError("summarize_events: No aggregation target fields found.")
 
     column_name = groupby_field.strip()
     if column_name not in available_fields:
         allowed = ", ".join(available_fields)
-        raise ValueError(f"groupby_field={groupby_field} は使用できません。利用可能: {allowed}")
+        raise ValueError(f"groupby_field={groupby_field} is not available. Available: {allowed}")
 
     if top_n is not None and top_n <= 0:
-        raise ValueError("top_n は正の整数で指定してください。")
+        raise ValueError("top_n must be a positive integer.")
 
     required_columns = [column_name]
     if filter_level:
@@ -1439,7 +1439,7 @@ def summarize_events(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="条件に一致するイベントはありませんでした",
+            message="No events matched the specified condition",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
@@ -1448,7 +1448,7 @@ def summarize_events(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df,
@@ -1469,24 +1469,24 @@ def summarize_by_time_window(
     page_offset: int = 0,
 ):
     """
-    時間窓別のアクティビティ集計を行います。
+    Aggregate activity by time window.
 
     Parameters:
-        interval (str): 集約間隔。'1h', '3h', '6h', '12h', '1d' から選択
-        filter_level (str, optional): フィルタする重要度レベル ('info', 'low', 'med', 'high', 'crit')
-        filter_rule (str, optional): フィルタするルールタイトル（部分一致）
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        interval (str): Aggregation interval. Choose from '1h', '3h', '6h', '12h', '1d'
+        filter_level (str, optional): Severity level to filter by ('info', 'low', 'med', 'high', 'crit')
+        filter_rule (str, optional): Rule title to filter by (partial match)
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
 
     Returns:
-        pandas.DataFrame: 時間窓別アクティビティ集計結果
+        pandas.DataFrame: Activity aggregation results by time window
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=500, max_page_size=MAX_PAGE_SIZE)
 
     if interval not in ALLOWED_TIME_INTERVALS:
         allowed = ", ".join(sorted(ALLOWED_TIME_INTERVALS))
-        raise ValueError(f"interval は {allowed} から選択してください。")
+        raise ValueError(f"interval must be one of: {allowed}")
 
     required_columns = ["Timestamp"]
     if filter_level:
@@ -1531,7 +1531,7 @@ def summarize_by_time_window(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="条件に一致するイベントはありませんでした",
+            message="No events matched the specified condition",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
@@ -1540,7 +1540,7 @@ def summarize_by_time_window(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df,
@@ -1561,32 +1561,32 @@ def analyze_rule_titles(
     page_offset: int = 0,
 ):
     """
-    ルールタイトル（RuleTitle）の集計分析を行います。
+    Perform aggregation analysis on rule titles (RuleTitle).
 
     Parameters:
-        level (str/Sequence[str], optional): フィルタする重要度レベル
-                                            単一の値（例: 'high'）または複数の値（例: ['high', 'crit']）
-        min_count (int): 表示する最小出現回数 (デフォルト: 1)
-        top_n (int | None): 後方互換用の上位件数制限。Noneなら全件対象
-        contains (str, optional): RuleTitleに含まれる文字列でフィルタ
-        time_range (Sequence[str], optional): 時間範囲でフィルタ（例: ('2023-01-01', '2023-01-02')）
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        level (str/Sequence[str], optional): Severity level to filter by
+                                            Single value (e.g., 'high') or multiple values (e.g., ['high', 'crit'])
+        min_count (int): Minimum occurrence count to display (default: 1)
+        top_n (int | None): Legacy top-N limit. None targets all records
+        contains (str, optional): Filter by string contained in RuleTitle
+        time_range (Sequence[str], optional): Filter by time range (e.g., ('2023-01-01', '2023-01-02'))
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
 
     Returns:
-        pandas.DataFrame: RuleTitle集計結果
+        pandas.DataFrame: RuleTitle aggregation results
     """
     _ensure_database_ready()
     _ensure_columns_exist(["RuleTitle", "Timestamp", "Level", "Computer"], context="analyze_rule_titles")
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=50, max_page_size=MAX_PAGE_SIZE)
 
     if min_count <= 0:
-        raise ValueError("min_count は正の整数で指定してください。")
+        raise ValueError("min_count must be a positive integer.")
     if top_n is not None and top_n <= 0:
-        raise ValueError("top_n は正の整数で指定してください。")
+        raise ValueError("top_n must be a positive integer.")
 
     if time_range is not None and len(time_range) != 2:
-        raise ValueError("time_range は (start, end) の2要素で指定してください。")
+        raise ValueError("time_range must be specified as a 2-element tuple (start, end).")
 
     params: list[object] = []
     conditions: list[str] = []
@@ -1615,16 +1615,16 @@ def analyze_rule_titles(
     base_query = f"""
         SELECT
             "RuleTitle",
-            COUNT(*) AS "イベント数",
-            MIN("Timestamp") AS "初回検出",
-            MAX("Timestamp") AS "最終検出",
-            STRING_AGG(DISTINCT "Level", ', ') AS "重要度",
-            STRING_AGG(DISTINCT "Computer", ', ') AS "検出ホスト"
+            COUNT(*) AS "event_count",
+            MIN("Timestamp") AS "first_seen",
+            MAX("Timestamp") AS "last_seen",
+            STRING_AGG(DISTINCT "Level", ', ') AS "severity",
+            STRING_AGG(DISTINCT "Computer", ', ') AS "detected_hosts"
         FROM logs
         {where_clause}
         GROUP BY "RuleTitle"
         HAVING COUNT(*) >= ?
-        ORDER BY "イベント数" DESC, "RuleTitle" ASC
+        ORDER BY "event_count" DESC, "RuleTitle" ASC
     """
 
     params.append(min_count)
@@ -1646,7 +1646,7 @@ def analyze_rule_titles(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="条件に一致するルールタイトルはありませんでした",
+            message="No rule titles matched the specified condition",
         )
     if result.empty:
         return _attach_pagination_metadata(
@@ -1655,7 +1655,7 @@ def analyze_rule_titles(
             page_size=page_size,
             page_offset=page_offset,
             status="no_data",
-            message="指定ページにデータはありません",
+            message="No data on the specified page",
         )
 
     return _attach_pagination_metadata(
@@ -1667,14 +1667,14 @@ def analyze_rule_titles(
 
 
 def _validate_detail_field_name(name: str) -> str:
-    """Details フィールド名を検証し、SQL安全な文字列を返す。"""
+    """Validate a Details field name and return a SQL-safe string."""
     stripped = name.strip()
     if not stripped:
-        raise ValueError("field_name を指定してください。")
+        raise ValueError("Please specify a field_name.")
     if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', stripped):
         raise ValueError(
-            f"不正なフィールド名です: {stripped}. "
-            "英数字とアンダースコアのみ使用可能です。"
+            f"Invalid field name: {stripped}. "
+            "Only alphanumeric characters and underscores are allowed."
         )
     return stripped
 
@@ -1683,7 +1683,7 @@ def _build_details_conditions(
     rule_title: str | None,
     level: str | Sequence[str] | None,
 ) -> tuple[str, list[object]]:
-    """Details系ツール共通のフィルタ条件を構築する。"""
+    """Build filter conditions common to Details-related tools."""
     conditions: list[str] = []
     params: list[object] = []
 
@@ -1710,15 +1710,15 @@ def analyze_host_timeline(
     page_offset: int = 0,
 ):
     """
-    特定ホストに絞った時系列イベント一覧を返します。
-    侵害チェーン（例: HostA → HostB → HostC）の追跡に最適です。
+    Returns a chronological event list filtered to a specific host.
+    Ideal for tracking compromise chains (e.g., HostA -> HostB -> HostC).
 
     Parameters:
-        host_contains (str): ホスト名の部分一致フィルタ（必須）
-        level (str/Sequence[str], optional): 重要度フィルタ（例: 'high', ['high', 'crit']）
-        time_range (Sequence[str], optional): 時間範囲フィルタ (start, end)
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        host_contains (str): Partial match filter for host name (required)
+        level (str/Sequence[str], optional): Severity filter (e.g., 'high', ['high', 'crit'])
+        time_range (Sequence[str], optional): Time range filter (start, end)
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(
@@ -1727,10 +1727,10 @@ def analyze_host_timeline(
 
     host = host_contains.strip()
     if not host:
-        raise ValueError("host_contains を指定してください。")
+        raise ValueError("Please specify host_contains.")
 
     if time_range is not None and len(time_range) != 2:
-        raise ValueError("time_range は (start, end) の2要素で指定してください。")
+        raise ValueError("time_range must be specified as a 2-element tuple (start, end).")
 
     required = ["Timestamp", "Computer", "RuleTitle", "Level"]
     _ensure_columns_exist(required, context="analyze_host_timeline")
@@ -1785,13 +1785,13 @@ def analyze_host_timeline(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
             status="no_data",
-            message=f"ホスト '{host}' に一致するイベントはありませんでした",
+            message=f"No events found matching host '{host}'",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
             pd.DataFrame(), total_count=total_count,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="指定ページにデータはありません",
+            status="no_data", message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df, total_count=total_count,
@@ -1809,19 +1809,19 @@ def parse_details_field(
     page_offset: int = 0,
 ):
     """
-    Details カラムのキーバリュー構造（Key: Value ¦ Key: Value）を解析します。
+    Parse the key-value structure of the Details column (Key: Value | Key: Value).
 
-    field_name が空の場合、利用可能なフィールド名一覧をカウント付きで返します。
-    field_name を指定すると、そのフィールドの値を抽出します。
+    When field_name is empty, returns a list of available field names with counts.
+    When field_name is specified, extracts values for that field.
 
     Parameters:
-        field_name (str): 抽出するフィールド名（例: 'Cmdline', 'Proc', 'User'）
-                         空の場合はフィールド名一覧を返す
-        rule_title (str, optional): RuleTitleフィルタ（部分一致）
-        level (str/Sequence[str], optional): 重要度フィルタ
-        unique (bool): Trueの場合、一意な値のカウント集計を返す
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        field_name (str): Field name to extract (e.g., 'Cmdline', 'Proc', 'User')
+                         Returns field name list when empty
+        rule_title (str, optional): RuleTitle filter (partial match)
+        level (str/Sequence[str], optional): Severity filter
+        unique (bool): When True, returns count aggregation of unique values
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
     _ensure_columns_exist(["Details"], context="parse_details_field")
@@ -1923,9 +1923,9 @@ def parse_details_field(
     )
 
     if total_count == 0:
-        msg = "一致するデータはありませんでした"
+        msg = "No matching data found"
         if field_name.strip():
-            msg = f"フィールド '{field_name.strip()}' のデータは見つかりませんでした"
+            msg = f"No data found for field '{field_name.strip()}'"
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
@@ -1935,7 +1935,7 @@ def parse_details_field(
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=total_count,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="指定ページにデータはありません",
+            status="no_data", message="No data on the specified page",
         ))
     return _WideDisplayDataFrame(_attach_pagination_metadata(
         result_df, total_count=total_count,
@@ -1952,19 +1952,19 @@ def extract_iocs(
     page_offset: int = 0,
 ):
     """
-    Details/ExtraFieldInfo カラムからIOC（Indicator of Compromise）を自動抽出します。
+    Automatically extract IOCs (Indicators of Compromise) from Details/ExtraFieldInfo columns.
 
-    プロセスパス、コマンドライン、IPアドレス、ファイルパス、ユーザー、ハッシュ、
-    サービス名をカテゴリ別に集計して返します。
+    Aggregates process paths, command lines, IP addresses, file paths, users, hashes,
+    and service names by category and returns the results.
 
     Parameters:
-        ioc_type (str, optional): 抽出するIOCタイプで絞り込み
+        ioc_type (str, optional): Filter by IOC type to extract
                                   'process', 'cmdline', 'filepath', 'ip', 'user', 'hash', 'service'
-                                  Noneの場合は全タイプを抽出
-        level (str/Sequence[str], optional): 重要度フィルタ
-        rule_title (str, optional): RuleTitleフィルタ（部分一致）
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+                                  Extracts all types when None
+        level (str/Sequence[str], optional): Severity filter
+        rule_title (str, optional): RuleTitle filter (partial match)
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
     _ensure_columns_exist(["Details"], context="extract_iocs")
@@ -1977,7 +1977,7 @@ def extract_iocs(
         ioc_type_normalized = ioc_type.strip().lower()
         if ioc_type_normalized not in valid_types:
             allowed = ", ".join(sorted(valid_types))
-            raise ValueError(f"ioc_type は {allowed} から選択してください。")
+            raise ValueError(f"ioc_type must be one of: {allowed}")
         target_categories = {ioc_type_normalized: IOC_FIELD_CATEGORIES[ioc_type_normalized]}
     else:
         target_categories = IOC_FIELD_CATEGORIES
@@ -1994,7 +1994,7 @@ def extract_iocs(
         return _attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="対象のIOCタイプが指定されていません",
+            status="no_data", message="No target IOC types specified",
         )
 
     case_expr = "CASE " + " ".join(case_parts) + " END"
@@ -2054,13 +2054,13 @@ def extract_iocs(
         return _attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="IOCが見つかりませんでした",
+            status="no_data", message="No IOCs found",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
             pd.DataFrame(), total_count=total_count,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="指定ページにデータはありません",
+            status="no_data", message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df, total_count=total_count,
@@ -2082,16 +2082,16 @@ def decode_powershell_commands(
     page_offset: int = 0,
 ):
     """
-    Base64エンコードされたPowerShellコマンドをデコードして返します。
+    Decode and return Base64-encoded PowerShell commands.
 
-    Details/ExtraFieldInfo に含まれる -enc/-encodedcommand/-e パラメータの
-    Base64値を検出し、UTF-16-LEとしてデコードします。
+    Detects Base64 values from -enc/-encodedcommand/-e parameters found in
+    Details/ExtraFieldInfo and decodes them as UTF-16-LE.
 
     Parameters:
-        level (str/Sequence[str], optional): 重要度フィルタ
-        rule_title (str, optional): RuleTitleフィルタ（部分一致）
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        level (str/Sequence[str], optional): Severity filter
+        rule_title (str, optional): RuleTitle filter (partial match)
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
     _ensure_columns_exist(["Timestamp", "Computer", "RuleTitle", "Level", "Details"], context="decode_powershell_commands")
@@ -2135,7 +2135,7 @@ def decode_powershell_commands(
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="Base64エンコードされたPowerShellコマンドは見つかりませんでした",
+            status="no_data", message="No Base64-encoded PowerShell commands found",
         ))
 
     decoded_rows: list[dict[str, str]] = []
@@ -2161,7 +2161,7 @@ def decode_powershell_commands(
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="Base64パターンにマッチするコマンドは見つかりませんでした",
+            status="no_data", message="No commands matching the Base64 pattern were found",
         ))
 
     all_df = pd.DataFrame(decoded_rows)
@@ -2172,7 +2172,7 @@ def decode_powershell_commands(
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=total,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="指定ページにデータはありません",
+            status="no_data", message="No data on the specified page",
         ))
 
     return _WideDisplayDataFrame(_attach_pagination_metadata(
@@ -2191,18 +2191,18 @@ def correlate_lateral_movement(
     page_offset: int = 0,
 ):
     """
-    ホスト間の横展開（Lateral Movement）相関分析を行います。
+    Perform lateral movement correlation analysis between hosts.
 
-    時間窓内で異なるホスト間に発生したイベントを self-join で検出し、
-    攻撃の横展開パターンを特定します。
+    Detects events occurring between different hosts within a time window using self-join,
+    identifying lateral movement attack patterns.
 
     Parameters:
-        time_window_minutes (int): 相関を検出する時間窓（分）。1〜1440
-        level (str/Sequence[str], optional): 重要度フィルタ
-        source_host (str, optional): ソースホスト名フィルタ（部分一致）
-        target_host (str, optional): ターゲットホスト名フィルタ（部分一致）
-        page_size (int): 1ページあたりの件数
-        page_offset (int): 取得開始オフセット
+        time_window_minutes (int): Time window for correlation detection (minutes). 1-1440
+        level (str/Sequence[str], optional): Severity filter
+        source_host (str, optional): Source host name filter (partial match)
+        target_host (str, optional): Target host name filter (partial match)
+        page_size (int): Number of items per page
+        page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
     _ensure_columns_exist(
@@ -2214,7 +2214,7 @@ def correlate_lateral_movement(
     )
 
     if time_window_minutes < 1 or time_window_minutes > 1440:
-        raise ValueError("time_window_minutes は 1〜1440 の範囲で指定してください。")
+        raise ValueError("time_window_minutes must be between 1 and 1440.")
 
     params: list[object] = []
     conditions_a: list[str] = []
@@ -2284,13 +2284,13 @@ def correlate_lateral_movement(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
             status="no_data",
-            message="横展開パターンは検出されませんでした",
+            message="No lateral movement patterns detected",
         )
     if result_df.empty:
         return _attach_pagination_metadata(
             pd.DataFrame(), total_count=total_count,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="指定ページにデータはありません",
+            status="no_data", message="No data on the specified page",
         )
     return _attach_pagination_metadata(
         result_df, total_count=total_count,
@@ -2299,7 +2299,7 @@ def correlate_lateral_movement(
 
 
 # ──────────────────────────────────────────
-# エントリポイント
+# Entry point
 # ──────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hayabusa MCP")
@@ -2307,24 +2307,24 @@ if __name__ == "__main__":
         "--transport",
         choices=["stdio", "streamable-http", "http"],
         default="stdio",
-        help="MCPトランスポート (default: stdio, httpはstreamable-httpの別名)",
+        help="MCP transport (default: stdio, http is an alias for streamable-http)",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP待受ホスト (streamable-http用)")
-    parser.add_argument("--port", type=int, default=8763, help="HTTP待受ポート (streamable-http用)")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP listen host (for streamable-http)")
+    parser.add_argument("--port", type=int, default=8763, help="HTTP listen port (for streamable-http)")
     parser.add_argument(
         "--streamable-http-path",
         default="/mcp",
-        help="Streamable HTTPエンドポイントパス (default: /mcp)",
+        help="Streamable HTTP endpoint path (default: /mcp)",
     )
     parser.add_argument(
         "--stateless-http",
         action="store_true",
-        help="stateless HTTPモードを有効化",
+        help="Enable stateless HTTP mode",
     )
     parser.add_argument(
         "--json-response",
         action="store_true",
-        help="JSONレスポンスモードを有効化",
+        help="Enable JSON response mode",
     )
     args = parser.parse_args()
     transport = "streamable-http" if args.transport == "http" else args.transport
@@ -2338,17 +2338,17 @@ if __name__ == "__main__":
 
     if transport == "streamable-http":
         path = args.streamable_http_path if args.streamable_http_path.startswith("/") else f"/{args.streamable_http_path}"
-        print("⚡ Hayabusa MCP サーバーを起動します（streamable-http モード）")
+        print("Starting Hayabusa MCP server (streamable-http mode)")
         print(f"endpoint: http://{args.host}:{args.port}{path}")
     else:
-        print("⚡ Hayabusa MCP サーバーを起動します（stdio モード）")
+        print("Starting Hayabusa MCP server (stdio mode)")
 
     if status.get("loaded"):
-        print(f"現在のデータセット: {status.get('dataset_path', '')}")
+        print(f"Current dataset: {status.get('dataset_path', '')}")
     else:
-        print("データセット未ロードです。switch_dataset ツールでCSVをロードしてください。")
+        print("No dataset loaded. Please load a CSV using the switch_dataset tool.")
 
     try:
         app.run(transport=transport)
     except KeyboardInterrupt:
-        print("🛑 Hayabusa MCP サーバーを停止しました。")
+        print("Hayabusa MCP server stopped.")

@@ -1,215 +1,228 @@
 ---
 name: investigate
-description: "Hayabusa MCPを使ったインシデント調査とタイムライン生成スキル。ユーザーが /investigate と入力した時、または「侵害調査」「タイムライン作成」「インシデント分析」「フォレンジック分析」「ログ分析して」などセキュリティログの調査・分析を依頼された時に使う。Hayabusa MCP toolsが利用可能な環境で動作する。"
+description: "Incident investigation and timeline generation skill using Hayabusa MCP. Use when the user types /investigate, or asks to 'investigate logs', 'analyze security events', 'create an incident timeline', 'forensic analysis', 'analyze this CSV' in the context of security log analysis. Requires Hayabusa MCP tools to be available."
 ---
 
-# Investigate - Hayabusa インシデントタイムライン調査
+# Investigate - Hayabusa Incident Timeline Investigation
 
-Hayabusa MCPツールを使い、CSVログを体系的に分析して侵害タイムラインレポートを日本語で生成する。あらゆる種類のサイバー攻撃（APT、ランサムウェア、内部不正、ウェブ侵害、サプライチェーン攻撃等）に対応する汎用的な調査フレームワーク。
+Systematically analyze CSV logs using Hayabusa MCP tools to generate an incident forensic report in English. A universal investigation framework that handles all types of cyber attacks (APT, ransomware, insider threats, web compromises, supply chain attacks, etc.).
 
-## 引数
+## Arguments
 
-- オプション: CSVファイルパス
-- 例: `/investigate /path/to/results.csv`
+- Optional: CSV file path
+- Example: `/investigate /path/to/results.csv`
 
-## ワークフロー
+## Workflow
 
-以下のステップを順に実行する。各ステップ内の独立したツール呼び出しは**並列実行**してレイテンシを最小化する。
+Execute the following steps in order. Independent tool calls within each step should be run **in parallel** to minimize latency.
 
-### Step 1: 対象CSVの特定とデータセット読み込み
+### Step 1: Identify Target CSV and Load Dataset
 
-1. 引数でCSVパスが指定されている場合 → そのパスを使用する
-2. 引数が未指定の場合 → `mcp__hayabusa__list_datasets` でカレントディレクトリ配下のCSVファイル一覧を取得し、`AskUserQuestion` ツールで対象ファイルを選択させる。候補が1件のみの場合もユーザーに確認する
-3. ユーザーが選択したCSVを `mcp__hayabusa__switch_dataset` で読み込む
+1. **Record investigation start time**: Run `date '+%Y-%m-%d %H:%M:%S'` via Bash tool and note the start time (used for report metadata in Step 7)
+2. If a CSV path is specified as an argument → use that path
+3. If no argument is given → use `mcp__hayabusa__list_datasets` to list CSV files under the current directory, then use `AskUserQuestion` tool to have the user select the target file. Confirm with the user even if there is only one candidate
+4. Load the user's selected CSV via `mcp__hayabusa__switch_dataset`
 
-### Step 2: プロファイル取得と調査方針の決定
+### Step 2: Profile Dataset and Determine Investigation Strategy
 
-`mcp__hayabusa__dataset_profile` でデータセットの概要を把握する。ここで得られる情報:
-- イベント期間（timestamp_min / timestamp_max）
-- 重要度別件数（info / low / med / high / crit）
-- ホスト別件数
-- ルールタイトル上位
+Use `mcp__hayabusa__dataset_profile` to get an overview of the dataset. Information obtained:
+- Event time range (timestamp_min / timestamp_max)
+- Counts by severity (info / low / med / high / crit)
+- Counts by host
+- Top rule titles
 
-この結果から**インシデントの性質を仮説立て**し、以降の調査パラメータを適応的に調整する:
-- crit/highが少数ホストに集中 → 標的型攻撃（APT）の可能性。該当ホストの深掘りを優先
-- crit/highが短時間に全ホストで発生 → ランサムウェア/ワーム型の可能性。時間窓を短く(1h)設定
-- 特定アカウントの大量活動 → 認証情報窃取・内部不正の可能性。アカウント軸の分析を重視
-- med以下のみで明確なcrit/highがない → 低速な偵察活動の可能性。med含めた分析に拡大
+Based on these results, **form a hypothesis about the nature of the incident** and adaptively adjust subsequent investigation parameters:
+- crit/high concentrated on a few hosts → possible targeted attack (APT). Prioritize deep-diving those hosts
+- crit/high occurring across all hosts in a short time → possible ransomware/worm. Set short time windows (1h)
+- Massive activity from specific accounts → possible credential theft/insider threat. Emphasize account-based analysis
+- Only med or below with no clear crit/high → possible slow reconnaissance. Expand analysis to include med
 
-### Step 3: 攻撃の全体像把握（並列実行）
+### Step 3: Establish Attack Overview (Parallel Execution)
 
-以下3つを**同時に**呼び出す:
+Call the following 3 **simultaneously**:
 
-1. **`mcp__hayabusa__analyze_rule_titles`** — `level: ["high", "crit"]` でhigh/critのルールタイトルを集計。攻撃手法と検出ホストの全体像を把握する。crit/highが存在しない場合は `level: "med"` にフォールバック
-2. **`mcp__hayabusa__analyze_mitre_tactics`** — MITRE ATT&CKタクティクス分析。攻撃フェーズの網羅性と時系列を把握する
-3. **`mcp__hayabusa__summarize_by_time_window`** — 活動の時間的集中を把握する。インシデント期間に応じてintervalを調整:
-   - 24時間以内: `"1h"`
-   - 1〜7日: `"3h"`
-   - 7日超: `"12h"` または `"1d"`
+1. **`mcp__hayabusa__analyze_rule_titles`** — with `level: ["high", "crit"]` to aggregate high/crit rule titles. Get the overall picture of attack techniques and affected hosts. Fall back to `level: "med"` if no crit/high exist
+2. **`mcp__hayabusa__analyze_mitre_tactics`** — MITRE ATT&CK tactics analysis. Understand the coverage and timeline of attack phases
+3. **`mcp__hayabusa__summarize_by_time_window`** — Understand temporal concentration of activity. Adjust interval based on incident duration:
+   - Within 24 hours: `"1h"`
+   - 1-7 days: `"3h"`
+   - Over 7 days: `"12h"` or `"1d"`
 
-### Step 3.5: 全ルールタイトルのDetails検証（偽陽性排除） ★重要
+### Step 3.5: Verify Details of All Rule Titles (False Positive Elimination) - CRITICAL
 
-**このステップはスキップしてはならない。** Step 3 の `analyze_rule_titles` で得られた全ルールタイトルについて、各ルール1〜2件のサンプルイベントのDetailsフィールドを取得し、**実際の内容を確認してから攻撃か偽陽性かを判定する**。
+**This step must not be skipped.** For all rule titles obtained from `analyze_rule_titles` in Step 3, retrieve the Details field from 1-2 sample events per rule and **verify the actual content before determining whether it's an attack or false positive**.
 
-#### 実施方法
+#### Method
 
-Step 3 で検出された**全ての異なるルールタイトル**について、以下のSQLで代表イベントのDetailsを取得する:
+For **all distinct rule titles** detected in Step 3, retrieve representative event Details using the following SQL:
 
 ```sql
 SELECT Timestamp, Computer, RuleTitle, Level, Details
-FROM logs WHERE RuleTitle = '[ルールタイトル]'
+FROM logs WHERE RuleTitle = '[rule title]'
 ORDER BY Timestamp LIMIT 2
 ```
 
-ルールタイトルが多い場合（10件超）は、以下の方法で並列化・効率化する:
-- 複数ルールタイトルを `WHERE RuleTitle IN (...)` でまとめてクエリする
-- ただし1クエリあたり5ルールまでとし、LIMIT 10 程度で各ルール最低1件は取得できるようにする
+When there are many rule titles (>10), parallelize/optimize using:
+- Combine multiple rule titles with `WHERE RuleTitle IN (...)`
+- Limit to 5 rules per query with LIMIT 10 to ensure at least 1 event per rule
 
-#### 検証すべき観点
+#### Verification Criteria
 
-各ルールのDetailsから以下を確認し、**偽陽性と判断されたルールはレポートから除外する（またはセクション9の偽陽性セクションに記載する）**:
+Check the following from each rule's Details. **Rules determined to be false positives should be excluded from the report (or listed in Section 9's false positive section)**:
 
-1. **プロセスパスの妥当性**: `C:\Windows\system32\svchost.exe -k print` のような正規Windowsサービスではないか
-2. **サービス名/説明の確認**: Detailsに含まれるサービス名が正規のWindows機能かどうか
-3. **実行バイナリの素性**: Description/Product/Company フィールドが正規ベンダー製品を示していないか（例: "Winlogbeat ships Windows event logs" → Elastic社の正規ツール）
-4. **ファイルパスの不審度**: `C:\Users\Public\`, `C:\Windows\Temp\<ランダム>`, `C:\ProgramData\` 等の攻撃者がよく使うステージングディレクトリかどうか
-5. **親プロセスの確認**: ParentCmdline が正規のサービスマネージャ（services.exe, svchost.exe）か、不審なプロセス（cmd.exe, powershell.exe, wsmprovhost.exe）か
-6. **ユーザーコンテキスト**: SYSTEMアカウントでの正規スケジュールタスクか、一般ユーザーアカウントでの不審な実行か
+1. **Process path legitimacy**: Is it a legitimate Windows service like `C:\Windows\system32\svchost.exe -k print`?
+2. **Service name/description**: Is the service name in Details a legitimate Windows feature?
+3. **Binary provenance**: Do Description/Product/Company fields indicate a legitimate vendor product? (e.g., "Winlogbeat ships Windows event logs" → legitimate Elastic tool)
+4. **File path suspiciousness**: Is it in attacker-favored staging directories like `C:\Users\Public\`, `C:\Windows\Temp\<random>`, `C:\ProgramData\`?
+5. **Parent process check**: Is ParentCmdline a legitimate service manager (services.exe, svchost.exe) or a suspicious process (cmd.exe, powershell.exe, wsmprovhost.exe)?
+6. **User context**: Is it a legitimate scheduled task under SYSTEM, or suspicious execution under a regular user account?
 
-#### 偽陽性の典型パターン（除外候補）
+#### Common False Positive Patterns (Exclusion Candidates)
 
-以下は偽陽性として頻出するパターン。Detailsの内容が合致する場合はレポートの攻撃タイムラインから除外し、セクション9に記載する:
+The following are frequently occurring false positive patterns. If Details content matches, exclude from the attack timeline and list in Section 9:
 
-- **Suspicious Service Path**: `svchost.exe -k print`（印刷サービス）、`svchost.exe -k netsvcs`（一般Windowsサービス）等の正規サービスパス
-- **LOLBAS Renamed**: 正規ツール（Elastic Winlogbeat, Velociraptor等）のリネームされたバイナリで、Description/Product が正規ベンダーを示す場合。ただし**攻撃者がツールの属性を偽装している可能性もあるため、配置パスや実行コンテキストも含めて総合判断する**
-- **Proc Access (Sysmon Alert)**: Veeam Backup, Defender ATP, sppsvc.exe 等の正規プロセス間のアクセス
-- **Proc Exec (Sysmon Alert)**: Windowsスケジュールタスク（makecab, rundll32 Windows.Storage.*）、Windows Update関連
+- **Suspicious Service Path**: Legitimate service paths like `svchost.exe -k print` (print service), `svchost.exe -k netsvcs` (general Windows service)
+- **LOLBAS Renamed**: Renamed binaries of legitimate tools (Elastic Winlogbeat, Velociraptor, etc.) where Description/Product indicates a legitimate vendor. However, **attackers may also spoof tool attributes, so make a comprehensive judgment including deployment path and execution context**
+- **Proc Access (Sysmon Alert)**: Legitimate inter-process access between Veeam Backup, Defender ATP, sppsvc.exe, etc.
+- **Proc Exec (Sysmon Alert)**: Windows scheduled tasks (makecab, rundll32 Windows.Storage.*), Windows Update related
 
-#### 攻撃インフラの発見
+#### Attack Infrastructure Discovery
 
-Detailsの確認中に、以下の攻撃インフラパターンを発見した場合は**必ず記録し、Step 5での深掘り対象に追加する**:
+During Details verification, if the following attack infrastructure patterns are found, **record them and add to Step 5 deep-dive targets**:
 
-- **ステージングディレクトリ**: `C:\Users\Public\`, `C:\ProgramData\`, `C:\Windows\Temp\<ランダム>`, `C:\Perflogs\` 等に配置された実行ファイルやDLL
-- **同一PIDの複数ルール検出**: 同じPID/PGUIDが異なるルールで検出されている場合、それは同一プロセスの多面的な悪性活動を示す
-- **不審なDLLロード**: rundll32.exe が正規のSystem32以外のパスからDLLを読み込んでいる場合（例: `rundll32 C:\Users\Public\Music\*.dll`）
+- **Staging directories**: Executables or DLLs placed in `C:\Users\Public\`, `C:\ProgramData\`, `C:\Windows\Temp\<random>`, `C:\Perflogs\`, etc.
+- **Same PID detected by multiple rules**: When the same PID/PGUID is detected by different rules, it indicates multifaceted malicious activity from the same process
+- **Suspicious DLL loading**: rundll32.exe loading DLLs from paths other than System32 (e.g., `rundll32 C:\Users\Public\Music\*.dll`)
 
-### Step 4: 詳細調査（並列実行）
+### Step 4: Detailed Investigation (Parallel Execution)
 
-以下4つを**同時に**呼び出す:
+Call the following 4 **simultaneously**:
 
-1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` でcritイベントの全詳細を取得する。critが存在しない場合はhighに拡大する
-2. **`mcp__hayabusa__extract_iocs`** — `level: ["high", "crit"]` でIOC（プロセス、コマンドライン、IP、ユーザー、ハッシュ等）を抽出する
-3. **`mcp__hayabusa__correlate_lateral_movement`** — `time_window_minutes: 60`, `level: ["high", "crit"]` でホスト間の横展開パターンを検出する。単一ホストのインシデントでは結果が空になる場合があるが、それ自体が横展開なしの証拠となる
-4. **`mcp__hayabusa__parse_details_field`** — `field_name: "User"`, `level: ["high", "crit"]`, `unique: true` で攻撃に関与したアカウントを集計する。攻撃主体の特定はほぼ全てのインシデントで必要なため、常に実行する
+1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` to get full details of all crit events. Expand to high if no crit events exist
+2. **`mcp__hayabusa__extract_iocs`** — with `level: ["high", "crit"]` to extract IOCs (processes, command lines, IPs, users, hashes, etc.)
+3. **`mcp__hayabusa__correlate_lateral_movement`** — with `time_window_minutes: 60`, `level: ["high", "crit"]` to detect inter-host lateral movement patterns. Empty results for single-host incidents are themselves evidence of no lateral movement
+4. **`mcp__hayabusa__parse_details_field`** — with `field_name: "User"`, `level: ["high", "crit"]`, `unique: true` to aggregate accounts involved in the attack. Identifying the attack principal is required for virtually all incidents
 
-### Step 5: 適応的深掘り（並列実行）
+### Step 5: Adaptive Deep Dive (Parallel Execution)
 
-Step 3-4 の結果を踏まえ、**データに存在する脅威に応じて**以下から必要なものを選択し同時に呼び出す:
+Based on Step 3-4 results, **select and simultaneously call** the necessary tools from below according to threats present in the data:
 
-#### 常に実行:
-- **`mcp__hayabusa__analyze_host_timeline`** — 最も疑わしいホストのタイムラインを取得する
+#### Always execute:
+- **`mcp__hayabusa__analyze_host_timeline`** — Get the timeline of the most suspicious host
 
-#### 条件付き実行:
-- **`mcp__hayabusa__decode_powershell_commands`** — Step 3でPowerShell関連ルール（Encoded PowerShell, PowerShell ScriptBlock等）が検出された場合に実行
-- **`mcp__hayabusa__parse_details_field`** — 特定フィールドの深掘りが必要な場合（例: `field_name: "Cmdline"` で実行コマンド一覧、`field_name: "User"` でアカウント分析）
-- **`mcp__hayabusa__search_all_fields`** — Step 3-4で特定のIOC（ファイル名、IP、ハッシュ等）が見つかった場合、その値で全フィールド横断検索を行い関連イベントを特定
-- **`mcp__hayabusa__run_sql`** — 追加のカスタムクエリが必要な場合（例: 特定時間帯の特定ホストのイベント一覧）
+#### Conditional execution:
+- **`mcp__hayabusa__decode_powershell_commands`** — Execute when PowerShell-related rules (Encoded PowerShell, PowerShell ScriptBlock, etc.) are detected in Step 3
+- **`mcp__hayabusa__parse_details_field`** — When specific field deep-dives are needed (e.g., `field_name: "Cmdline"` for command list, `field_name: "User"` for account analysis)
+- **`mcp__hayabusa__search_all_fields`** — When specific IOCs (filenames, IPs, hashes, etc.) are found in Steps 3-4, cross-search all fields to identify related events
+- **`mcp__hayabusa__run_sql`** — When additional custom queries are needed (e.g., event list for a specific host during a specific time window)
 
-「最も疑わしいホスト」の判定基準（優先度順）:
-1. critイベントが最も多いホスト
-2. 横展開の起点と特定されたホスト
-3. 最も早い時刻にhigh/critが検出されたホスト（Patient Zero候補）
-4. 複数のMITRE戦術フェーズに跨がって登場するホスト
+Criteria for "most suspicious host" (priority order):
+1. Host with the most crit events
+2. Host identified as the lateral movement origin
+3. Host where high/crit was first detected (Patient Zero candidate)
+4. Host appearing across multiple MITRE tactic phases
 
-#### 攻撃インフラの横断検索（Step 3.5で発見された場合は必須）:
+#### Attack infrastructure cross-search (required if discovered in Step 3.5):
 
-Step 3.5 で攻撃者のステージングディレクトリ（例: `C:\Users\Public\Music\`）や不審なプロセスパスが発見された場合、`search_all_fields` でそのパスを全フィールド横断検索し、**同じディレクトリに配置された他のツールや関連活動を網羅的に特定する**。
+If attacker staging directories (e.g., `C:\Users\Public\Music\`) or suspicious process paths were found in Step 3.5, use `search_all_fields` to cross-search those paths across all fields to **comprehensively identify other tools and related activity in the same directory**.
 
-#### 全活動期間の網羅調査（Step 3の時間窓集計で複数クラスタが見つかった場合は必須）:
+#### Full activity period coverage (required if multiple clusters found in Step 3 time window):
 
-Step 3 の `summarize_by_time_window` で複数の活動期間クラスタ（例: 2023-03, 2023-04, 2023-11, 2024-09 のように不連続な活動群）が検出された場合、**全てのクラスタについて代表的なイベントを確認する**。具体的には各クラスタの時間範囲で以下のSQLを実行する:
+If `summarize_by_time_window` in Step 3 detects multiple discontinuous activity clusters (e.g., 2023-03, 2023-04, 2023-11, 2024-09), **verify representative events for all clusters**. Specifically, execute the following SQL for each cluster's time range:
 
 ```sql
 SELECT Timestamp, Computer, RuleTitle, Level, Details
-FROM logs WHERE Timestamp >= '[クラスタ開始]' AND Timestamp <= '[クラスタ終了]'
+FROM logs WHERE Timestamp >= '[cluster start]' AND Timestamp <= '[cluster end]'
 AND Level IN ('high','crit')
 ORDER BY Timestamp LIMIT 20
 ```
 
-これにより「第N波攻撃」と推定していたものが実は正常活動（Windowsスケジュールタスク等）であるケースを識別できる。明確な攻撃活動がないクラスタはレポートで「攻撃キャンペーン」として記載しない。
+This helps identify cases where what was assumed to be a "wave N attack" is actually normal activity (Windows scheduled tasks, etc.). Clusters without clear attack activity should not be reported as "attack campaigns."
 
-### Step 5.5: プロセス相関・ネットワークマッピング（並列実行）
+### Step 5.5: Process Correlation & Network Mapping (Parallel Execution)
 
-Step 4-5 の結果から重要なイベントが特定された後、以下の相関分析を行う:
+After key events are identified from Steps 4-5, perform the following correlation analysis:
 
-#### PID/PGUID相関:
-同一のPID/PGUIDが複数の異なるルールで検出されている場合、それらは**同一プロセスの異なる悪性挙動**を示す。Detailsフィールドに含まれるPID/PGUIDを横断的に確認し、例えば:
-- Qakbot DLLをロードしたrundll32.exe（PID X）が、同じPIDでRDP接続も行っている → DLLにRDP機能が内蔵されている
-- PsExec.exe（PID Y）がネットワーク接続（port 135/445）を行い、同時にリモートサービスを作成している → 横展開の全体像
+#### PID/PGUID Correlation:
+When the same PID/PGUID is detected by multiple different rules, they represent **different malicious behaviors of the same process**. Cross-reference PID/PGUIDs in Details fields. For example:
+- rundll32.exe (PID X) that loaded a Qakbot DLL also made RDP connections with the same PID → the DLL has built-in RDP capability
+- PsExec.exe (PID Y) making network connections (port 135/445) while simultaneously creating remote services → full picture of lateral movement
 
-#### IP→ホスト名マッピング:
-IOC抽出やDetails内で検出された内部IPアドレスについて、同じIPが他のイベントでどのComputer名と紐づいているかを確認する:
+#### IP → Hostname Mapping:
+For internal IP addresses detected in IOC extraction or Details, check which Computer name is associated with the same IP in other events:
 ```sql
 SELECT DISTINCT Computer, Details FROM logs
 WHERE Details LIKE '%10.65.45.XXX%' LIMIT 5
 ```
 
-#### SID→アカウント名の解決:
-「User Added To Local Admin Grp」等のイベントでSIDのみが記録されている場合、同じSIDが他のイベントでアカウント名と共に出現していないか検索する:
+#### SID → Account Name Resolution:
+When events like "User Added To Local Admin Grp" only record SIDs, search whether the same SID appears with an account name in other events:
 ```sql
 SELECT Details FROM logs WHERE Details LIKE '%S-1-5-21-XXXX%' LIMIT 5
 ```
 
-#### ハッシュIOCの収集:
-Step 3.5〜5 で確認したDetailsフィールド内のHashes値（SHA256, SHA1, MD5）を、攻撃に関連するプロセス・DLLについて記録する。特に以下のハッシュはレポートのIOCセクションに含める:
-- 攻撃者がステージングディレクトリに配置したファイルのハッシュ
-- 攻撃ツール（PsExec, Mimikatz, BloodHound等）のハッシュ
-- 不審なDLLのハッシュ
+#### Hash IOC Collection:
+Record Hashes values (SHA256, SHA1, MD5) from Details fields confirmed in Steps 3.5-5 for attack-related processes/DLLs. The following hashes in particular should be included in the report's IOC section:
+- Hashes of files placed in attacker staging directories
+- Hashes of attack tools (PsExec, Mimikatz, BloodHound, etc.)
+- Hashes of suspicious DLLs
 
-### Step 6: 可視化グラフ生成
+### Step 6: Visualization Chart Generation
 
-調査で収集したデータからタイムラインチャートとMITRE ATT&CKフロー図を生成し、レポートに埋め込む。
+Generate timeline charts and MITRE ATT&CK flow diagrams from investigation data and embed them in the report.
 
-**重要**: スクリプトはこのスキルの `scripts/` サブディレクトリに配置されている。スクリプトのベースディレクトリは以下の通り:
+**Important**: Scripts are located in this skill's `scripts/` subdirectory. The script base directory is:
 ```
 SCRIPT_DIR="$HOME/.claude/skills/investigate/scripts"
 ```
 
-**注意**: `~` やGlobツールではパスを解決できない場合がある。スクリプトの存在確認や実行は**必ずBashツール**を使用し、`$HOME` を用いた絶対パスで参照すること。Globツールでスクリプトを探さないこと。
+**Note**: `~` or Glob tool may not resolve paths correctly. Always use the **Bash tool** for script existence checks and execution, referencing with absolute paths using `$HOME`. Do not use the Glob tool to search for scripts.
 
-#### 6-1. タイムラインチャート生成
+#### 6-0. Create Output Directory
 
-Bashツールで以下を実行する。JSON入力をパイプで渡す:
+Before generating any output files, create a directory named after the CSV file (without extension) with a timestamp suffix in the same directory as the CSV. All output files (charts and report) will be saved inside this directory.
+
+```bash
+mkdir -p "[CSV directory]/[CSV filename without extension]_[YYYY-MM-DDTHHMI]"
+```
+
+- `[YYYY-MM-DDTHHMI]`: Local timestamp at the time of directory creation (to the minute)
+
+For example, if the CSV is `/data/hayabusa-results.csv`, create `/data/hayabusa-results_2026-02-20T0723/` and save all outputs there. Use this same directory path for all subsequent output files in Steps 6-1, 6-2, and 7.
+
+#### 6-1. Timeline Chart Generation
+
+Execute the following via Bash tool, piping JSON input:
 
 ```bash
 echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/timeline_chart.py"
 ```
 
-JSON入力の構造:
+JSON input structure:
 ```json
 {
   "events": [
-    {"timestamp": "YYYY-MM-DDTHH:MM:SS", "host": "ホスト名", "rule": "RuleTitle", "level": "crit/high/med/low/info", "mitre": "TXXXX"}
+    {"timestamp": "YYYY-MM-DDTHH:MM:SS", "host": "hostname", "rule": "RuleTitle", "level": "crit/high/med/low/info", "mitre": "TXXXX"}
   ],
   "phases": [
-    {"name": "Phase N: フェーズ名", "start": "YYYY-MM-DDTHH:MM:SS", "end": "YYYY-MM-DDTHH:MM:SS"}
+    {"name": "Phase N: Phase Name", "start": "YYYY-MM-DDTHH:MM:SS", "end": "YYYY-MM-DDTHH:MM:SS"}
   ],
-  "title": "Incident Timeline - [環境名]",
-  "output": "[CSVと同じディレクトリ]/[CSV名]_timeline.html"
+  "title": "Incident Timeline - [environment name]",
+  "output": "[CSV directory]/[CSV name]_[YYYY-MM-DDTHHMI]/[CSV name]_timeline.html"
 }
 ```
 
-- `events`: Step 3-5で収集したhigh/critイベントから代表的なもの（最大50件程度）を選定。同一ルール・同一ホストの繰り返しは代表1件に絞る
-- `phases`: セクション3で定義した攻撃フェーズの時間範囲。省略可
-- `level`: 重要度に応じてマーカーの色・形が変わる（crit=赤ダイヤ、high=橙丸、med=黄四角、low=青三角）
+- `events`: Select representative events (up to ~50) from high/crit events collected in Steps 3-5. Deduplicate repetitions of the same rule on the same host to 1 representative
+- `phases`: Time ranges of attack phases defined in Section 3. Optional
+- `level`: Marker color/shape varies by severity (crit=red diamond, high=orange circle, med=yellow square, low=blue triangle)
 
-#### 6-2. MITRE ATT&CKフロー図生成
+#### 6-2. MITRE ATT&CK Flow Diagram Generation
 
 ```bash
 echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/mitre_flow.py"
 ```
 
-JSON入力の構造:
+JSON input structure:
 ```json
 {
   "tactics": [
@@ -222,340 +235,398 @@ JSON入力の構造:
       "time_range": "YYYY-MM-DD HH:MM ~ HH:MM"
     }
   ],
-  "title": "Attack Flow (MITRE ATT&CK) - [環境名]",
-  "output": "[CSVと同じディレクトリ]/[CSV名]_mitre_flow.html"
+  "title": "Attack Flow (MITRE ATT&CK) - [environment name]",
+  "output": "[CSV directory]/[CSV name]_[YYYY-MM-DDTHHMI]/[CSV name]_mitre_flow.html"
 }
 ```
 
-- `tactics`: セクション4の攻撃フロー情報。検出された順にタクティクスを並べる
-- 各タクティクスの `techniques` にはStep 3のルールタイトルから推定したテクニックIDと名前を記載
-- `hosts` には各タクティクスに関連するホスト名を記載
+- `tactics`: Attack flow information from Section 4. List tactics in detection order
+- Each tactic's `techniques` should include technique IDs and names inferred from Step 3 rule titles
+- `hosts` should list host names associated with each tactic
 
-#### 6-3. グラフのレポート埋め込み
+#### 6-3. Embedding Charts in the Report
 
-生成したHTMLファイルをマークダウンレポート内の該当セクションにリンクとして埋め込む:
-- タイムラインチャート → セクション3「侵害タイムライン」の冒頭に `[タイムラインチャート（インタラクティブ）](ファイル名_timeline.html)` で挿入
-- MITREフロー図 → セクション4「攻撃フロー」の冒頭に `[攻撃フロー図（インタラクティブ）](ファイル名_mitre_flow.html)` で挿入
+Embed generated HTML files as markdown links in the appropriate report sections:
+- Timeline chart → Insert at the beginning of Section 3 "Compromise Timeline" as `[Interactive Timeline Chart](filename_timeline.html)`
+- MITRE flow diagram → Insert at the beginning of Section 4 "Attack Flow" as `[Interactive Attack Flow Diagram](filename_mitre_flow.html)`
 
-### Step 7: レポート生成
+#### 6-4. Collect Time and Version Metadata for the Report
 
-収集した全データを分析し、以下の出力フォーマットに従って**日本語の**インシデント・フォレンジックレポートを生成する。
+After visualization files have been generated, use the Bash tool to obtain the following values for report metadata:
+- `date '+%Y-%m-%d %H:%M:%S'` → use as the report metadata timestamp reference
+- `claude --version` → use for the "Generated by" field
 
-#### ファイル出力
+**Ordering requirement**: Run these commands **only after visualization chart generation is complete**. Do not run them earlier.
 
-レポートは**マークダウンファイル（.md）** として保存する。ファイル名の命名規則:
+### Step 7: Report Generation
+
+Analyze all collected data and generate an **English** incident forensic report following the output format below.
+
+#### File Output
+
+The report should be generated as an **HTML file only**. Do not create an intermediate Markdown file.
+
+##### Step 7-1: HTML Report Output
+
+File naming convention:
 
 ```
-{CSVファイル名（拡張子なし）}_{YYYY-MM-DDTHHMI}.md
+{CSV filename (without extension)}_{YYYY-MM-DDTHHMI}.html
 ```
 
-- `{CSVファイル名}`: 分析対象CSVのファイル名（拡張子 `.csv` を除いたstem部分）
-- `{YYYY-MM-DDTHHMI}`: レポート生成時のローカルタイムスタンプ（時分まで）
-- 保存先: 分析対象CSVと同じディレクトリ
+- `{CSV filename}`: The stem of the target CSV filename (without `.csv` extension)
+- `{YYYY-MM-DDTHHMI}`: Local timestamp at report generation time (to the minute)
+- Save location: Inside the output directory created in Step 6-0 (`[CSV directory]/[CSV filename without extension]_[YYYY-MM-DDTHHMI]/`)
 
-例:
-- `hayabusa-results.csv` → `hayabusa-results_2026-02-20T0723.md`
-- `/path/to/incident-log.csv` → `/path/to/incident-log_2026-02-20T1530.md`
+First, assemble the full report body as a string. Do not save it as a `.md` file at any point.
 
-レポート全文をWriteツールでファイルに書き出し、保存完了後にファイルパスをユーザーに通知する。
+Then execute the following via Bash tool to convert the report body directly to HTML and save it:
+
+```bash
+echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/report.py"
+```
+
+JSON input structure:
+```json
+{
+  "content": "# Incident Forensic Report\n...",
+  "output": "/path/to/report.html",
+  "title": "Incident Forensic Report",
+  "charts": {
+    "timeline": "/path/to/timeline.html",
+    "mitre_flow": "/path/to/mitre_flow.html"
+  }
+}
+```
+
+- `content`: The complete report body as a markdown-style string
+- `output`: Final HTML output file path
+- `charts`: Paths to chart HTML files generated in Step 6. Chart links `[...](xxx.html)` in the report body are automatically converted to iframe embeds
+
+After conversion, notify the user of the final `.html` file path.
+
+Example:
+- `hayabusa-results.csv` → `hayabusa-results_2026-02-20T0723/hayabusa-results_2026-02-20T0723.html` (final report)
+- The output directory `hayabusa-results_2026-02-20T0723/` will also contain `hayabusa-results_timeline.html` and `hayabusa-results_mitre_flow.html`
 
 ---
 
-## 出力フォーマット仕様
+## Output Format Specification
 
-レポートは以下の9セクションで構成する。各セクションの内容・テーブル列・記載ルールに従うこと。データに該当がないセクションも「該当なし」として残し、調査済みであることを明示する。
+The report consists of the following 9 sections. Follow the content, table columns, and formatting rules for each section. Sections with no applicable data should still remain as "None identified" to make clear that they were investigated.
 
-### セクション 1: エグゼクティブサマリー
+### Section 1: Executive Summary
 
-経営層・非技術者向けの要約。3〜5文で以下を伝える:
-- 何が起きたか（侵害の性質: APT、ランサムウェア、不正アクセス等）
-- いつ起きたか（期間）
-- どの程度の規模か（影響ホスト数・アカウント数）
-- 攻撃の深刻度（最高重要度と確認された脅威）
+A summary for executives and non-technical readers. Convey the following in 3-5 sentences:
+- What happened (nature of compromise: APT, ransomware, unauthorized access, etc.)
+- When it occurred (time period)
+- Scale of impact (number of affected hosts/accounts)
+- Severity of the attack (highest severity and confirmed threats)
 
 ```markdown
-# インシデント・フォレンジックレポート
+# Incident Forensic Report
 
-## 1. エグゼクティブサマリー
+## 1. Executive Summary
 
-YYYY-MM-DD から YYYY-MM-DD の期間にかけて、[環境名] において
-[侵害の種類] が確認された。攻撃者は...（3〜5文の要約）
+From YYYY-MM-DD to YYYY-MM-DD, a [type of compromise] was confirmed in [environment name].
+The attacker... (3-5 sentence summary)
 ```
 
-### セクション 2: インシデント概要
+### Section 2: Incident Overview
 
-定量的なファクトシートを表形式で示す。
+Present a quantitative fact sheet in table format.
 
 ```markdown
-## 2. インシデント概要
+## 2. Incident Overview
 
-| 項目 | 値 |
+| Item | Value |
 |---|---|
-| インシデント期間 | YYYY-MM-DD HH:MM UTC ~ YYYY-MM-DD HH:MM UTC |
-| 分析対象イベント総数 | N 件 |
-| 重要度別件数 | crit: N / high: N / med: N / low: N / info: N |
-| 影響ホスト数 | N 台 |
-| 影響ホスト一覧 | HOST-A, HOST-B, ... |
-| 侵害確認アカウント数 | N アカウント |
-| 検出された攻撃ツール/マルウェア | （ルール名から識別されたもの、なければ「特定のツール名は未検出」） |
-| 初期侵入ベクター（推定） | （根拠とともに記載。特定できない場合は「不明 - 追加調査が必要」） |
-| 最高重要度イベント | ルール名 (ホスト名, 時刻) |
+| Incident Period | YYYY-MM-DD HH:MM UTC ~ YYYY-MM-DD HH:MM UTC |
+| Total Events Analyzed | N events |
+| Counts by Severity | crit: N / high: N / med: N / low: N / info: N |
+| Affected Host Count | N hosts |
+| Affected Hosts | HOST-A, HOST-B, ... |
+| Compromised Account Count | N accounts |
+| Detected Attack Tools/Malware | (identified from rule names, or "No specific tool names detected") |
+| Initial Access Vector (Estimated) | (with evidence. If unidentifiable: "Unknown - further investigation required") |
+| Highest Severity Event | Rule Name (hostname, timestamp) |
 ```
 
-「検出された攻撃ツール/マルウェア」はルール名に含まれるツール名を根拠に記載する。ルール名からツール名が特定できない場合でも、攻撃手法（例: "PowerShellによるリモート実行", "レジストリ改ざんによる防御回避"）を記載する。
+"Detected Attack Tools/Malware" should be based on tool names found in rule names. Even if no specific tool name is identifiable, describe the attack technique (e.g., "Remote execution via PowerShell", "Defense evasion via registry modification").
 
-「初期侵入ベクター」の推定根拠例:
-- Initial Access戦術のイベントが存在する場合 → そのイベント内容から推定
-- 二重拡張子ファイルの実行 → フィッシングメール添付ファイル
-- 外部IPからのログオン → リモートアクセス経由
-- 脆弱性関連ルール → 脆弱性悪用
-- 上記いずれにも該当しない → 「不明」と明記
+Initial access vector estimation evidence examples:
+- Initial Access tactic events exist → estimate from event content
+- Double-extension file execution → phishing email attachment
+- Logon from external IP → remote access
+- Vulnerability-related rule → vulnerability exploitation
+- None of the above → explicitly state "Unknown"
 
-### セクション 3: 侵害タイムライン（メインセクション）
+### Section 3: Compromise Timeline (Main Section)
 
-レポートの核心部分。時系列を攻撃フェーズごとにグループ化し、各フェーズ内はイベントを時刻順に表形式で記載する。
+The core of the report. Group the timeline by attack phase, with events listed chronologically in table format within each phase.
 
-#### フェーズ分類のガイドライン
+#### Phase Classification Guidelines
 
-MITRE ATT&CKタクティクスと時間的クラスタリングに基づいてフェーズを分ける。以下は参考区分であり、データの実態に合わせて柔軟にフェーズを設定する:
+Divide phases based on MITRE ATT&CK tactics and temporal clustering. The following are reference categories; set phases flexibly according to the actual data:
 
-| フェーズ候補 | 対応MITRE戦術 | 典型的な活動内容 |
+| Phase Candidate | Corresponding MITRE Tactic | Typical Activities |
 |---|---|---|
-| 初期アクセス | Initial Access (TA0001) | フィッシング、脆弱性悪用、有効アカウントの不正使用、サプライチェーン |
-| 実行 | Execution (TA0002) | スクリプト実行、コマンドライン、WMI/PowerShell/タスクスケジューラ |
-| 永続化 | Persistence (TA0003) | サービス登録、スケジュールタスク、レジストリRun key、Bootkit |
-| 権限昇格 | Privilege Escalation (TA0004) | 管理者グループ追加、トークン操作、脆弱性悪用 |
-| 防御回避 | Defense Evasion (TA0005) | AV無効化、ログ消去、難読化、プロセスインジェクション、署名偽装 |
-| 認証情報窃取 | Credential Access (TA0006) | LSASS、SAMダンプ、Kerberoasting、パスワードスプレー |
-| 偵察 | Discovery (TA0007) | システム情報、ネットワーク列挙、AD列挙、ファイル探索 |
-| 横展開 | Lateral Movement (TA0008) | RDP、SMB、WinRM、PsExec、Pass-the-Hash/Ticket |
-| 収集 | Collection (TA0009) | ファイル収集、クリップボード、スクリーンキャプチャ、メール収集 |
-| C2通信 | Command and Control (TA0011) | HTTP/HTTPS、DNS、暗号化チャネル、プロキシ |
-| 持ち出し | Exfiltration (TA0010) | 外部転送、クラウドストレージ、代替プロトコル |
-| 影響 | Impact (TA0040) | 暗号化（ランサムウェア）、破壊、サービス停止、改ざん |
+| Initial Access | Initial Access (TA0001) | Phishing, vulnerability exploitation, valid account abuse, supply chain |
+| Execution | Execution (TA0002) | Script execution, command line, WMI/PowerShell/Task Scheduler |
+| Persistence | Persistence (TA0003) | Service registration, scheduled tasks, registry Run keys, Bootkit |
+| Privilege Escalation | Privilege Escalation (TA0004) | Admin group addition, token manipulation, vulnerability exploitation |
+| Defense Evasion | Defense Evasion (TA0005) | AV disabling, log clearing, obfuscation, process injection, signature spoofing |
+| Credential Access | Credential Access (TA0006) | LSASS, SAM dump, Kerberoasting, password spraying |
+| Discovery | Discovery (TA0007) | System info, network enumeration, AD enumeration, file exploration |
+| Lateral Movement | Lateral Movement (TA0008) | RDP, SMB, WinRM, PsExec, Pass-the-Hash/Ticket |
+| Collection | Collection (TA0009) | File collection, clipboard, screen capture, email collection |
+| Command and Control | Command and Control (TA0011) | HTTP/HTTPS, DNS, encrypted channels, proxies |
+| Exfiltration | Exfiltration (TA0010) | External transfer, cloud storage, alternative protocols |
+| Impact | Impact (TA0040) | Encryption (ransomware), destruction, service disruption, defacement |
 
-活動が確認されないフェーズは省略する。データに応じて複数のタクティクスを1フェーズにまとめたり、同一タクティクスを時間帯で分割してもよい。
+Omit phases where no activity was confirmed. Multiple tactics may be combined into one phase, or the same tactic may be split across time periods as appropriate.
 
-#### 各フェーズの記載フォーマット
+#### Per-Phase Format
 
 ```markdown
-## 3. 侵害タイムライン
+## 3. Compromise Timeline
 
-### Phase 1: [フェーズ名] (YYYY-MM-DD HH:MM ~ HH:MM UTC)
+### Phase 1: [Phase Name] (YYYY-MM-DD HH:MM ~ HH:MM UTC)
 
-| 時刻 (UTC) | ホスト | イベント (RuleTitle) | 重要度 | MITRE | 詳細 |
+| Time (UTC) | Host | Event (RuleTitle) | Severity | MITRE | Details |
 |---|---|---|---|---|---|
-| HH:MM:SS | HOST-A | Rule Name | crit/high | TID | Detailsから攻撃理解に必要な情報を抜粋 |
+| HH:MM:SS | HOST-A | Rule Name | crit/high | TID | Key information extracted from Details for understanding the attack |
 
-**分析所見**: このフェーズでは...
+**Analysis**: In this phase...
 ```
 
-各フェーズの「分析所見」には以下を含める:
-- 攻撃者が何を達成しようとしたか（目的の推定）
-- 使用された手法の説明（一般読者にもわかるように）
-- 検出根拠（どのSigmaルールがなぜ発火したか）
-- 前後のフェーズとの因果関係
+Each phase's "Analysis" should include:
+- What the attacker was trying to achieve (estimated objective)
+- Description of techniques used (understandable to general readers)
+- Detection basis (which Sigma rule fired and why)
+- Causal relationship with preceding/following phases
 
-テーブルに載せるイベントの選別基準:
-- crit/highイベントは原則すべて記載
-- 同一ルール・同一ホストの繰り返しは代表的な1件+件数注記
-- 同一タイムスタンプで複数ルールが発火した場合は最も重要度の高いルールを採用し、他を注記
+Event selection criteria for tables:
+- All crit/high events should be listed in principle
+- Repetitions of the same rule on the same host → 1 representative + count note
+- When multiple rules fire at the same timestamp → use the highest severity rule and note others
 
-### セクション 4: 攻撃フロー図
+### Section 4: Attack Flow Diagram
 
-検出されたMITRE ATT&CKタクティクスに基づく攻撃進行の可視化。
+Visualization of attack progression based on detected MITRE ATT&CK tactics.
 
 ```markdown
-## 4. 攻撃フロー (MITRE ATT&CK)
+## 4. Attack Flow (MITRE ATT&CK)
 
-[検出タクティクス1] → [検出タクティクス2] → ... → [検出タクティクスN]
+[Detected Tactic 1] → [Detected Tactic 2] → ... → [Detected Tactic N]
      (TID)              (TID)                        (TID)
-   [関連ホスト]        [関連ホスト]                  [関連ホスト]
+   [Related Hosts]     [Related Hosts]              [Related Hosts]
 ```
 
-- 実際に検出されたタクティクスのみ記載する
-- 各タクティクスの下に、最も代表的なテクニックIDと関連ホストを付記
-- 検出間にギャップがある場合（例: 初期アクセス→C2の間が不明）、「(未検出/推定)」と注記して攻撃チェーンの欠落を明示
+- List only actually detected tactics
+- Below each tactic, note the most representative technique ID and related hosts
+- When gaps exist between detections (e.g., unknown between Initial Access and C2), note "(Not detected/Estimated)" to indicate gaps in the attack chain
 
-### セクション 5: 影響を受けた資産とアカウント
+### Section 5: Affected Assets and Accounts
 
-#### 5-1. ホスト別影響サマリー
+#### 5-1. Per-Host Impact Summary
 
 ```markdown
-## 5. 影響を受けた資産とアカウント
+## 5. Affected Assets and Accounts
 
-### 5-1. ホスト別影響サマリー
+### 5-1. Per-Host Impact Summary
 
-| ホスト名 | 役割（推定） | high/crit件数 | 主な検出ルール | 最初の異常検出 | 最後の異常検出 | 侵害レベル |
+| Hostname | Role (Estimated) | High/Crit Count | Primary Detection Rules | First Anomaly Detected | Last Anomaly Detected | Compromise Level |
 |---|---|---|---|---|---|---|
-| HOST-A | 端末/サーバ/DC/DB等 | N件 | Rule1, Rule2 | YYYY-MM-DD HH:MM | YYYY-MM-DD HH:MM | 確定/疑い/調査中 |
+| HOST-A | Workstation/Server/DC/DB etc. | N events | Rule1, Rule2 | YYYY-MM-DD HH:MM | YYYY-MM-DD HH:MM | Confirmed/Suspected/Under Investigation |
 ```
 
-ホスト役割の推定方法:
-- ホスト名の命名規則から推定（DC-, SRV-, WS-, DB- 等）
-- 検出イベントの種類から推定（AD関連イベント→ドメインコントローラ、DB関連→DBサーバ等）
-- 推定できない場合は「不明」
+Host role estimation methods:
+- Infer from hostname naming conventions (DC-, SRV-, WS-, DB-, etc.)
+- Infer from detected event types (AD-related events → Domain Controller, DB-related → DB server, etc.)
+- If unable to estimate → "Unknown"
 
-侵害レベルの判定基準:
-- **確定**: critイベント検出、マルウェア/攻撃ツール実行、C2通信が確認されたホスト
-- **疑い**: highイベント検出、横展開先候補だが決定的証拠が不足
-- **調査中**: 関連はあるがmedium以下のみ。追加ログが必要
+Compromise level criteria:
+- **Confirmed**: Host with crit events detected, malware/attack tool execution, or C2 communication confirmed
+- **Suspected**: High events detected, lateral movement target candidate but lacking definitive evidence
+- **Under Investigation**: Related but only medium or below. Additional logs needed
 
-#### 5-2. アカウント別影響
+#### 5-2. Per-Account Impact
 
 ```markdown
-### 5-2. 侵害されたアカウント
+### 5-2. Compromised Accounts
 
-| アカウント名 | 種別 | 関連ホスト | 主な関連イベント | 検出件数 | 侵害の根拠 |
+| Account Name | Type | Related Hosts | Primary Related Events | Detection Count | Compromise Evidence |
 |---|---|---|---|---|---|
-| アカウント名 | 種別 | HOST-A, HOST-B | イベント概要 | N件 | 侵害と判断した理由 |
+| Account name | Type | HOST-A, HOST-B | Event summary | N events | Reason for compromise determination |
 ```
 
-アカウント種別: ドメインユーザー / ドメイン管理者 / ローカル管理者 / サービスアカウント / SYSTEM / マシンアカウント
+Account types: Domain User / Domain Admin / Local Admin / Service Account / SYSTEM / Machine Account
 
-侵害の判断基準:
-- 通常使用されないホストでの活動
-- 異常な時間帯（業務時間外）の活動
-- 権限昇格を伴う活動
-- 攻撃ツールの実行主体
-- 複数ホストでの短時間の認証（横展開の兆候）
+Compromise determination criteria:
+- Activity on hosts not normally used
+- Activity during abnormal hours (outside business hours)
+- Activity involving privilege escalation
+- Actor executing attack tools
+- Short-duration authentication across multiple hosts (lateral movement indicator)
 
-### セクション 6: IOC一覧 (Indicators of Compromise)
+### Section 6: IOC List (Indicators of Compromise)
 
-カテゴリ別にIOCを整理する。フォレンジック調査や封じ込め対応に使える形で記載する。
+Organize IOCs by category. Present in a format usable for forensic investigation and containment response.
 
 ```markdown
-## 6. IOC一覧 (Indicators of Compromise)
+## 6. IOC List (Indicators of Compromise)
 
-### 6-1. 悪性プロセス/ファイル
+### 6-1. Malicious Processes/Files
 
-| IOC種別 | 値 | 検出ホスト | 検出件数 | コンテキスト |
+| IOC Type | Value | Detected Host | Detection Count | Context |
 |---|---|---|---|---|
-| ファイルパス/プロセス/ハッシュ | 値 | ホスト名 | N | 攻撃における役割 |
+| File Path/Process/Hash | value | hostname | N | Role in the attack |
 
-### 6-2. ネットワークIOC
+### 6-2. Network IOCs
 
-| IOC種別 | 値 | 方向 | 検出ホスト | コンテキスト |
+| IOC Type | Value | Direction | Detected Host | Context |
 |---|---|---|---|---|
-| IP/ドメイン/URL/ポート | 値 | In/Out | ホスト名 | 通信の目的 |
+| IP/Domain/URL/Port | value | In/Out | hostname | Purpose of communication |
 
-### 6-3. 永続化メカニズム
+### 6-3. Persistence Mechanisms
 
-| 種別 | 名前/パス | ホスト | コンテキスト |
+| Type | Name/Path | Host | Context |
 |---|---|---|---|
-| サービス/タスク/レジストリ/スタートアップ等 | 値 | ホスト名 | 目的 |
+| Service/Task/Registry/Startup etc. | value | hostname | Purpose |
 
-### 6-4. アカウントIOC
+### 6-4. Account IOCs
 
-| アカウント | 種別 | 不審な活動 | ホスト |
+| Account | Type | Suspicious Activity | Host |
 |---|---|---|---|
-| アカウント名 | 種別 | 活動内容 | ホスト名 |
+| Account name | Type | Activity description | hostname |
 ```
 
-各カテゴリで該当がない場合は「該当なし - [理由]」と明記する。「調査したが検出されなかった」と「調査していない」を区別することが重要。
+For categories with no findings, explicitly state "None identified - [reason]". It is important to distinguish between "investigated but not detected" and "not investigated."
 
-### セクション 7: デコード済みペイロード
+### Section 7: Decoded Payloads
 
-エンコード/難読化されたスクリプトの分析結果を記載する。PowerShellに限らず、VBScript、JScript、Base64エンコードされたバイナリなど、デコードが必要なペイロード全般を対象とする。
+Analysis results of encoded/obfuscated scripts. Covers all payloads requiring decoding, not just PowerShell — VBScript, JScript, Base64-encoded binaries, etc.
 
 ```markdown
-## 7. デコード済みペイロード
+## 7. Decoded Payloads
 
-### ペイロード 1: [目的の簡潔な説明]
-- **検出時刻**: YYYY-MM-DD HH:MM UTC
-- **検出ホスト**: HOST-A
-- **検出ルール**: Rule Name
-- **エンコード方式**: Base64 / XOR / Gzip+Base64 等
-- **デコード結果**:
+### Payload 1: [Brief description of purpose]
+- **Detection Time**: YYYY-MM-DD HH:MM UTC
+- **Detection Host**: HOST-A
+- **Detection Rule**: Rule Name
+- **Encoding Method**: Base64 / XOR / Gzip+Base64 etc.
+- **Decoded Result**:
   ```
-  デコードされたコマンド/スクリプト
+  Decoded command/script
   ```
-- **分析**: このスクリプトの目的と実行された場合の影響（意図と影響の説明）
-- **攻撃性判定**: 攻撃ペイロード / 正規ツール由来（非攻撃性） / 判定不能
+- **Analysis**: Purpose of this script and impact if executed (intent and impact description)
+- **Maliciousness Assessment**: Attack payload / Legitimate tool origin (non-malicious) / Indeterminate
 ```
 
-デコード対象が存在しない場合は「エンコードされたペイロードは検出されなかった」と記載。
+If no decode targets exist, state "No encoded payloads were detected."
 
-攻撃性判定の基準:
-- 外部通信を含む → 攻撃ペイロードの可能性が高い
-- 既知の構成管理ツール（Ansible, Puppet, Chef, Packer等）の痕跡 → 正規ツール由来
-- メモリ操作、プロセスインジェクション、資格情報アクセスを含む → 攻撃ペイロード
-- 判断が困難な場合は「判定不能 - 追加調査が必要」
+Maliciousness assessment criteria:
+- Contains external communications → likely attack payload
+- Traces of known configuration management tools (Ansible, Puppet, Chef, Packer, etc.) → legitimate tool origin
+- Contains memory manipulation, process injection, credential access → attack payload
+- If difficult to determine → "Indeterminate - further investigation required"
 
-### セクション 8: 横展開分析
+### Section 8: Lateral Movement Analysis
 
-ホスト間の攻撃伝播パターンを整理する。
+Organize inter-host attack propagation patterns.
 
 ```markdown
-## 8. 横展開 (Lateral Movement) 分析
+## 8. Lateral Movement Analysis
 
-### 伝播経路
+### Propagation Path
 
-起点ホスト → 経由 → 到達先の順で攻撃の流れを示す。
+Show attack flow from origin → intermediary → destination.
 
-HOST-A (HH:MM) --[手法]--> HOST-B (HH:MM) --[手法]--> HOST-C (HH:MM)
+HOST-A (HH:MM) --[technique]--> HOST-B (HH:MM) --[technique]--> HOST-C (HH:MM)
 
-### 横展開イベント詳細
+### Lateral Movement Event Details
 
-| 時刻 (UTC) | 起点ホスト | 宛先ホスト | 手法 | 検出ルール | 使用アカウント |
+| Time (UTC) | Source Host | Destination Host | Technique | Detection Rule | Account Used |
 |---|---|---|---|---|---|
-| HH:MM:SS | HOST-A | HOST-B | 手法名 | Rule Name | アカウント名 |
+| HH:MM:SS | HOST-A | HOST-B | Technique name | Rule Name | Account name |
 ```
 
-横展開が検出されなかった場合:
-- 単一ホストのインシデント → 「横展開は検出されなかった。攻撃は [HOST-A] に限定されていた可能性がある」
-- ログ不足の可能性 → 「横展開の証拠は検出されなかったが、[理由] により確定的ではない」
+When no lateral movement is detected:
+- Single-host incident → "No lateral movement was detected. The attack may have been confined to [HOST-A]"
+- Possible log insufficiency → "No evidence of lateral movement was detected, but this is not conclusive due to [reason]"
 
-### セクション 9: 調査上の留意事項と推奨事項
+### Section 9: Investigation Notes and Recommendations
 
 ```markdown
-## 9. 調査上の留意事項と推奨事項
+## 9. Investigation Notes and Recommendations
 
-### 分析の制約
-- **分析範囲**: 本レポートは Hayabusa Sigmaルールにより検出されたイベントに基づく。ルールに合致しない活動は検出対象外
-- **タイムスタンプ**: すべてUTC表記
-- **ログソース**: 分析に使用したログソース / 不足しているログソース
+### Analysis Constraints
+- **Scope**: This report is based on events detected by Hayabusa Sigma rules. Activity not matching any rule is outside detection scope
+- **Timestamps**: All in UTC
+- **Log Sources**: Log sources used for analysis / missing log sources
 
-### 偽陽性と判定したイベント
-Step 3.5 の検証で偽陽性（または偽陽性の可能性が高い）と判定し、攻撃タイムラインから**除外した**イベントを列挙する。判定根拠を付記し、読者が独自に再判定できるようにDetailsの要約を含める。
+### Events Determined to be False Positives
+List events determined to be false positives (or highly likely false positives) in Step 3.5 verification that were **excluded from the attack timeline**. Include determination rationale and a Details summary so readers can independently re-evaluate.
 
-| ルールタイトル | 件数 | 判定根拠（Detailsの要約） |
+| Rule Title | Count | Determination Rationale (Details Summary) |
 |---|---|---|
-| ルール名 | N件 | 偽陽性と判断した具体的理由（例: "正規Windows印刷サービス svchost.exe -k print"） |
+| Rule name | N events | Specific reason for false positive determination (e.g., "Legitimate Windows print service svchost.exe -k print") |
 
-### 判断が困難なイベント
-攻撃活動か正規活動か確定できなかったイベントを列挙する。追加情報があれば判定可能になる条件も記載する。
+### Indeterminate Events
+List events where it was not possible to definitively determine attack vs. legitimate activity. Include conditions under which a determination could be made with additional information.
 
-### 追加調査の推奨
-（本分析では確認できなかった領域、追加で取得すべきログ、確認すべき事項を列挙）
+### Recommended Additional Investigation
+(Areas not covered in this analysis, additional logs to collect, items to verify)
 
-### 封じ込め・復旧の推奨事項
-（検出された脅威に基づく即時対応の提案: アカウントリセット、ホスト隔離、IOCブロック等）
+### Containment and Recovery Recommendations
+(Immediate response suggestions based on detected threats: account resets, host isolation, IOC blocking, etc.)
 ```
+
+### Report Metadata (Footer)
+
+Add the following metadata section at the end of the report, after Section 9, separated by a horizontal rule.
+
+```markdown
+---
+
+> **Report Metadata**
+> - Generated by: Claude Code (`claude --version` output)
+> - Model: [model ID from system prompt (e.g., claude-opus-4-6)]
+> - Analysis duration: [elapsed time from Step 1 start to report output (min:sec)]
+> - Report generated at: YYYY-MM-DD HH:MM:SS (Local)
+```
+
+Metadata collection procedure:
+1. **Start time**: Record `date '+%Y-%m-%d %H:%M:%S'` in Step 1
+2. **Claude Code version**: Run `claude --version` via Bash tool in Step 6-4
+3. **Model ID**: Obtain from the system prompt's "You are powered by the model named ..." statement. If unknown, state "Claude (model ID unknown)"
+4. **Analysis duration**: Calculate the difference between the start time recorded in Step 1 and either the post-visualization timestamp captured in Step 6-4 or the final report generation time in Step 7
+5. **Report generated at**: Record the Step 7 report completion time
 
 ---
 
-## 分析上の注意点
+## Analysis Guidelines
 
-レポート全体を通じて以下に留意する:
+Observe the following throughout the entire report:
 
-- **攻撃者ツールの特定**: Hayabusaのルール名には攻撃ツール名が含まれることが多い（例: "HackTool - [ツール名]", "[ツール名] Execution"）。ルール名のパターンから攻撃ツール/フレームワークを識別し、セクション2に反映する
-- **正規活動との区別**: 構成管理ツール（Packer, Ansible, SCCM等）やIT管理ツール由来の活動は攻撃と誤認しやすい。コンテキスト（実行パス、実行ユーザー、タイミング）から判断し、判断根拠をセクション9に記載する
-- **重複検出の扱い**: 同一タイムスタンプで複数ルールが発火するのは同一イベントへの複数ルールマッチの可能性が高い。タイムラインでは最も重要度の高いルールを代表として採用する
-- **アカウント分析**: 単一アカウントの複数ホストでの活動、サービスアカウントの対話的ログオン、管理者アカウントの異常使用パターンに注目する
-- **時間的相関**: 異なるホスト間で短時間に発生するイベントは横展開の兆候。時間窓（通常数分〜数十分）内のイベント群を関連付ける
-- **ページング対応**: MCP toolsの結果に `has_more: True` がある場合、以下の基準に従って追加取得を判断する:
-  - **全件取得が必須**: critイベント（`run_sql` WHERE Level = 'crit'）、侵害アカウント一覧（`parse_details_field` User）
-  - **上位200件まで取得**: IOC（`extract_iocs`）、横展開相関（`correlate_lateral_movement`）
-  - **最初のページで十分**: 時間窓集計（`summarize_by_time_window`）、ルールタイトル集計（`analyze_rule_titles`）
-  - **最も疑わしいホスト2〜3台分を全件取得**: ホストタイムライン（`analyze_host_timeline`）
-  - 上記以外は状況に応じて判断。ページングよりもフィルタ条件の絞り込み（level, rule_title, time_range等）で必要なデータに到達することを優先する
-- **大きなツール出力への対応**: `decode_powershell_commands` や `run_sql` の結果がトークン上限を超えてファイルに保存される場合がある。この場合はTaskツール（バックグラウンドエージェント）にファイルの読み取りと要約を委任し、メインの調査フローを止めない。バックグラウンドエージェントへの指示には「デコード結果の要約」「ホスト・タイムスタンプの抽出」「攻撃目的の分類」を含める
-- **データ不在への対応**: 特定のカテゴリのイベントが検出されないことも重要な情報。「検出なし」は「発生していない」ではなく「検出ルールに合致するものがなかった」ことを意味する。この区別をレポートに反映する
-- **偽陽性の積極的排除（最重要）**: **ルールタイトルだけで攻撃と断定してはならない。必ずDetailsフィールドの実際の内容を確認してから判断する。** "Suspicious Service Path" が正規の印刷サービス、"LOLBAS Renamed" が正規のElastic Winlogbeatのリネーム、"Proc Access" がVeeam Backupの正規動作である場合がある。各ルールの最初の発見時に必ず1-2件のDetailsを確認し、偽陽性かどうかを判定するステップ（Step 3.5）を省略しない
-- **攻撃者のステージングディレクトリ検索**: 攻撃者は頻繁に `C:\Users\Public\`、`C:\ProgramData\`、`C:\Windows\Temp\<ランダム>\`、`C:\Perflogs\` 等にツールを配置する。Detailsフィールドのプロセスパスにこれらのディレクトリが含まれる場合、`search_all_fields` で同じディレクトリパスを横断検索し、他に配置されたツールを網羅的に発見する
-- **PID/PGUIDによるプロセス相関**: 同一PID/PGUIDが異なるルールで検出されている場合、それは同一プロセスの異なる側面の検出であることを意味する。例えば、あるrundll32.exe（PID X）がQakbot DLLをロードし、同じPID XでRDP接続を行っている場合、DLLにRDP機能が内蔵されていると結論づけられる。レポートのタイムライン・横展開分析でこの相関を反映する
-- **IP→ホスト名マッピング**: IOCや横展開分析で検出された内部IPアドレスは、可能な限り対応するホスト名に解決する。同じIPが別のイベントでComputer名と共に登場していないか確認するか、SrcIP/TgtIPとComputer名の対応関係をSQLで照合する
-- **SID→アカウント名の解決**: 「User Added To Local Admin Grp」等のイベントでSIDのみが記録されている場合、同じSIDが他のイベントでアカウント名と共に出現していないか検索し、可能な限りアカウント名を特定する
-- **ハッシュIOCの確実な収集**: Detailsフィールドの Hashes 値（SHA256, SHA1, MD5, IMPHASH）は、攻撃に関連するプロセス/DLLについて必ずレポートのIOCセクションに記載する。特にステージングディレクトリに配置されたファイル、攻撃ツール、不審なDLLのハッシュは重要
-- **全活動期間の網羅**: 時間窓分析で複数の不連続な活動クラスタが検出された場合、主要なクラスタだけでなく全てのクラスタの代表イベントを確認する。活動が確認されたが明確な攻撃活動がないクラスタは「攻撃キャンペーン」として記載せず、正常活動または詳細不明として扱う
+- **Identifying attacker tools**: Hayabusa rule names often contain attack tool names (e.g., "HackTool - [tool name]", "[tool name] Execution"). Identify attack tools/frameworks from rule name patterns and reflect in Section 2
+- **Distinguishing from legitimate activity**: Activity from configuration management tools (Packer, Ansible, SCCM, etc.) and IT management tools can be mistaken for attacks. Judge based on context (execution path, executing user, timing) and document rationale in Section 9
+- **Handling duplicate detections**: Multiple rules firing at the same timestamp is likely multiple rule matches on the same event. Use the highest severity rule as representative in the timeline
+- **Account analysis**: Focus on single accounts active across multiple hosts, service accounts with interactive logons, and abnormal admin account usage patterns
+- **Temporal correlation**: Events occurring across different hosts within a short time are indicators of lateral movement. Correlate event groups within time windows (typically minutes to tens of minutes)
+- **Pagination handling**: When MCP tool results show `has_more: True`, follow these criteria for additional retrieval:
+  - **Must retrieve all**: Crit events (`run_sql` WHERE Level = 'crit'), compromised account list (`parse_details_field` User)
+  - **Retrieve up to 200**: IOCs (`extract_iocs`), lateral movement correlation (`correlate_lateral_movement`)
+  - **First page is sufficient**: Time window summaries (`summarize_by_time_window`), rule title aggregation (`analyze_rule_titles`)
+  - **Retrieve all for the 2-3 most suspicious hosts**: Host timeline (`analyze_host_timeline`)
+  - For others, judge by situation. Prioritize reaching needed data through filter refinement (level, rule_title, time_range, etc.) over pagination
+- **Handling large tool outputs**: Results from `decode_powershell_commands` or `run_sql` may exceed token limits and be saved to files. In such cases, delegate file reading and summarization to a Task tool (background agent) to avoid blocking the main investigation flow. Instructions to background agents should include "summarize decode results", "extract hosts/timestamps", and "classify attack objectives"
+- **Handling absence of data**: The absence of events in a specific category is also important information. "Not detected" means "nothing matched detection rules," not "did not occur." Reflect this distinction in the report
+- **Proactive false positive elimination (most critical)**: **Never determine an attack based on rule title alone. Always verify the actual Details field content before making a judgment.** "Suspicious Service Path" may be a legitimate print service, "LOLBAS Renamed" may be a legitimate Elastic Winlogbeat rename, "Proc Access" may be legitimate Veeam Backup operation. At first encounter of each rule, always check 1-2 event Details and do not skip the determination step (Step 3.5)
+- **Attacker staging directory search**: Attackers frequently place tools in `C:\Users\Public\`, `C:\ProgramData\`, `C:\Windows\Temp\<random>\`, `C:\Perflogs\`, etc. When process paths in Details fields contain these directories, use `search_all_fields` to cross-search the same directory path to comprehensively discover other deployed tools
+- **Process correlation via PID/PGUID**: When the same PID/PGUID is detected by different rules, it means detection of different aspects of the same process. For example, if a rundll32.exe (PID X) loaded a Qakbot DLL and the same PID X made RDP connections, conclude that the DLL has built-in RDP capability. Reflect this correlation in the report's timeline and lateral movement analysis
+- **IP → hostname mapping**: For internal IP addresses detected in IOCs and lateral movement analysis, resolve to corresponding hostnames where possible. Check if the same IP appears with a Computer name in other events, or correlate SrcIP/TgtIP with Computer names via SQL
+- **SID → account name resolution**: When events like "User Added To Local Admin Grp" only record SIDs, search whether the same SID appears with an account name in other events and identify the account name where possible
+- **Reliable hash IOC collection**: Hashes values (SHA256, SHA1, MD5, IMPHASH) in Details fields must be included in the report's IOC section for attack-related processes/DLLs. Hashes of files in staging directories, attack tools, and suspicious DLLs are particularly important
+- **Full activity period coverage**: When time window analysis detects multiple discontinuous activity clusters, verify representative events for all clusters, not just the primary ones. Clusters with confirmed activity but no clear attack activity should not be reported as "attack campaigns" — treat as normal activity or details unknown
