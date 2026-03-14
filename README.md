@@ -52,7 +52,7 @@ claude mcp list
 Use Mecha Hayabusa to read hayabusa-results.csv and build an intrusion timeline and report.
 ```
 
-<img width="1073" height="795" alt="Image" src="https://github.com/user-attachments/assets/8c972743-9f22-4278-a468-bd97376f1329" />
+<img width="1073" height="895" alt="Image" src="https://github.com/user-attachments/assets/8c972743-9f22-4278-a468-bd97376f1329" />
 
 Results
 
