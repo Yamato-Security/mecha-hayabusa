@@ -37,6 +37,42 @@ def _escape(text):
     return html_mod.escape(text)
 
 
+def _safe_href(url: str):
+    """Return a safely escaped href value or None if the URL is not allowed."""
+    if url is None:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    # Disallow control characters in URLs
+    if any(ord(ch) < 32 for ch in url):
+        return None
+    # Detect an explicit scheme, e.g. "http:" or "javascript:"
+    m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*):', url)
+    if m:
+        scheme = m.group(1).lower()
+        # Allow only a small set of safe schemes
+        if scheme not in ('http', 'https', 'mailto'):
+            return None
+    else:
+        # Disallow protocol-relative URLs like "//example.com"
+        if url.startswith('//'):
+            return None
+    # Escape for inclusion inside an href attribute
+    return html_mod.escape(url, quote=True)
+
+
+def _link_replacer(match: "re.Match[str]") -> str:
+    """Regex replacer to convert [text](url) into a safe <a> tag."""
+    label = match.group(1)
+    raw_url = match.group(2)
+    safe_url = _safe_href(raw_url)
+    if not safe_url:
+        # If URL is unsafe, render just the label (already escaped) without a link.
+        return label
+    return f'<a href="{safe_url}">{label}</a>'
+
+
 def _inline(text):
     """Convert inline markdown (bold, italic, code, links) to HTML."""
     # inline code first (so contents aren't processed further)
@@ -58,8 +94,9 @@ def _inline(text):
     # italic *text* or _text_  (but not inside words with underscores)
     text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<em>\1</em>', text)
     text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', text)
-    # links [text](url)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+    # links [text](url) with scheme validation and href escaping
+    link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
+    text = link_pattern.sub(_link_replacer, text)
 
     return text
 
