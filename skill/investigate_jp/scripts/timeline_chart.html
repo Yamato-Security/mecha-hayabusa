@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -56,12 +56,12 @@
 <body>
 
 <div id="toolbar">
-  <label>Range:</label>
+  <label>期間:</label>
   <input type="date" id="date-start">
-  <span class="sep">~</span>
+  <span class="sep">〜</span>
   <input type="date" id="date-end">
-  <button id="btn-apply" onclick="applyRange()">Apply</button>
-  <button id="btn-reset" onclick="resetRange()">All</button>
+  <button id="btn-apply" onclick="applyRange()">適用</button>
+  <button id="btn-reset" onclick="resetRange()">全期間</button>
   <div id="date-buttons"></div>
   <div id="summary"></div>
 </div>
@@ -429,7 +429,7 @@
     var c = { crit:0, high:0, med:0, low:0, info:0 };
     filtered.forEach(function(e) { if (c[e.level] !== undefined) c[e.level]++; });
     document.getElementById('summary').textContent =
-      filtered.length + ' events (crit:' + c.crit + ' high:' + c.high +
+      filtered.length + '件 (crit:' + c.crit + ' high:' + c.high +
       ' med:' + c.med + ' low:' + c.low + ' info:' + c.info + ')';
   }
 

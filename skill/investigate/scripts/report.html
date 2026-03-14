@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<style>
+  :root {
+    --bg: #f8f9fa;
+    --sidebar-bg: #1a1a2e;
+    --sidebar-text: #c8c8d4;
+    --sidebar-active: #e94560;
+    --content-bg: #ffffff;
+    --text: #2d2d2d;
+    --text-muted: #6c757d;
+    --heading: #1a1a2e;
+    --border: #dee2e6;
+    --accent: #e94560;
+    --code-bg: #f4f4f8;
+    --table-header: #1a1a2e;
+    --table-header-text: #ffffff;
+    --table-stripe: #f8f9fa;
+    --crit: #DC143C;
+    --high: #FF8C00;
+    --med: #DAA520;
+    --low: #4682B4;
+    --info: #A9A9A9;
+    --sidebar-w: 280px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+                 "Yu Gothic", "Noto Sans CJK JP", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* ---------- sidebar ---------- */
+  nav#sidebar {
+    position: fixed;
+    top: 0; left: 0;
+    width: var(--sidebar-w);
+    height: 100vh;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-text);
+    overflow-y: auto;
+    padding: 24px 0;
+    z-index: 100;
+    transition: transform .3s;
+  }
+  nav#sidebar .logo {
+    padding: 0 20px 20px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: .05em;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    margin-bottom: 12px;
+  }
+  nav#sidebar a {
+    display: block;
+    padding: 8px 20px;
+    color: var(--sidebar-text);
+    text-decoration: none;
+    font-size: 13px;
+    border-left: 3px solid transparent;
+    transition: all .2s;
+  }
+  nav#sidebar a:hover,
+  nav#sidebar a.active {
+    color: #fff;
+    background: rgba(255,255,255,.06);
+    border-left-color: var(--sidebar-active);
+  }
+  nav#sidebar a.sub {
+    padding-left: 36px;
+    font-size: 12px;
+    color: rgba(200,200,212,.6);
+  }
+  nav#sidebar a.sub:hover { color: #fff; }
+
+  /* hamburger for mobile */
+  #menu-toggle {
+    display: none;
+    position: fixed;
+    top: 12px; left: 12px;
+    z-index: 200;
+    background: var(--sidebar-bg);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    width: 40px; height: 40px;
+    font-size: 22px;
+    cursor: pointer;
+  }
+
+  /* ---------- main ---------- */
+  main {
+    margin-left: var(--sidebar-w);
+    flex: 1;
+    padding: 40px 48px 80px;
+    max-width: 1100px;
+  }
+
+  h1 {
+    font-size: 28px;
+    color: var(--heading);
+    margin: 0 0 32px;
+    padding-bottom: 12px;
+    border-bottom: 3px solid var(--accent);
+  }
+  h2 {
+    font-size: 22px;
+    color: var(--heading);
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--border);
+  }
+  h3 {
+    font-size: 17px;
+    color: var(--heading);
+    margin: 32px 0 12px;
+  }
+  h4 {
+    font-size: 15px;
+    color: var(--text-muted);
+    margin: 24px 0 8px;
+  }
+
+  p { margin: 0 0 14px; }
+
+  /* ---------- tables ---------- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0 24px;
+    font-size: 13px;
+  }
+  thead th {
+    background: var(--table-header);
+    color: var(--table-header-text);
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tbody tr:nth-child(even) { background: var(--table-stripe); }
+  tbody tr:hover { background: #eef1f5; }
+
+  /* severity badges */
+  .level-crit { color: var(--crit); font-weight: 700; }
+  .level-high { color: var(--high); font-weight: 700; }
+  .level-med  { color: var(--med);  font-weight: 600; }
+  .level-low  { color: var(--low); }
+  .level-info { color: var(--info); }
+
+  /* ---------- code ---------- */
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    overflow-x: auto;
+    margin: 12px 0 20px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  code {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
+    font-size: 13px;
+  }
+  p code, li code, td code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+
+  /* ---------- blockquote (metadata) ---------- */
+  blockquote {
+    background: var(--code-bg);
+    border-left: 4px solid var(--accent);
+    padding: 16px 20px;
+    margin: 24px 0;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  blockquote strong { color: var(--text); }
+
+  /* ---------- lists ---------- */
+  ul, ol { margin: 8px 0 16px 24px; }
+  li { margin-bottom: 4px; }
+
+  /* ---------- hr ---------- */
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 40px 0;
+  }
+
+  /* ---------- chart embed ---------- */
+  .chart-container {
+    width: 100%;
+    margin: 20px 0 28px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .chart-container iframe {
+    width: 100%;
+    height: 520px;
+    border: none;
+    display: block;
+  }
+  .chart-container.chart-wide iframe {
+    height: 700px;
+  }
+  .chart-label {
+    display: block;
+    padding: 8px 16px;
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--table-stripe);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ---------- attack flow ascii ---------- */
+  .attack-flow {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    margin: 16px 0 24px;
+    font-family: monospace;
+    font-size: 13px;
+    white-space: pre;
+    overflow-x: auto;
+    line-height: 1.6;
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 900px) {
+    nav#sidebar { transform: translateX(-100%); }
+    nav#sidebar.open { transform: translateX(0); }
+    #menu-toggle { display: block; }
+    main { margin-left: 0; padding: 60px 20px 60px; }
+  }
+
+  @media print {
+    nav#sidebar, #menu-toggle { display: none !important; }
+    main { margin-left: 0; padding: 20px; max-width: 100%; }
+    .chart-container { break-inside: avoid; }
+    table { font-size: 11px; }
+    h2 { break-before: page; }
+  }
+</style>
+</head>
+<body>
+
+<button id="menu-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">&#9776;</button>
+
+<nav id="sidebar">
+  <div class="logo">INCIDENT REPORT</div>
+  {{NAV_ITEMS}}
+</nav>
+
+<main>
+{{BODY}}
+</main>
+
+<script>
+// highlight active nav on scroll
+(function(){
+  var links = document.querySelectorAll('#sidebar a[href^="#"]');
+  var sections = [];
+  links.forEach(function(a){
+    var id = a.getAttribute('href').slice(1);
+    var el = document.getElementById(id);
+    if(el) sections.push({el:el, a:a});
+  });
+  function onScroll(){
+    var scrollY = window.scrollY + 120;
+    var current = sections[0];
+    for(var i=0;i<sections.length;i++){
+      if(sections[i].el.offsetTop <= scrollY) current = sections[i];
+    }
+    links.forEach(function(a){ a.classList.remove('active'); });
+    if(current) current.a.classList.add('active');
+  }
+  window.addEventListener('scroll', onScroll);
+  onScroll();
+})();
+</script>
+</body>
+</html>

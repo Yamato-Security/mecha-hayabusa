@@ -183,6 +183,7 @@ def main():
     # Detect time segments
     all_ts = [ev["ts"] for ev in parsed]
     segments = detect_segments(all_ts)
+
     # Build data for template
     all_events_for_js = [
         {
