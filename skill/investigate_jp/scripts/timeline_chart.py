@@ -194,7 +194,6 @@ def main():
     # Detect time segments
     all_ts = [ev["ts"] for ev in parsed]
     segments = detect_segments(all_ts)
-    time_gaps = build_time_gaps(segments)
 
     # Build data for template
     all_events_for_js = [
@@ -209,7 +208,6 @@ def main():
     ]
     all_events_json = json.dumps(all_events_for_js, ensure_ascii=False)
     phases_json = json.dumps(phases, ensure_ascii=False)
-    time_gaps_json = json.dumps(time_gaps, ensure_ascii=False)
     segments_json = json.dumps(build_segments_for_js(segments), ensure_ascii=False)
 
     # Read template and render
@@ -220,7 +218,6 @@ def main():
         title=title,
         all_events_json=all_events_json,
         phases_json=phases_json,
-        time_gaps_json=time_gaps_json,
         segments_json=segments_json,
         echarts_js=echarts_js,
     )
