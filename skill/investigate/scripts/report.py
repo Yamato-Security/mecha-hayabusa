@@ -24,6 +24,7 @@ import os
 import re
 import sys
 from pathlib import Path
+import urllib.parse
 
 TEMPLATE_PATH = Path(__file__).with_name("report.html")
 
@@ -35,6 +36,34 @@ TEMPLATE_PATH = Path(__file__).with_name("report.html")
 def _escape(text):
     """HTML-escape text, preserving already-converted tags."""
     return html_mod.escape(text)
+
+
+def _sanitize_href(url):
+    """
+    Sanitize a URL for use in an href attribute.
+
+    Allows only relative URLs (no scheme) and a small set of safe schemes.
+    Returns a safe fallback ("#") for anything else.
+    """
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    allowed_schemes = {"", "http", "https", "mailto"}
+    if scheme not in allowed_schemes:
+        safe_url = "#"
+    else:
+        safe_url = url
+    # Escape for safe use inside an href attribute (quotes included).
+    return html_mod.escape(safe_url, quote=True)
+
+
+def _link_replacer(match):
+    """Replacer for markdown links [text](url) to safe <a href="...">."""
+    link_text = match.group(1)
+    raw_url = match.group(2)
+    safe_href = _sanitize_href(raw_url)
+    # link_text has already been through _escape and any formatting regexes will
+    # operate on this string, so we can insert it as-is.
+    return f'<a href="{safe_href}">{link_text}</a>'
 
 
 def _inline(text):
@@ -59,7 +88,7 @@ def _inline(text):
     text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<em>\1</em>', text)
     text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', text)
     # links [text](url)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _link_replacer, text)
 
     return text
 
