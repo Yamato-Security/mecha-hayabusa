@@ -81,6 +81,17 @@ def _inline(text):
     parts.append(_escape(text))
     text = ''.join(parts)
 
+    # Protect <code>...</code> spans from further inline formatting
+    code_spans = {}
+
+    def _store_code_span(match):
+        key = f"__CODE_SPAN_{len(code_spans)}__"
+        code_spans[key] = match.group(0)
+        return key
+
+    # Use DOTALL so code spans containing newlines are also preserved
+    text = re.sub(r'(?s)<code>.*?</code>', _store_code_span, text)
+
     # bold **text** or __text__
     text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
     text = re.sub(r'__(.+?)__', r'<strong>\1</strong>', text)
@@ -89,6 +100,10 @@ def _inline(text):
     text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', text)
     # links [text](url)
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _link_replacer, text)
+
+    # Restore original code spans
+    for placeholder, span_html in code_spans.items():
+        text = text.replace(placeholder, span_html)
 
     return text
 
