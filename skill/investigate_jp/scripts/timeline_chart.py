@@ -130,16 +130,6 @@ def ts_to_ms(dt):
     return int(dt.timestamp() * 1000)
 
 
-def build_time_gaps(segments):
-    """Build time-gap intervals as [start_ms, end_ms] pairs for JS."""
-    gaps = []
-    for i in range(len(segments) - 1):
-        gap_start = segments[i][1]
-        gap_end = segments[i + 1][0]
-        gaps.append([ts_to_ms(gap_start), ts_to_ms(gap_end)])
-    return gaps
-
-
 def build_segments_for_js(segments):
     """Build segment intervals as [[start_ms, end_ms], ...] for JS."""
     return [[ts_to_ms(s), ts_to_ms(e)] for s, e in segments]
@@ -150,7 +140,7 @@ def _safe_js_json(s):
     return s.replace("</", r"<\/")
 
 
-def render_html(template, *, title, all_events_json, phases_json, time_gaps_json, segments_json, echarts_js):
+def render_html(template, *, title, all_events_json, phases_json, segments_json, echarts_js):
     """Replace placeholders in the HTML template."""
     html = template
     html = html.replace("{{ECHARTS_JS}}", echarts_js)
@@ -158,7 +148,6 @@ def render_html(template, *, title, all_events_json, phases_json, time_gaps_json
     html = html.replace("{{TITLE_JSON}}", _safe_js_json(json.dumps(title, ensure_ascii=False)))
     html = html.replace("{{ALL_EVENTS_JSON}}", _safe_js_json(all_events_json))
     html = html.replace("{{PHASES_JSON}}", _safe_js_json(phases_json))
-    html = html.replace("{{TIME_GAPS_JSON}}", _safe_js_json(time_gaps_json))
     html = html.replace("{{SEGMENTS_JSON}}", _safe_js_json(segments_json))
     return html
 
