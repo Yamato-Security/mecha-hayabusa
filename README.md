@@ -45,16 +45,34 @@ Confirmation:
 claude mcp list
 ```
 
-Prompt example:
+## Prompt example:
+
+### Use investigate Skill
 ```
 Use Mecha Hayabusa to read hayabusa-results.csv and build an intrusion timeline and report.
 ```
 
-<img width="1190" height="211" alt="image" src="https://github.com/user-attachments/assets/7116517e-ce36-4f80-a474-931021875953" />
+<img width="1073" height="795" alt="Image" src="https://github.com/user-attachments/assets/8c972743-9f22-4278-a468-bd97376f1329" />
 
 Results
-<img width="2486" height="1488" alt="image" src="https://github.com/user-attachments/assets/78fe5337-768a-4ef5-9e44-6f9ac57e25ab" />
 
+<img width="1073" height="795" alt="Image" src="https://github.com/user-attachments/assets/4077c74f-fc85-4d07-9597-370a1e20582e" />
+
+An HTML report will be generated. See the "samples" folder for an example.
+
+<img width="1073" height="743" alt="Image" src="https://github.com/user-attachments/assets/2c5414f7-fc02-4db7-b85b-b62f4a03b9a4" />
+
+<img width="1073" height="992" alt="Image" src="https://github.com/user-attachments/assets/4ba38a9b-1618-4c2c-86a2-7b621d205774" />
+
+<img width="1073" height="682" alt="Image" src="https://github.com/user-attachments/assets/47919ec4-67e9-40bc-a503-26bef27cddcf" />
+
+### Ask additional investigation and explanation
+
+```
+What happened in ACC-09?
+```
+
+<img width="1073" height="892" alt="Image" src="https://github.com/user-attachments/assets/bac54fd4-9e7c-401a-8fda-e6160dec0409" />
 
 # Features
 
