@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{TITLE}}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic",
+                 "Noto Sans CJK JP", "Segoe UI", sans-serif;
+    background: #fafafa;
+  }
+  #toolbar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 12px; padding: 8px 16px;
+    background: #fff; border-bottom: 1px solid #e0e0e0; flex-wrap: wrap;
+  }
+  #toolbar .title { font-size: 14px; font-weight: 700; color: #333; }
+  #toolbar .info { font-size: 12px; color: #666; margin-left: auto; }
+  #chart { width: 100vw; height: calc(100vh - 42px); }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <span class="title" id="chart-title"></span>
+  <span class="info" id="chart-info"></span>
+</div>
+<div id="chart"></div>
+
+<script>{{ECHARTS_JS}}</script>
+<script>
+(function() {
+  /* ---- data injected by Python ---- */
+  var TITLE = {{TITLE_JSON}};
+  var NODES = {{NODES_JSON}};
+  var LINKS = {{LINKS_JSON}};
+
+  document.getElementById('chart-title').textContent = TITLE;
+
+  /* ---- summary ---- */
+  var hostCount = NODES.length;
+  var moveCount = LINKS.length;
+  document.getElementById('chart-info').textContent =
+    hostCount + ' ホスト / ' + moveCount + ' 横展開イベント';
+
+  /* ---- level colors ---- */
+  var LEVEL_COLORS = {
+    crit: '#DC143C', high: '#FF8C00', med: '#FFD700',
+    low: '#4682B4', info: '#A9A9A9'
+  };
+  var LEVEL_LABELS = {
+    crit: 'Critical', high: 'High', med: 'Medium',
+    low: 'Low', info: 'Info'
+  };
+
+  /* ---- tooltip formatter ---- */
+  function tooltipFormatter(params) {
+    if (!params.data) return '';
+
+    /* Node (host) tooltip */
+    if (params.dataType === 'node') {
+      var d = params.data;
+      var html = '<div style="max-width:400px;word-wrap:break-word;">'
+        + '<b style="font-size:14px;">' + d.name + '</b><br/>';
+      if (d.hostInfo) {
+        var h = d.hostInfo;
+        html += '<span style="color:#666;">イベント数:</span> ' + h.event_count + '<br/>';
+        html += '<span style="color:#666;">送信元として:</span> ' + h.as_source + ' 件<br/>';
+        html += '<span style="color:#666;">宛先として:</span> ' + h.as_target + ' 件<br/>';
+        if (h.levels && h.levels.length) {
+          html += '<span style="color:#666;">重大度:</span> ' + h.levels.join(', ') + '<br/>';
+        }
+      }
+      html += '</div>';
+      return html;
+    }
+
+    /* Edge (movement) tooltip */
+    if (params.dataType === 'edge') {
+      var d = params.data;
+      if (!d.moveInfo) return '';
+      var m = d.moveInfo;
+      var sc = LEVEL_COLORS[m.source_level] || '#666';
+      var tc = LEVEL_COLORS[m.target_level] || '#666';
+      var html = '<div style="max-width:450px;word-wrap:break-word;">'
+        + '<b>' + m.source_host + ' → ' + m.target_host + '</b><br/>'
+        + '<hr style="border:none;border-top:1px solid #eee;margin:4px 0;"/>'
+        + '<span style="color:#666;">起点イベント:</span> '
+        + '<b style="color:' + sc + '">[' + m.source_level.toUpperCase() + ']</b> '
+        + m.source_event + '<br/>'
+        + '<span style="color:#666;">起点時刻:</span> ' + m.source_time + '<br/>'
+        + '<hr style="border:none;border-top:1px solid #eee;margin:4px 0;"/>'
+        + '<span style="color:#666;">宛先イベント:</span> '
+        + '<b style="color:' + tc + '">[' + m.target_level.toUpperCase() + ']</b> '
+        + m.target_event + '<br/>'
+        + '<span style="color:#666;">宛先時刻:</span> ' + m.target_time + '<br/>'
+        + '<hr style="border:none;border-top:1px solid #eee;margin:4px 0;"/>'
+        + '<span style="color:#666;">時間差:</span> ' + m.delta_minutes + ' 分'
+        + '</div>';
+      return html;
+    }
+    return '';
+  }
+
+  /* ---- build ECharts option ---- */
+  var option = {
+    tooltip: {
+      trigger: 'item',
+      formatter: tooltipFormatter,
+      backgroundColor: 'rgba(255,255,255,0.97)',
+      borderColor: '#ccc',
+      textStyle: { fontSize: 12 },
+      extraCssText: 'max-width:480px;white-space:normal;'
+    },
+    series: [{
+      type: 'graph',
+      layout: 'none',
+      roam: true,
+      draggable: true,
+      focusNodeAdjacency: true,
+      edgeSymbol: ['none', 'arrow'],
+      edgeSymbolSize: [0, 14],
+      nodes: NODES,
+      links: LINKS,
+      lineStyle: { opacity: 0.7 },
+      emphasis: {
+        focus: 'adjacency',
+        lineStyle: { width: 5, opacity: 1 },
+        itemStyle: { borderWidth: 3 }
+      }
+    }]
+  };
+
+  /* ---- init chart ---- */
+  var chart = echarts.init(document.getElementById('chart'));
+  chart.setOption(option);
+  window.addEventListener('resize', function() { chart.resize(); });
+})();
+</script>
+</body>
+</html>
