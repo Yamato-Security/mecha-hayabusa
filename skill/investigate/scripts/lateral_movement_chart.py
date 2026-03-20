@@ -28,6 +28,7 @@ Input: JSON from stdin with the following structure:
 import html as html_mod
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -58,12 +59,26 @@ def _highest_level(levels):
     return best
 
 
+_EXTERNAL_RE = re.compile(
+    r"(?:"
+    r"\d{1,3}(?:\.\d{1,3}){3}"            # IPv4
+    r"|(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}"  # FQDN (one or more subdomains + TLD)
+    r")"
+)
+
+
+def _is_external(hostname):
+    """Heuristic: treat FQDNs with TLD and IP addresses as external."""
+    return bool(_EXTERNAL_RE.fullmatch(hostname))
+
+
 def compute_layout(movements):
     """Compute left-to-right layered layout based on attack propagation order.
 
     Uses BFS from the earliest source host to assign layers (columns).
     Hosts appearing first as source are placed leftmost, showing the
-    propagation path clearly.
+    propagation path clearly.  External hosts (C2 servers, IPs) are
+    placed at the top or bottom edge of their layer for visual clarity.
     """
     if not movements:
         return {}
@@ -100,22 +115,79 @@ def compute_layout(movements):
             max_layer += 1
             layer[h] = max_layer
 
-    # Group hosts by layer
+    # Build undirected neighbor list (cross-layer only) for ordering
+    neighbors = {}
+    for m in movements:
+        sh, th = m["source_host"], m["target_host"]
+        if layer.get(sh) != layer.get(th):
+            neighbors.setdefault(sh, []).append(th)
+            neighbors.setdefault(th, []).append(sh)
+
+    # Group hosts by layer, separating internal and external nodes.
+    # External nodes (C2 servers, IPs) are placed at the edges of their
+    # layer so lines to/from them don't cut through the main cluster.
     layers = {}
     for h, l in layer.items():
         layers.setdefault(l, []).append(h)
 
     x_spacing = 250.0
     y_spacing = 120.0
+    external_top_y = 0.0  # external nodes pinned near top edge
 
+    def _sort_layer(hosts_in_layer):
+        """Sort: internal nodes in the middle, external at top/bottom."""
+        internal = [h for h in hosts_in_layer if not _is_external(h)]
+        external = [h for h in hosts_in_layer if _is_external(h)]
+        return internal, external
+
+    # Initial placement
     pos = {}
     for l, hosts_in_layer in layers.items():
         x = 120.0 + l * x_spacing
-        n = len(hosts_in_layer)
-        total_height = (n - 1) * y_spacing
-        start_y = 300.0 - total_height / 2
-        for i, h in enumerate(hosts_in_layer):
+        internal, external = _sort_layer(hosts_in_layer)
+        # Place internal nodes centered
+        n_int = len(internal)
+        total_int = (n_int - 1) * y_spacing if n_int > 1 else 0
+        start_y = 300.0 - total_int / 2
+        for i, h in enumerate(internal):
             pos[h] = (x, start_y + i * y_spacing)
+        # Place external nodes at the top edge of the chart
+        if external and internal:
+            for i, h in enumerate(external):
+                pos[h] = (x, external_top_y - i * y_spacing)
+        elif external:
+            for i, h in enumerate(external):
+                pos[h] = (x, 300.0 + i * y_spacing)
+
+    # Barycenter heuristic: reorder *internal* nodes within each layer
+    # by average y-position of their cross-layer neighbors.
+    num_layers = max(layers.keys()) + 1
+    for _iteration in range(4):
+        for l in range(num_layers):
+            if l not in layers:
+                continue
+            internal = [h for h in layers[l] if not _is_external(h)]
+            if len(internal) <= 1:
+                continue
+            barycenters = {}
+            for h in internal:
+                nbr_ys = [pos[n][1] for n in neighbors.get(h, [])
+                          if n in pos]
+                barycenters[h] = (sum(nbr_ys) / len(nbr_ys)
+                                  if nbr_ys else pos[h][1])
+            sorted_hosts = sorted(internal, key=lambda h: barycenters[h])
+            # Update internal positions only
+            x = pos[sorted_hosts[0]][0]
+            n = len(sorted_hosts)
+            total_height = (n - 1) * y_spacing
+            start_y = 300.0 - total_height / 2
+            for i, h in enumerate(sorted_hosts):
+                pos[h] = (x, start_y + i * y_spacing)
+            # Re-position external nodes at top edge
+            external = [h for h in layers[l] if _is_external(h)]
+            if external:
+                for i, h in enumerate(external):
+                    pos[h] = (x, external_top_y - i * y_spacing)
 
     return pos
 
