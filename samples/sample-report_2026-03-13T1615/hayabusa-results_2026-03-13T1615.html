@@ -969,20 +969,7 @@
 </ul>
 <h2 id="8-lateral-movement-analysis">8. Lateral Movement Analysis</h2>
 <h3 id="propagation-path">Propagation Path</h3>
-<pre><code>IT-03 (04:52) --[Mimikatz cred theft]--&gt; Domain Credentials Obtained
-                                              |
- IT-02 (04:55) &lt;--[CobaltStrike service]------+
-                                              |
- ACC-01 (05:19) &lt;--[Phishing]--+              |
- ACC-04 (05:19) &lt;--[Phishing]--+              |
- ACC-09 (05:20) &lt;--[Phishing]--+--------------+
- ACC-05 (05:21) &lt;--[Phishing]--+
-                    |
- ACC-09 (06:06) --[msxsl.exe C2]--&gt; secure.n-document.com
- ACC-03 (06:09) --[msxsl.exe C2]--&gt; secure.n-document.com
- ACC-03 (06:21) --[crx.dll download]--&gt; secure.n-document.com
-                    |
- ALL hosts (12:00) &lt;--[GPO: Disable Defender + NTLM Downgrade]-- Domain Controller</code></pre>
+<iframe src="hayabusa-results_lateral_movement.html" style="width:100%; height:620px; border:1px solid #dee2e6; border-radius:8px;"></iframe>
 <h3 id="lateral-movement-event-details">Lateral Movement Event Details</h3>
 <p>Direct host-to-host lateral movement via SMB/RDP/WinRM was not explicitly detected between individual hosts. However, the attack progression indicates:</p>
 <ol>
