@@ -1,0 +1,9 @@
+# Sobre
+
+O **Mecha Hayabusa** conecta a ferramenta de análise de logs de eventos do Windows **Hayabusa** a grandes modelos de linguagem (LLMs) por meio do **Model Context Protocol (MCP)**, possibilitando perícia digital e caça a ameaças orientadas por linguagem natural. Os analistas podem investigar conjuntos de dados de logs de eventos do Windows baseados em CSV usando recursos como análise de táticas do MITRE ATT&CK, extração de IOC, correlação de movimento lateral, decodificação de PowerShell e análise de linha do tempo centrada no host.
+
+As linhas do tempo em CSV do Hayabusa são automaticamente convertidas em um banco de dados local **DuckDB**, permitindo que os LLMs realizem análises rápidas e estruturadas sobre grandes conjuntos de dados de logs. O sistema oferece recursos como troca e perfilamento de conjuntos de dados, execução de SQL somente leitura, busca entre campos, agregação de títulos de regras, sumarização por janela de tempo, análise de linha do tempo do host, análise do campo `Details`, extração de IOC, decodificação de PowerShell codificado em Base64 e correlação de movimento lateral.
+
+O Mecha Hayabusa também inclui uma **investigation skill** dedicada que padroniza o fluxo de trabalho de DFIR e oferece suporte à geração estruturada de relatórios de incidentes em **japonês ou inglês**.
+
+A principal inovação do Mecha Hayabusa é permitir que um LLM execute um **fluxo de trabalho estruturado de investigação DFIR por meio do MCP**, em vez de atuar como uma simples interface de busca. Essa abordagem dá suporte a todo o ciclo de vida da investigação—desde a triagem do conjunto de dados e o desenvolvimento de hipóteses até a análise da fase de ataque, a investigação em nível de host, a correlação de movimento lateral e a geração do relatório final—ao mesmo tempo em que melhora a consistência e a eficiência para os respondedores de incidentes.

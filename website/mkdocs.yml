@@ -128,42 +128,146 @@ plugins:
         - locale: zh-TW
           name: 繁體中文
           build: true
+          nav_translations:
+            "Home": "首頁"
+            "Overview": "概覽"
+            "About": "關於"
+            "Features": "功能特色"
+            "Getting Started": "入門指南"
+            "Resources": "資源"
+            "Contributors": "貢獻者"
         - locale: ko
           name: 한국어
           build: true
+          nav_translations:
+            "Home": "홈"
+            "Overview": "개요"
+            "About": "소개"
+            "Features": "기능"
+            "Getting Started": "시작하기"
+            "Resources": "자료"
+            "Contributors": "기여자"
         - locale: de
           name: Deutsch
           build: true
+          nav_translations:
+            "Home": "Startseite"
+            "Overview": "Übersicht"
+            "About": "Über"
+            "Features": "Funktionen"
+            "Getting Started": "Erste Schritte"
+            "Resources": "Ressourcen"
+            "Contributors": "Mitwirkende"
         - locale: tr
           name: Türkçe
           build: true
+          nav_translations:
+            "Home": "Ana Sayfa"
+            "Overview": "Genel Bakış"
+            "About": "Hakkında"
+            "Features": "Özellikler"
+            "Getting Started": "Başlarken"
+            "Resources": "Kaynaklar"
+            "Contributors": "Katkıda Bulunanlar"
         - locale: fr
           name: Français
           build: true
+          nav_translations:
+            "Home": "Accueil"
+            "Overview": "Vue d'ensemble"
+            "About": "À propos"
+            "Features": "Fonctionnalités"
+            "Getting Started": "Premiers pas"
+            "Resources": "Ressources"
+            "Contributors": "Contributeurs"
         - locale: es
           name: Español
           build: true
+          nav_translations:
+            "Home": "Inicio"
+            "Overview": "Resumen"
+            "About": "Acerca de"
+            "Features": "Características"
+            "Getting Started": "Primeros pasos"
+            "Resources": "Recursos"
+            "Contributors": "Colaboradores"
         - locale: pt-BR
           name: Português (Brasil)
           build: true
+          nav_translations:
+            "Home": "Início"
+            "Overview": "Visão geral"
+            "About": "Sobre"
+            "Features": "Recursos"
+            "Getting Started": "Primeiros passos"
+            "Resources": "Materiais"
+            "Contributors": "Colaboradores"
         - locale: uk
           name: Українська
           build: true
+          nav_translations:
+            "Home": "Головна"
+            "Overview": "Огляд"
+            "About": "Про проєкт"
+            "Features": "Можливості"
+            "Getting Started": "Початок роботи"
+            "Resources": "Ресурси"
+            "Contributors": "Учасники"
         - locale: hi
           name: हिन्दी
           build: true
+          nav_translations:
+            "Home": "होम"
+            "Overview": "अवलोकन"
+            "About": "परिचय"
+            "Features": "विशेषताएँ"
+            "Getting Started": "शुरुआत करें"
+            "Resources": "संसाधन"
+            "Contributors": "योगदानकर्ता"
         - locale: id
           name: Bahasa Indonesia
           build: true
+          nav_translations:
+            "Home": "Beranda"
+            "Overview": "Ikhtisar"
+            "About": "Tentang"
+            "Features": "Fitur"
+            "Getting Started": "Memulai"
+            "Resources": "Sumber Daya"
+            "Contributors": "Kontributor"
         - locale: my
           name: မြန်မာဘာသာ
           build: true
+          nav_translations:
+            "Home": "ပင်မစာမျက်နှာ"
+            "Overview": "ခြုံငုံသုံးသပ်ချက်"
+            "About": "အကြောင်း"
+            "Features": "လုပ်ဆောင်ချက်များ"
+            "Getting Started": "စတင်အသုံးပြုခြင်း"
+            "Resources": "အရင်းအမြစ်များ"
+            "Contributors": "ပါဝင်ကူညီသူများ"
         - locale: th
           name: ไทย
           build: true
+          nav_translations:
+            "Home": "หน้าแรก"
+            "Overview": "ภาพรวม"
+            "About": "เกี่ยวกับ"
+            "Features": "คุณสมบัติ"
+            "Getting Started": "เริ่มต้นใช้งาน"
+            "Resources": "แหล่งข้อมูล"
+            "Contributors": "ผู้มีส่วนร่วม"
         - locale: ar
           name: العربية
           build: true
+          nav_translations:
+            "Home": "الرئيسية"
+            "Overview": "نظرة عامة"
+            "About": "حول"
+            "Features": "الميزات"
+            "Getting Started": "البدء"
+            "Resources": "المصادر"
+            "Contributors": "المساهمون"
 
 extra:
   social:
