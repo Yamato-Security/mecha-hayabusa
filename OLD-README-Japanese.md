@@ -2,7 +2,7 @@
  <p>
     <img alt="Mecha Hayabusa Logo" src="mecha_hayabusa_logo.png" width="50%">
  </p>
- [ <b>English</b> ] | [<a href="README.md">English</a>]
+ [ <b>English</b> ] | [<a href="OLD-README.md">English</a>]
 </div>
 
 # Mecha Hayabusa
