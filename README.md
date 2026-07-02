@@ -19,6 +19,31 @@ Mecha Hayabusa also includes a dedicated **investigation skill** that standardiz
 
 The key innovation of Mecha Hayabusa is enabling an LLM to execute a **structured DFIR investigation workflow through MCP**, rather than acting as a simple search interface. This approach supports the full investigation lifecycle—from dataset triage and hypothesis development to attack-phase analysis, host-level investigation, lateral movement correlation, and final report generation—while improving consistency and efficiency for incident responders.
 
+# Preparing the Hayabusa CSV
+
+Run Hayabusa with the **`verbose`** profile to create the CSV timeline (recommended):
+
+```bash
+hayabusa csv-timeline -d <EVTX_DIR> -o hayabusa-results.csv -p verbose -w
+```
+
+When you need the full, unabbreviated field information of each event, use the **`all-field-info-verbose`** profile instead:
+
+```bash
+hayabusa csv-timeline -d <EVTX_DIR> -o hayabusa-results.csv -p all-field-info-verbose -w
+```
+
+Profile differences that matter to Mecha Hayabusa (verified against Hayabusa 3.8.0 output):
+
+| Profile | Detail columns | Field names in detail columns |
+|---|---|---|
+| `verbose` (recommended) | `Details` + `ExtraFieldInfo` | Abbreviated (e.g. `Cmdline`, `Proc`, `SrcIP`) |
+| `all-field-info-verbose` | `AllFieldInfo` | Original event field names (e.g. `CommandLine`, `NewProcessName`, `SourceIp`) |
+
+Notes:
+
+- The detail-parsing tools (`parse_details_field`, `extract_iocs`, `decode_powershell_commands`, `analyze_mitre_tactics`) parse the `Details` column by default. When analyzing an `all-field-info-verbose` CSV, pass **`detail_source="AllFieldInfo"`**.
+- Both profiles include the `MitreTactics` / `MitreTags` columns required by `analyze_mitre_tactics` and `correlate_lateral_movement`.
 
 ## How to execute（HTTP）
 
@@ -156,14 +181,15 @@ Analyze attack activity and event timelines.
 Extract and analyze indicators from log details.
 
 - **parse_details_field**  
-  Extract key/value pairs from the `Details` field.  
+  Extract key/value pairs from the `Details` field (default) or the `AllFieldInfo` field (`detail_source="AllFieldInfo"`).  
   Supports listing and unique aggregation.
 
 - **extract_iocs**  
-  Extract **Indicators of Compromise (IOCs)** from `Details` and `ExtraFieldInfo`, categorized by type.
+  Extract **Indicators of Compromise (IOCs)** from `Details` and `ExtraFieldInfo` (default) or `AllFieldInfo` (`detail_source="AllFieldInfo"`), categorized by type.
 
 - **decode_powershell_commands**  
-  Decode Base64-encoded PowerShell commands found in events.
+  Decode Base64-encoded PowerShell commands found in events.  
+  Scans `Details`/`ExtraFieldInfo` by default, or `AllFieldInfo` with `detail_source="AllFieldInfo"`.
 
 # Contributors
 
