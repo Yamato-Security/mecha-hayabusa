@@ -83,12 +83,13 @@
 ログ詳細から IOC や重要情報を抽出します。
 
 -   **parse_details_field**
-    `Details` フィールドからキー / 値を抽出します。
+    `Details` フィールド（デフォルト）または `AllFieldInfo` フィールド（`detail_source="AllFieldInfo"` 指定時）からキー / 値を抽出します。
     一覧表示およびユニーク集計に対応。
 
 -   **extract_iocs**
-    `Details` および `ExtraFieldInfo` から **IOC (Indicators of Compromise)** をカテゴリ別に抽出します。
+    `Details` および `ExtraFieldInfo`（デフォルト）、または `AllFieldInfo`（`detail_source="AllFieldInfo"` 指定時）から **IOC (Indicators of Compromise)** をカテゴリ別に抽出します。
 
 -   **decode_powershell_commands**
     イベント内の Base64 エンコードされた PowerShell
     コマンドをデコードします。
+    デフォルトで `Details`/`ExtraFieldInfo` を、`detail_source="AllFieldInfo"` 指定時は `AllFieldInfo` を走査します。

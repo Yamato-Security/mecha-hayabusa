@@ -1,5 +1,31 @@
 # Usage
 
+## Preparing the Hayabusa CSV
+
+Run Hayabusa with the **`verbose`** profile to create the CSV timeline (recommended):
+
+```bash
+hayabusa csv-timeline -d <EVTX_DIR> -o hayabusa-results.csv -p verbose -w
+```
+
+When you need the full, unabbreviated field information of each event, use the **`all-field-info-verbose`** profile instead:
+
+```bash
+hayabusa csv-timeline -d <EVTX_DIR> -o hayabusa-results.csv -p all-field-info-verbose -w
+```
+
+Profile differences that matter to Mecha Hayabusa (verified against Hayabusa 3.8.0 output):
+
+| Profile | Detail columns | Field names in detail columns |
+|---|---|---|
+| `verbose` (recommended) | `Details` + `ExtraFieldInfo` | Abbreviated (e.g. `Cmdline`, `Proc`, `SrcIP`) |
+| `all-field-info-verbose` | `AllFieldInfo` | Original event field names (e.g. `CommandLine`, `NewProcessName`, `SourceIp`) |
+
+Notes:
+
+- The detail-parsing tools (`parse_details_field`, `extract_iocs`, `decode_powershell_commands`, `analyze_mitre_tactics`) parse the `Details` column by default. When analyzing an `all-field-info-verbose` CSV, pass **`detail_source="AllFieldInfo"`**.
+- Both profiles include the `MitreTactics` / `MitreTags` columns required by `analyze_mitre_tactics` and `correlate_lateral_movement`.
+
 ## How to execute（HTTP）
 
 ```bash
