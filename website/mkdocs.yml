@@ -1,0 +1,288 @@
+# =============================================================================
+# Mecha Hayabusa Documentation Site — Material for MkDocs
+# -----------------------------------------------------------------------------
+# Hosted for free on GitHub Pages (see ../.github/workflows/docs.yml).
+# Top tabs = main topics, left sidebar = subtopics.
+# >>> If you fork/rename, update site_url, repo_url and repo_name below. <<<
+# =============================================================================
+
+site_name: Mecha Hayabusa
+site_description: >-
+  Mecha Hayabusa is an AI analyzer, DFIR timeline and report generation tool for Hayabusa results.
+site_author: Yamato Security
+site_url: https://yamato-security.github.io/mecha-hayabusa/
+
+repo_url: https://github.com/Yamato-Security/mecha-hayabusa
+repo_name: Yamato-Security/mecha-hayabusa
+edit_uri: edit/main/website/docs/
+
+copyright: >-
+  Copyright &copy; Yamato Security — Documentation built with Material for MkDocs
+
+docs_dir: docs
+
+theme:
+  name: material
+  language: en
+  logo: assets/favicon.png
+  favicon: assets/favicon.png
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tooltips
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.keys
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - glightbox:
+      touchNavigation: true
+      loop: false
+      effect: zoom
+      width: 100%
+      auto_caption: false
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: ja
+          name: 日本語
+          build: true
+          site_name: Mecha Hayabusa ドキュメント
+          nav_translations:
+            Home: ホーム
+            Overview: 概要
+            About: 概要
+            Features: 機能
+            Getting Started: はじめに
+            Resources: リソース
+            Contributors: コントリビュータ
+        - locale: zh-TW
+          name: 繁體中文
+          build: true
+          nav_translations:
+            "Home": "首頁"
+            "Overview": "概覽"
+            "About": "關於"
+            "Features": "功能特色"
+            "Getting Started": "入門指南"
+            "Resources": "資源"
+            "Contributors": "貢獻者"
+        - locale: ko
+          name: 한국어
+          build: true
+          nav_translations:
+            "Home": "홈"
+            "Overview": "개요"
+            "About": "소개"
+            "Features": "기능"
+            "Getting Started": "시작하기"
+            "Resources": "자료"
+            "Contributors": "기여자"
+        - locale: de
+          name: Deutsch
+          build: true
+          nav_translations:
+            "Home": "Startseite"
+            "Overview": "Übersicht"
+            "About": "Über"
+            "Features": "Funktionen"
+            "Getting Started": "Erste Schritte"
+            "Resources": "Ressourcen"
+            "Contributors": "Mitwirkende"
+        - locale: tr
+          name: Türkçe
+          build: true
+          nav_translations:
+            "Home": "Ana Sayfa"
+            "Overview": "Genel Bakış"
+            "About": "Hakkında"
+            "Features": "Özellikler"
+            "Getting Started": "Başlarken"
+            "Resources": "Kaynaklar"
+            "Contributors": "Katkıda Bulunanlar"
+        - locale: fr
+          name: Français
+          build: true
+          nav_translations:
+            "Home": "Accueil"
+            "Overview": "Vue d'ensemble"
+            "About": "À propos"
+            "Features": "Fonctionnalités"
+            "Getting Started": "Premiers pas"
+            "Resources": "Ressources"
+            "Contributors": "Contributeurs"
+        - locale: es
+          name: Español
+          build: true
+          nav_translations:
+            "Home": "Inicio"
+            "Overview": "Resumen"
+            "About": "Acerca de"
+            "Features": "Características"
+            "Getting Started": "Primeros pasos"
+            "Resources": "Recursos"
+            "Contributors": "Colaboradores"
+        - locale: pt-BR
+          name: Português (Brasil)
+          build: true
+          nav_translations:
+            "Home": "Início"
+            "Overview": "Visão geral"
+            "About": "Sobre"
+            "Features": "Recursos"
+            "Getting Started": "Primeiros passos"
+            "Resources": "Materiais"
+            "Contributors": "Colaboradores"
+        - locale: uk
+          name: Українська
+          build: true
+          nav_translations:
+            "Home": "Головна"
+            "Overview": "Огляд"
+            "About": "Про проєкт"
+            "Features": "Можливості"
+            "Getting Started": "Початок роботи"
+            "Resources": "Ресурси"
+            "Contributors": "Учасники"
+        - locale: hi
+          name: हिन्दी
+          build: true
+          nav_translations:
+            "Home": "होम"
+            "Overview": "अवलोकन"
+            "About": "परिचय"
+            "Features": "विशेषताएँ"
+            "Getting Started": "शुरुआत करें"
+            "Resources": "संसाधन"
+            "Contributors": "योगदानकर्ता"
+        - locale: id
+          name: Bahasa Indonesia
+          build: true
+          nav_translations:
+            "Home": "Beranda"
+            "Overview": "Ikhtisar"
+            "About": "Tentang"
+            "Features": "Fitur"
+            "Getting Started": "Memulai"
+            "Resources": "Sumber Daya"
+            "Contributors": "Kontributor"
+        - locale: my
+          name: မြန်မာဘာသာ
+          build: true
+          nav_translations:
+            "Home": "ပင်မစာမျက်နှာ"
+            "Overview": "ခြုံငုံသုံးသပ်ချက်"
+            "About": "အကြောင်း"
+            "Features": "လုပ်ဆောင်ချက်များ"
+            "Getting Started": "စတင်အသုံးပြုခြင်း"
+            "Resources": "အရင်းအမြစ်များ"
+            "Contributors": "ပါဝင်ကူညီသူများ"
+        - locale: th
+          name: ไทย
+          build: true
+          nav_translations:
+            "Home": "หน้าแรก"
+            "Overview": "ภาพรวม"
+            "About": "เกี่ยวกับ"
+            "Features": "คุณสมบัติ"
+            "Getting Started": "เริ่มต้นใช้งาน"
+            "Resources": "แหล่งข้อมูล"
+            "Contributors": "ผู้มีส่วนร่วม"
+        - locale: ar
+          name: العربية
+          build: true
+          nav_translations:
+            "Home": "الرئيسية"
+            "Overview": "نظرة عامة"
+            "About": "حول"
+            "Features": "الميزات"
+            "Getting Started": "البدء"
+            "Resources": "المصادر"
+            "Contributors": "المساهمون"
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Yamato-Security/mecha-hayabusa
+      name: Mecha Hayabusa on GitHub
+    - icon: fontawesome/brands/x-twitter
+      link: https://twitter.com/SecurityYamato
+      name: Yamato Security on X
+
+nav:
+  - Home: index.md
+  - Overview:
+      - About: overview/index.md
+      - Features: overview/features.md
+  - Getting Started: getting-started/index.md
+  - Resources:
+      - Contributors: resources/contributing.md

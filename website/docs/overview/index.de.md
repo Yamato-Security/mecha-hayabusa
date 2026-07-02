@@ -1,0 +1,9 @@
+# Über
+
+**Mecha Hayabusa** verbindet das Windows-Ereignisprotokoll-Analysetool **Hayabusa** über das **Model Context Protocol (MCP)** mit großen Sprachmodellen (LLMs) und ermöglicht so eine durch natürliche Sprache gesteuerte digitale Forensik und Bedrohungssuche. Analysten können CSV-basierte Windows-Ereignisprotokoll-Datensätze mithilfe von Funktionen wie der Analyse von MITRE-ATT&CK-Taktiken, der IOC-Extraktion, der Korrelation von Lateral Movement, der PowerShell-Dekodierung und der hostzentrierten Zeitleistenanalyse untersuchen.
+
+Hayabusa-CSV-Zeitleisten werden automatisch in eine lokale **DuckDB**-Datenbank konvertiert, sodass LLMs eine schnelle, strukturierte Analyse über große Protokolldatensätze durchführen können. Das System bietet Funktionen wie Datensatzwechsel und -profilierung, schreibgeschützte SQL-Ausführung, feldübergreifende Suche, Aggregation von Regeltiteln, Zusammenfassung von Zeitfenstern, Host-Zeitleistenanalyse, Parsing des `Details`-Felds, IOC-Extraktion, Dekodierung von Base64-codiertem PowerShell und Korrelation von Lateral Movement.
+
+Mecha Hayabusa enthält außerdem einen dedizierten **Untersuchungs-Skill**, der den DFIR-Workflow standardisiert und die strukturierte Erstellung von Vorfallberichten in **Japanisch oder Englisch** unterstützt.
+
+Die zentrale Innovation von Mecha Hayabusa besteht darin, einem LLM die Ausführung eines **strukturierten DFIR-Untersuchungs-Workflows über MCP** zu ermöglichen, anstatt als einfache Suchschnittstelle zu fungieren. Dieser Ansatz unterstützt den gesamten Untersuchungslebenszyklus – von der Datensatz-Triage und Hypothesenentwicklung über die Analyse von Angriffsphasen, die Untersuchung auf Host-Ebene und die Korrelation von Lateral Movement bis hin zur abschließenden Berichterstellung – und verbessert gleichzeitig die Konsistenz und Effizienz für Incident Responder.
