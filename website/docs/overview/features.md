@@ -80,11 +80,12 @@ Analyze attack activity and event timelines.
 Extract and analyze indicators from log details.
 
 - **parse_details_field**  
-  Extract key/value pairs from the `Details` field.  
+  Extract key/value pairs from the `Details` field (default) or the `AllFieldInfo` field (`detail_source="AllFieldInfo"`).  
   Supports listing and unique aggregation.
 
 - **extract_iocs**  
-  Extract **Indicators of Compromise (IOCs)** from `Details` and `ExtraFieldInfo`, categorized by type.
+  Extract **Indicators of Compromise (IOCs)** from `Details` and `ExtraFieldInfo` (default) or `AllFieldInfo` (`detail_source="AllFieldInfo"`), categorized by type.
 
 - **decode_powershell_commands**  
-  Decode Base64-encoded PowerShell commands found in events.
+  Decode Base64-encoded PowerShell commands found in events.  
+  Scans `Details`/`ExtraFieldInfo` by default, or `AllFieldInfo` with `detail_source="AllFieldInfo"`.

@@ -353,6 +353,177 @@ class DeterminismTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.correlate_lateral_movement(time_window_minutes=1441)
 
+    # P7: detail_source on a Details-profile dataset
+    def test_detail_source_allfieldinfo_raises_on_details_dataset(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            server.parse_details_field(detail_source="AllFieldInfo")
+        self.assertIn("detail_source='Details'", str(ctx.exception))
+
+    def test_detail_source_invalid_value(self) -> None:
+        with self.assertRaises(ValueError):
+            server.parse_details_field(detail_source="Bogus")
+
+
+# Header of the Hayabusa `all-field-info-verbose` profile (verified against
+# Hayabusa 3.8.0 output). There is no Details/ExtraFieldInfo column; all original
+# event fields are in AllFieldInfo instead.
+ALL_FIELD_INFO_CSV_HEADER = [
+    "Timestamp",
+    "RuleTitle",
+    "Level",
+    "Computer",
+    "Channel",
+    "EventID",
+    "MitreTactics",
+    "MitreTags",
+    "OtherTags",
+    "RecordID",
+    "AllFieldInfo",
+    "RuleFile",
+    "RuleID",
+    "EvtxFile",
+]
+
+ALL_FIELD_INFO_CSV_ROWS = [
+    [
+        "2024-01-01 00:00:00.000 +00:00",
+        "Alpha",
+        "high",
+        "HOST-A",
+        "Sec",
+        "4688",
+        "Exec",
+        "T1059",
+        "",
+        "1",
+        "CommandLine: wmic process call create ¦ NewProcessName: C:\\Windows\\System32\\wbem\\wmic.exe ¦ SubjectUserName: admin",
+        "alpha.yml",
+        "11111111-1111-1111-1111-111111111111",
+        "a.evtx",
+    ],
+    [
+        "2024-01-01 00:01:00.000 +00:00",
+        "Beta",
+        "high",
+        "HOST-B",
+        "Sysmon",
+        "1",
+        "LatMov",
+        "T1021",
+        "",
+        "2",
+        "Image: C:\\Users\\Public\\evil.exe ¦ Hashes: SHA256=AAAA ¦ SourceIp: 10.0.0.5 ¦ User: corp\\admin",
+        "beta.yml",
+        "22222222-2222-2222-2222-222222222222",
+        "b.evtx",
+    ],
+    [
+        "2024-01-01 00:02:00.000 +00:00",
+        "EncodedPS",
+        "high",
+        "HOST-A",
+        "Sec",
+        "4688",
+        "Exec",
+        "T1059.001",
+        "",
+        "3",
+        "CommandLine: powershell.exe -enc dABlAHMAdAA= ¦ NewProcessName: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe ¦ SubjectUserName: admin",
+        "encps.yml",
+        "33333333-3333-3333-3333-333333333333",
+        "c.evtx",
+    ],
+]
+
+
+class AllFieldInfoProfileTests(unittest.TestCase):
+    """Behavior when an all-field-info-verbose profile CSV is loaded."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        tmpdir = pathlib.Path(self.tmp.name)
+        self.csv_path = tmpdir / "allfieldinfo.csv"
+        self.db_path = tmpdir / "allfieldinfo.duckdb"
+
+        with self.csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(ALL_FIELD_INFO_CSV_HEADER)
+            writer.writerows(ALL_FIELD_INFO_CSV_ROWS)
+
+        self.orig_db_path = server.DB_PATH
+        self.orig_repo = server.repo
+        self.orig_cache = server._LOG_COLUMNS_CACHE
+
+        server.DB_PATH = self.db_path
+        server.repo = server.DuckDBRepository(self.db_path)
+        server._LOG_COLUMNS_CACHE = None
+        server.switch_dataset(target=str(self.csv_path))
+
+    def tearDown(self) -> None:
+        server.DB_PATH = self.orig_db_path
+        server.repo = self.orig_repo
+        server._LOG_COLUMNS_CACHE = self.orig_cache
+        self.tmp.cleanup()
+
+    def test_parse_details_field_default_raises_with_guidance(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            server.parse_details_field()
+        self.assertIn("detail_source='AllFieldInfo'", str(ctx.exception))
+
+    def test_parse_details_field_lists_original_field_names(self) -> None:
+        df = server.parse_details_field(detail_source="AllFieldInfo", page_size=20)
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        field_names = df["FieldName"].tolist()
+        self.assertIn("CommandLine", field_names)
+        self.assertIn("NewProcessName", field_names)
+
+    def test_parse_details_field_extracts_value(self) -> None:
+        df = server.parse_details_field(
+            field_name="CommandLine", detail_source="AllFieldInfo", unique=True, page_size=10
+        )
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        values = df["Value"].tolist()
+        self.assertIn("wmic process call create", values)
+
+    def test_extract_iocs_uses_original_field_names(self) -> None:
+        df = server.extract_iocs(detail_source="AllFieldInfo", page_size=100)
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        pairs = {(row["Type"], row["FieldName"]) for row in df.to_dict(orient="records")}
+        self.assertIn(("process", "Image"), pairs)
+        self.assertIn(("cmdline", "CommandLine"), pairs)
+        self.assertIn(("ip", "SourceIp"), pairs)
+        self.assertIn(("hash", "Hashes"), pairs)
+
+    def test_decode_powershell_commands_from_allfieldinfo(self) -> None:
+        df = server.decode_powershell_commands(detail_source="AllFieldInfo")
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        decoded_values = df["DecodedCommand"].tolist()
+        self.assertTrue(any("test" in str(v) for v in decoded_values))
+
+    def test_analyze_mitre_tactics_with_allfieldinfo(self) -> None:
+        df = server.analyze_mitre_tactics(detail_source="AllFieldInfo", page_size=10)
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        self.assertIn("Details", df.columns)
+        phases = df["Phase"].tolist()
+        self.assertIn("Execution", phases)
+
+    def test_analyze_mitre_tactics_default_raises_with_guidance(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            server.analyze_mitre_tactics()
+        self.assertIn("detail_source='AllFieldInfo'", str(ctx.exception))
+
+    def test_get_event_detail_expands_allfieldinfo(self) -> None:
+        df = server.get_event_detail(record_id="1")
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        fields = df["Field"].tolist()
+        self.assertIn("AllField.CommandLine", fields)
+        self.assertIn("AllField.NewProcessName", fields)
+
+    def test_analyze_host_timeline_includes_allfieldinfo_column(self) -> None:
+        df = server.analyze_host_timeline(host_contains="HOST-A", page_size=10)
+        self.assertEqual(df.iloc[0]["status"], "ok")
+        self.assertIn("AllFieldInfo", df.columns)
+
 
 if __name__ == "__main__":
     unittest.main()

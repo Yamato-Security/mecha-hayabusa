@@ -20,7 +20,12 @@ MAX_PAGE_SIZE = 1000
 RUN_SQL_MAX_ROWS = 500
 DATASET_LIST_MAX_ROWS = 500
 SUMMARY_FIELD_CANDIDATES = ("RuleTitle", "Computer", "Level", "EventID", "Channel", "Provider")
-SEARCH_RESULT_COLUMNS = ("Timestamp", "Computer", "RuleTitle", "Level", "Channel", "EventID", "MitreTactics", "MitreTags", "Details")
+SEARCH_RESULT_COLUMNS = ("Timestamp", "Computer", "RuleTitle", "Level", "Channel", "EventID", "MitreTactics", "MitreTags", "Details", "AllFieldInfo")
+# Detail columns that hold "Key: Value ¦ Key: Value" data.
+# "Details" comes from the standard/verbose profiles (with abbreviated field names),
+# "AllFieldInfo" comes from the all-field-info-verbose profile
+# (with original event field names). A CSV contains one or the other, never both.
+DETAIL_SOURCE_COLUMNS = ("Details", "AllFieldInfo")
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f %z"
 
 class _WideDisplayDataFrame(pd.DataFrame):
@@ -50,6 +55,7 @@ class _WideDisplayDataFrame(pd.DataFrame):
 DETAILS_SEPARATOR_CHAR = "\u00a6"  # Hayabusa broken bar (U+00A6)
 DETAILS_SEPARATOR = f" {DETAILS_SEPARATOR_CHAR} "
 
+# Abbreviated field names used in the Details column (standard/verbose profiles).
 IOC_FIELD_CATEGORIES = {
     "process": ["Proc", "Image", "ParentImage"],
     "cmdline": ["Cmdline"],
@@ -58,6 +64,19 @@ IOC_FIELD_CATEGORIES = {
     "user": ["User", "TgtUser", "SrcUser"],
     "hash": ["Hash", "Hashes"],
     "service": ["Svc"],
+}
+
+# Original event field names as they appear in the AllFieldInfo column
+# (all-field-info-verbose profile). Verified against Hayabusa 3.8.0
+# CSV output for Security, Sysmon and PowerShell channels.
+IOC_FIELD_CATEGORIES_ALL_FIELD_INFO = {
+    "process": ["Image", "ParentImage", "ImageLoaded", "NewProcessName", "ParentProcessName", "ProcessName"],
+    "cmdline": ["CommandLine", "ParentCommandLine"],
+    "filepath": ["TargetFilename", "RelativeTargetName", "ObjectName", "Path"],
+    "ip": ["SourceIp", "DestinationIp", "IpAddress"],
+    "user": ["User", "ParentUser", "SubjectUserName", "TargetUserName", "TargetOutboundUserName"],
+    "hash": ["Hashes", "Hash"],
+    "service": ["ServiceName", "ServiceFileName", "ImagePath"],
 }
 
 TACTICS_MAP = {
@@ -1064,8 +1083,8 @@ def get_event_detail(
         val = row[col]
         str_val = "" if pd.isna(val) else str(val)
 
-        if col in ("Details", "ExtraFieldInfo") and str_val:
-            prefix = "Details" if col == "Details" else "Extra"
+        if col in ("Details", "ExtraFieldInfo", "AllFieldInfo") and str_val:
+            prefix = {"Details": "Details", "ExtraFieldInfo": "Extra", "AllFieldInfo": "AllField"}[col]
             pairs = str_val.split(DETAILS_SEPARATOR)
             for pair in pairs:
                 pair = pair.strip()
@@ -1262,6 +1281,7 @@ def search_all_fields(
 @app.tool()
 def analyze_mitre_tactics(
     filter_tactics: Sequence[str] | None = None,
+    detail_source: str = "Details",
     page_size: int = 100,
     page_offset: int = 0,
 ):
@@ -1272,6 +1292,9 @@ def analyze_mitre_tactics(
         filter_tactics (Sequence[str], optional): List of tactics to analyze
                                                  Example: ['InitAccess', 'PrivEsc']
                                                  Analyzes all tactics when None
+        detail_source (str): Detail column shown in the results. 'Details' (default,
+                             standard/verbose profiles) or 'AllFieldInfo'
+                             (all-field-info-verbose profile)
         page_size (int): Number of items per page
         page_offset (int): Starting offset for retrieval
 
@@ -1280,10 +1303,12 @@ def analyze_mitre_tactics(
     """
     _ensure_database_ready()
     page_size, page_offset = _resolve_pagination(page_size, page_offset, default_page_size=100, max_page_size=MAX_PAGE_SIZE)
+    detail_column = _resolve_detail_source(detail_source, context="analyze_mitre_tactics")
     _ensure_columns_exist(
-        ["Timestamp", "Computer", "RuleTitle", "Details", "MitreTactics"],
+        ["Timestamp", "Computer", "RuleTitle", detail_column, "MitreTactics"],
         context="analyze_mitre_tactics",
     )
+    detail_quoted = _quote_identifier(detail_column)
 
     target_tactics = [str(tactic).strip() for tactic in (filter_tactics or TACTICS_MAP.keys()) if str(tactic).strip()]
     if not target_tactics:
@@ -1312,7 +1337,7 @@ def analyze_mitre_tactics(
                 l."Timestamp" AS "First Seen",
                 l."Computer" AS "Computer",
                 l."RuleTitle" AS "Event",
-                l."Details" AS "Details",
+                l.{detail_quoted} AS "Details",
                 ROW_NUMBER() OVER (
                     PARTITION BY tm."RawTactic"
                     ORDER BY
@@ -1320,7 +1345,7 @@ def analyze_mitre_tactics(
                         l."Timestamp" ASC,
                         l."Computer" ASC,
                         l."RuleTitle" ASC,
-                        l."Details" ASC
+                        l.{detail_quoted} ASC
                 ) AS rn
             FROM logs AS l
             JOIN tactic_map AS tm
@@ -1679,6 +1704,44 @@ def _validate_detail_field_name(name: str) -> str:
     return stripped
 
 
+def _resolve_detail_source(detail_source: str, context: str) -> str:
+    """
+    Resolve which detail column to parse: 'Details' (default) or 'AllFieldInfo'.
+
+    Raises ValueError when the value is invalid or the column does not exist in
+    the current dataset. When the requested column is missing but the other
+    detail column exists (e.g. an all-field-info-verbose profile CSV was loaded), the
+    error message suggests the correct detail_source value to retry with.
+    """
+    requested = (detail_source or "Details").strip()
+    matched = next(
+        (column for column in DETAIL_SOURCE_COLUMNS if column.lower() == requested.lower()),
+        None,
+    )
+    if matched is None:
+        allowed = ", ".join(DETAIL_SOURCE_COLUMNS)
+        raise ValueError(f"{context}: detail_source must be one of: {allowed}")
+
+    existing = _get_logs_columns()
+    if matched not in existing:
+        fallback = next(
+            (column for column in DETAIL_SOURCE_COLUMNS if column != matched and column in existing),
+            None,
+        )
+        if fallback is not None:
+            raise ValueError(
+                f"{context}: Column '{matched}' does not exist in the current dataset."
+                f" This dataset contains '{fallback}' instead."
+                f" Please call again with detail_source='{fallback}'."
+            )
+        available_label = ", ".join(sorted(existing))
+        raise ValueError(
+            f"{context}: Column '{matched}' does not exist in the current dataset."
+            f" Available columns: {available_label}"
+        )
+    return matched
+
+
 def _build_details_conditions(
     rule_title: str | None,
     level: str | Sequence[str] | None,
@@ -1762,7 +1825,7 @@ def analyze_host_timeline(
     select_cols = [
         col for col in
         ["Timestamp", "RuleTitle", "Level", "Computer", "Channel", "EventID",
-         "MitreTactics", "MitreTags", "Details"]
+         "MitreTactics", "MitreTags", "Details", "AllFieldInfo"]
         if col in columns
     ]
     select_expr = ", ".join(_quote_identifier(c) for c in select_cols)
@@ -1805,26 +1868,32 @@ def parse_details_field(
     rule_title: str | None = None,
     level: str | Sequence[str] | None = None,
     unique: bool = False,
+    detail_source: str = "Details",
     page_size: int = 50,
     page_offset: int = 0,
 ):
     """
-    Parse the key-value structure of the Details column (Key: Value | Key: Value).
+    Parse the key-value structure of the Details or AllFieldInfo column (Key: Value | Key: Value).
 
     When field_name is empty, returns a list of available field names with counts.
     When field_name is specified, extracts values for that field.
 
     Parameters:
-        field_name (str): Field name to extract (e.g., 'Cmdline', 'Proc', 'User')
-                         Returns field name list when empty
+        field_name (str): Field name to extract.
+                         Details uses abbreviated names (e.g., 'Cmdline', 'Proc', 'User');
+                         AllFieldInfo uses original event field names (e.g., 'CommandLine',
+                         'NewProcessName', 'Image'). Returns field name list when empty
         rule_title (str, optional): RuleTitle filter (partial match)
         level (str/Sequence[str], optional): Severity filter
         unique (bool): When True, returns count aggregation of unique values
+        detail_source (str): Column to parse. 'Details' (default, standard/verbose profiles)
+                             or 'AllFieldInfo' (all-field-info-verbose profile)
         page_size (int): Number of items per page
         page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
-    _ensure_columns_exist(["Details"], context="parse_details_field")
+    detail_column = _resolve_detail_source(detail_source, context="parse_details_field")
+    detail_quoted = _quote_identifier(detail_column)
     page_size, page_offset = _resolve_pagination(
         page_size, page_offset, default_page_size=50, max_page_size=MAX_PAGE_SIZE
     )
@@ -1839,10 +1908,10 @@ def parse_details_field(
         query = f"""
             WITH split AS (
                 SELECT unnest(string_split(
-                    COALESCE("Details", ''), {sep_literal}
+                    COALESCE({detail_quoted}, ''), {sep_literal}
                 )) AS kv_pair
                 FROM logs
-                WHERE "Details" IS NOT NULL AND "Details" != ''
+                WHERE {detail_quoted} IS NOT NULL AND {detail_quoted} != ''
                 {and_clause}
             )
             SELECT
@@ -1864,11 +1933,11 @@ def parse_details_field(
                 WITH split AS (
                     SELECT
                         unnest(string_split(
-                            COALESCE("Details", ''), {sep_literal}
+                            COALESCE({detail_quoted}, ''), {sep_literal}
                         )) AS kv_pair,
                         "Computer"
                     FROM logs
-                    WHERE position('{validated_name}: ' IN COALESCE("Details", '')) > 0
+                    WHERE position('{validated_name}: ' IN COALESCE({detail_quoted}, '')) > 0
                     {and_clause}
                 )
                 SELECT
@@ -1904,10 +1973,10 @@ def parse_details_field(
                     SELECT
                         {context_select}
                         unnest(string_split(
-                            COALESCE("Details", ''), {sep_literal}
+                            COALESCE({detail_quoted}, ''), {sep_literal}
                         )) AS kv_pair
                     FROM logs
-                    WHERE position('{validated_name}: ' IN COALESCE("Details", '')) > 0
+                    WHERE position('{validated_name}: ' IN COALESCE({detail_quoted}, '')) > 0
                     {and_clause}
                 )
                 SELECT
@@ -1948,11 +2017,13 @@ def extract_iocs(
     ioc_type: str | None = None,
     level: str | Sequence[str] | None = None,
     rule_title: str | None = None,
+    detail_source: str = "Details",
     page_size: int = 100,
     page_offset: int = 0,
 ):
     """
-    Automatically extract IOCs (Indicators of Compromise) from Details/ExtraFieldInfo columns.
+    Automatically extract IOCs (Indicators of Compromise) from Details/ExtraFieldInfo
+    columns (standard/verbose profiles) or the AllFieldInfo column (all-field-info-verbose profile).
 
     Aggregates process paths, command lines, IP addresses, file paths, users, hashes,
     and service names by category and returns the results.
@@ -1963,24 +2034,29 @@ def extract_iocs(
                                   Extracts all types when None
         level (str/Sequence[str], optional): Severity filter
         rule_title (str, optional): RuleTitle filter (partial match)
+        detail_source (str): Column to parse. 'Details' (default, also scans ExtraFieldInfo)
+                             or 'AllFieldInfo' (all-field-info-verbose profile)
         page_size (int): Number of items per page
         page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
-    _ensure_columns_exist(["Details"], context="extract_iocs")
+    detail_column = _resolve_detail_source(detail_source, context="extract_iocs")
     page_size, page_offset = _resolve_pagination(
         page_size, page_offset, default_page_size=100, max_page_size=MAX_PAGE_SIZE
     )
 
-    valid_types = set(IOC_FIELD_CATEGORIES.keys())
+    field_categories = (
+        IOC_FIELD_CATEGORIES if detail_column == "Details" else IOC_FIELD_CATEGORIES_ALL_FIELD_INFO
+    )
+    valid_types = set(field_categories.keys())
     if ioc_type is not None:
         ioc_type_normalized = ioc_type.strip().lower()
         if ioc_type_normalized not in valid_types:
             allowed = ", ".join(sorted(valid_types))
             raise ValueError(f"ioc_type must be one of: {allowed}")
-        target_categories = {ioc_type_normalized: IOC_FIELD_CATEGORIES[ioc_type_normalized]}
+        target_categories = {ioc_type_normalized: field_categories[ioc_type_normalized]}
     else:
-        target_categories = IOC_FIELD_CATEGORIES
+        target_categories = field_categories
 
     # Build CASE expression for field categorization
     case_parts: list[str] = []
@@ -2004,13 +2080,14 @@ def extract_iocs(
     and_clause = f"AND {extra_filter}" if extra_filter else ""
 
     columns = _get_logs_columns()
-    has_extra = "ExtraFieldInfo" in columns
+    has_extra = detail_column == "Details" and "ExtraFieldInfo" in columns
     sep_literal = f"' {DETAILS_SEPARATOR_CHAR} '"
+    detail_quoted = _quote_identifier(detail_column)
 
     if has_extra:
         combined_expr = f"""COALESCE("Details", '') || {sep_literal} || COALESCE("ExtraFieldInfo", '')"""
     else:
-        combined_expr = 'COALESCE("Details", \'\')'
+        combined_expr = f"COALESCE({detail_quoted}, '')"
 
     query = f"""
         WITH split AS (
@@ -2018,7 +2095,7 @@ def extract_iocs(
                 unnest(string_split({combined_expr}, {sep_literal})) AS kv_pair,
                 "Computer"
             FROM logs
-            WHERE ("Details" IS NOT NULL AND "Details" != '')
+            WHERE ({detail_quoted} IS NOT NULL AND {detail_quoted} != '')
             {and_clause}
         ),
         parsed AS (
@@ -2078,6 +2155,7 @@ _ENCODED_PS_PATTERN = re.compile(
 def decode_powershell_commands(
     level: str | Sequence[str] | None = None,
     rule_title: str | None = None,
+    detail_source: str = "Details",
     page_size: int = 50,
     page_offset: int = 0,
 ):
@@ -2085,16 +2163,19 @@ def decode_powershell_commands(
     Decode and return Base64-encoded PowerShell commands.
 
     Detects Base64 values from -enc/-encodedcommand/-e parameters found in
-    Details/ExtraFieldInfo and decodes them as UTF-16-LE.
+    Details/ExtraFieldInfo (or AllFieldInfo) and decodes them as UTF-16-LE.
 
     Parameters:
         level (str/Sequence[str], optional): Severity filter
         rule_title (str, optional): RuleTitle filter (partial match)
+        detail_source (str): Column to scan. 'Details' (default, also scans ExtraFieldInfo)
+                             or 'AllFieldInfo' (all-field-info-verbose profile)
         page_size (int): Number of items per page
         page_offset (int): Starting offset for retrieval
     """
     _ensure_database_ready()
-    _ensure_columns_exist(["Timestamp", "Computer", "RuleTitle", "Level", "Details"], context="decode_powershell_commands")
+    detail_column = _resolve_detail_source(detail_source, context="decode_powershell_commands")
+    _ensure_columns_exist(["Timestamp", "Computer", "RuleTitle", "Level", detail_column], context="decode_powershell_commands")
     page_size, page_offset = _resolve_pagination(
         page_size, page_offset, default_page_size=50, max_page_size=MAX_PAGE_SIZE
     )
@@ -2103,13 +2184,14 @@ def decode_powershell_commands(
     and_clause = f"AND {extra_filter}" if extra_filter else ""
 
     columns = _get_logs_columns()
-    has_extra = "ExtraFieldInfo" in columns
+    has_extra = detail_column == "Details" and "ExtraFieldInfo" in columns
     sep_literal = f"' {DETAILS_SEPARATOR_CHAR} '"
+    detail_quoted = _quote_identifier(detail_column)
 
     if has_extra:
         combined_expr = f"""COALESCE("Details", '') || {sep_literal} || COALESCE("ExtraFieldInfo", '')"""
     else:
-        combined_expr = 'COALESCE("Details", \'\')'
+        combined_expr = f"COALESCE({detail_quoted}, '')"
 
     query = f"""
         SELECT
