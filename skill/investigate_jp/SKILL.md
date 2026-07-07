@@ -16,12 +16,40 @@ Hayabusa MCPツールを使い、CSVログを体系的に分析して侵害タ�
 
 以下のステップを順に実行する。各ステップ内の独立したツール呼び出しは**並列実行**してレイテンシを最小化する。
 
+### 調査ステート管理（JSON）★最初に読むこと
+
+調査全体は `state.py` が管理する機械可読なJSONステートファイルで追跡する。これにより網羅性が（記憶ではなく）決定論的なコードで強制され、中断した調査を再開できる。スクリプトの場所:
+
+```
+STATE_PY="$HOME/.claude/skills/investigate_jp/scripts/state.py"
+```
+
+ルール:
+
+- **state.py の実行は必ずBashツール**を使い、絶対パスで参照する（チャートスクリプトと同じ制約）
+- ステートディレクトリ `STATE_DIR` は Step 1 で作成するレポート出力ディレクトリと同一。全ステートファイル（`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `queries.jsonl`）はチャート・レポートと同じ場所に置かれる
+- **確定した事実はその場で記録する**（各Stepの本文にコマンドを記載）。一括登録は `state.py triage --batch` / `finding --batch` / `ioc --batch` / `host --batch` にJSON配列をstdinで渡す
+- **★一括登録のJSONは必ずファイル経由で渡す（重要）**: rationale や excerpt には Windows パス（`C:\Users\...`、`\Device\...`、`C:\$SNAP_...`）が頻出する。これを `echo '[...]' | ... --batch` のようにシングルクォートのインラインで渡すと、`\U` `\D` `\$` 等が**JSONの不正エスケープ**となり `Invalid \escape` で必ず失敗する。**WriteツールでスクラッチパッドにJSONファイルを書き、`--batch < /path/to/batch.json` でリダイレクト入力する**のを正規の手順とする。インラインの `echo` は避ける。どうしてもインラインで書く場合はバックスラッシュを `\\` に二重化するか、パスを `/` 表記にする（本文の記述としては `/` 表記でも意味は通じる）
+- **再開**: 対象CSVに前回セッションのステートディレクトリ（`[CSV名]_[タイムスタンプ]` 内の `manifest.json`）が既に存在する場合は、`python3 "$STATE_PY" status --dir <dir>` で残作業を確認し、最初からやり直さずに続きから再開する。再開するかはユーザーに確認する
+- **レポートゲート**: Step 7 は `state.py check` が PASS（全カバレッジゲート green）であることが前提。そうでない場合 `report.py` はレポート生成を拒否する
+
 ### Step 1: 対象CSVの特定とデータセット読み込み
 
 1. **調査開始時刻を記録する**: Bashツールで `date '+%Y-%m-%d %H:%M:%S'` を実行し、開始時刻を控えておく（Step 6-4 で取得するレポート生成時刻との差分計算に使用）
 2. 引数でCSVパスが指定されている場合 → そのパスを使用する
 3. 引数が未指定の場合 → `mcp__hayabusa__list_datasets` でカレントディレクトリ配下のCSVファイル一覧を取得し、`AskUserQuestion` ツールで対象ファイルを選択させる。候補が1件のみの場合もユーザーに確認する
-4. ユーザーが選択したCSVを `mcp__hayabusa__switch_dataset` で読み込む
+4. ユーザーが選択したCSVを `mcp__hayabusa__switch_dataset` で読み込む。**パラメータ名は `target`**（CSVの絶対パス、または `list_datasets` が返すエイリアスを渡す。`path` ではない）。なお `mcp__hayabusa__run_sql` のSQLは **`sql` パラメータ**で渡す（`query` ではない）
+5. **出力/ステートディレクトリを作成し、調査ステートを初期化する**:
+
+```bash
+STATE_DIR="[CSVのディレクトリ]/[CSV拡張子なしのファイル名]_[YYYY-MM-DDTHHMI]"
+python3 "$STATE_PY" init --csv "[CSVパス]" --dir "$STATE_DIR" --model "[モデルID]" --skill investigate_jp
+```
+
+   - `init` はCSVをフィンガープリント（sha256、行数、カラム、detail_source）し、**CSV中の全ルールタイトルを `rule_triage.json` に自動シード**、タイムスタンプから導出した活動クラスタを `clusters.json` にシードする。このシード済みリストが調査全体のカバレッジの基準となる
+   - 出力される `detail_source`（Details または AllFieldInfo）は、詳細フィールド解析系MCPツールに渡す `detail_source` の値を示す。**このスキル内のSQL例に登場する `Details` カラムは、`detail_source` が `AllFieldInfo` の場合すべて `AllFieldInfo` に読み替えること**（AllFieldInfoプロファイルのCSVに `Details` カラムは存在せず、そのまま実行するとエラーになる）
+   - **AllFieldInfo内のサブフィールド（`NewProcessName`, `ProcessName`, `SubjectUserName`, `IpAddress` 等）は独立したカラムではなく `AllFieldInfo` テキスト列の中にある**。`run_sql` で `SELECT NewProcessName ... GROUP BY NewProcessName` のように直接参照するとカラム不存在エラーになる。サブフィールド単位の集計・抽出は `mcp__hayabusa__parse_details_field` を使うか、`AllFieldInfo LIKE '%...%'` で絞り込む
+   - このディレクトリは従来 Step 6-0 で作成していたものを兼ねる。チャートとレポートもここに保存する
 
 ### Step 2: プロファイル取得と調査方針の決定
 
@@ -37,6 +65,14 @@ Hayabusa MCPツールを使い、CSVログを体系的に分析して侵害タ�
 - 特定アカウントの大量活動 → 認証情報窃取・内部不正の可能性。アカウント軸の分析を重視
 - med以下のみで明確なcrit/highがない → 低速な偵察活動の可能性。med含めた分析に拡大
 
+**調査方針をステートに記録する**（監査可能にし、カバレッジゲートの基準を確定させる）:
+
+```bash
+python3 "$STATE_PY" strategy --dir "$STATE_DIR" --hypothesis "[仮説を一行で]" --interval "[選択したinterval]" --levels "high,crit"
+```
+
+- `--levels` はカバレッジゲートが強制する重要度レベルを定義する（medに拡大する場合は `med` も含める）。クラスタが未判定のうちにレベルを変更すると活動クラスタが再導出される
+
 ### Step 3: 攻撃の全体像把握（並列実行）
 
 以下3つを**同時に**呼び出す:
@@ -48,23 +84,55 @@ Hayabusa MCPツールを使い、CSVログを体系的に分析して侵害タ�
    - 1〜7日: `"3h"`
    - 7日超: `"12h"` または `"1d"`
 
-### Step 3.5: 全ルールタイトルのDetails検証（偽陽性排除） ★重要
+### Step 3.5: 全ルールタイトルの詳細フィールド検証（偽陽性排除） ★重要
 
-**このステップはスキップしてはならない。** Step 3 の `analyze_rule_titles` で得られた全ルールタイトルについて、各ルール1〜2件のサンプルイベントのDetailsフィールドを取得し、**実際の内容を確認してから攻撃か偽陽性かを判定する**。
+**このステップはスキップしてはならない。** Step 3 の `analyze_rule_titles` で得られた全ルールタイトルについて、各ルール1〜2件のサンプルイベントの詳細フィールド（`Details` または `AllFieldInfo`。manifest の `detail_source` に従う）を取得し、**実際の内容を確認してから攻撃か偽陽性かを判定する**。
+
+完全なルール一覧は `state.py init` の時点で `rule_triage.json` にシード済み。このステップの作業は pending 件数をゼロにすることに等しい。残作業は以下で確認する:
+
+```bash
+python3 "$STATE_PY" status --dir "$STATE_DIR"
+```
 
 #### 実施方法
 
-Step 3 で検出された**全ての異なるルールタイトル**について、以下のSQLで代表イベントのDetailsを取得する:
+Step 3 で検出された**全ての異なるルールタイトル**について、以下のSQLで代表イベントの詳細フィールドを取得する:
 
 ```sql
-SELECT Timestamp, Computer, RuleTitle, Level, Details
+SELECT Timestamp, Computer, RuleTitle, Level, RecordID, Details
 FROM logs WHERE RuleTitle = '[ルールタイトル]'
 ORDER BY Timestamp LIMIT 2
 ```
 
+- `detail_source` が `AllFieldInfo` の場合は `Details` を `AllFieldInfo` に置き換える
+- `RecordID` を必ずSELECTに含める（判定記録の `record_ids`、ゲート G7 で必要になる）
+
 ルールタイトルが多い場合（10件超）は、以下の方法で並列化・効率化する:
 - 複数ルールタイトルを `WHERE RuleTitle IN (...)` でまとめてクエリする
 - ただし1クエリあたり5ルールまでとし、LIMIT 10 程度で各ルール最低1件は取得できるようにする
+
+#### 判定結果の記録（必須）
+
+ルールをひとまとまり検証するごとに、判定を即座に記録する（最後にまとめて記録しない — コンテキストが圧縮される可能性がある）。verdict は `attack` / `false_positive` / `indeterminate` の3値、`rationale`（判定根拠）は必須。
+
+**JSONはWriteツールでファイルに書き、リダイレクトで渡す**（rationale/excerptにWindowsパスが入るとインライン `echo` は `Invalid \escape` で失敗するため。前述の「一括登録のJSON」ルール参照）:
+
+```json
+// 例: $STATE_DIR/triage_batch.json （Writeツールで作成）
+[
+ {"rule_title": "[正確なタイトル]", "verdict": "attack", "rationale": "[根拠]", "record_ids": ["123"], "excerpt": "[詳細フィールドの要点]"},
+ {"rule_title": "[正確なタイトル]", "verdict": "false_positive", "rationale": "[根拠]"}
+]
+```
+
+```bash
+python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch.json"
+```
+
+- **`attack` 判定には `record_ids`（実際に検証した代表イベントのRecordID、最低1件）が必須**（RecordIDカラムを持つデータセットの場合。記録時に拒否され、ゲート G7 でも強制される）。`excerpt` に判定根拠となった詳細フィールドの要点を残し、読者が再判定できるようにする
+- **時間的相関だけで `attack` と判定しない**: 詳細フィールドに実体的証拠（コマンドライン、ファイルパス、対象オブジェクト等）が無く、「攻撃チェーン上のタイミングで発生した」ことだけが根拠の場合は `indeterminate` とする（例: CommandLine未記録のrundll32起動、詳細フィールドが空のNTLMv1検知）。攻撃との関連の可能性はレポートの分析所見とセクション9「判断が困難なイベント」で述べる
+
+ルールタイトルはシード済みのタイトルと完全一致させる（`status` の出力またはCSVからコピー）。コマンドは残りの pending 件数を出力する。**pending = 0 になって初めてこのステップは完了**（後段のゲート G1 が強制する）。なお G1 の対象は調査対象レベルのルールのみだが、**findingに引用したルールは重要度に関わらず判定が必要**（ゲート G8）— info/lowのルールを証拠として使う場合も、この手順で判定を記録する。
 
 #### 検証すべき観点
 
@@ -98,10 +166,52 @@ Detailsの確認中に、以下の攻撃インフラパターンを発見した�
 
 以下4つを**同時に**呼び出す:
 
-1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` でcritイベントの全詳細を取得する。critが存在しない場合はhighに拡大する
+1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` でcritイベントの全詳細を取得する（`detail_source` が `AllFieldInfo` の場合は `Details` → `AllFieldInfo`）。critが存在しない場合はhighに拡大する
 2. **`mcp__hayabusa__extract_iocs`** — `level: ["high", "crit"]` でIOC（プロセス、コマンドライン、IP、ユーザー、ハッシュ等）を抽出する
 3. **`mcp__hayabusa__correlate_lateral_movement`** — `time_window_minutes: 60`, `level: ["high", "crit"]` でホスト間の横展開パターンを検出する。単一ホストのインシデントでは結果が空になる場合があるが、それ自体が横展開なしの証拠となる
-4. **`mcp__hayabusa__parse_details_field`** — `field_name: "User"`, `level: ["high", "crit"]`, `unique: true` で攻撃に関与したアカウントを集計する。攻撃主体の特定はほぼ全てのインシデントで必要なため、常に実行する
+4. **`mcp__hayabusa__parse_details_field`** — `level: ["high", "crit"]`, `unique: true` で攻撃に関与したアカウントを集計する。攻撃主体の特定はほぼ全てのインシデントで必要なため、常に実行する。**`field_name` は detail_source に依存する**: `Details` プロファイルでは `field_name: "User"`、**`AllFieldInfo` プロファイルでは `User` フィールドは存在しないため `field_name: "SubjectUserName"`（および必要に応じ `"TargetUserName"`）を指定する**（`AllFieldInfo` で `"User"` を渡すと `no_data` になる）。`field_name` を空で呼ぶと利用可能なフィールド名一覧が返るため、不明な場合はまず空で呼んで確認する
+
+**確定した結果はその場でステートに記録する**:
+
+- crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`record_ids` も必須**（裏付けイベントのRecordID、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。`rules` に引用したルールは重要度に関わらずトリアージ判定が必要（ゲート G8。未判定のまま引用すると警告が出る）:
+
+JSONはWriteツールでファイルに書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
+
+```json
+// 例: $STATE_DIR/finding_batch.json
+[
+ {"title": "[findingの短いタイトル]", "summary": "[何が起きたか]", "phase": "Execution",
+  "hosts": ["HOST-A"], "rules": ["[正確なルールタイトル]"], "record_ids": ["123"],
+  "query": "SELECT ..."}
+]
+```
+
+```bash
+python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
+```
+
+- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `record_ids` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル経由で渡す:
+
+```json
+// 例: $STATE_DIR/ioc_batch.json
+[
+ {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[攻撃における役割]", "record_ids": ["123"]}
+]
+```
+
+```bash
+python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/ioc_batch.json"
+```
+
+- **★ `has_more: true` を受け取ったら、その場で必ず `log-query` に記録する（重要）**: ゲート G5 は**自己申告制**であり、記録しなければ検知できない。log-query を一度も呼ばなければ G5 は「no queries logged」で緑になるが、これは「打ち切りが無かった」ことの証明にはならない。`has_more: true` を返す代表的なツール（`extract_iocs`, `correlate_lateral_movement`, `run_sql`, `analyze_host_timeline` 等）で打ち切る/追加取得する場合は、以下で必ず記録する:
+
+```bash
+python3 "$STATE_PY" log-query --dir "$STATE_DIR" --tool extract_iocs --query-hash "[ツール結果のquery_hash]" --has-more
+```
+
+  - **`--query-hash [hash]` を必ず渡す**（ツール結果の `query_hash`）。全ページ取得後に解決するには、**同じ** `--query-hash` を `--has-more` なしで再記録する。解決は query_hash で突き合わせるため、後続で解消できるのはハッシュを付けた場合のみ。
+  - 正当な打ち切り（結果が無害・ノイズと確認済み等）として記録する場合は、1エントリで `--has-more --accept-truncation --note "[理由]"` を記録する。
+  - `--query-hash` なしの `--has-more` エントリは、突き合わせるハッシュが無いため後続では解消できず、その同じエントリの `--accept-truncation` でしか解決できない。後でページネーションする意図があるなら必ずハッシュを渡すこと。
 
 ### Step 5: 適応的深掘り（並列実行）
 
@@ -131,13 +241,20 @@ Step 3.5 で攻撃者のステージングディレクトリ（例: `C:\Users\Pu
 Step 3 の `summarize_by_time_window` で複数の活動期間クラスタ（例: 2023-03, 2023-04, 2023-11, 2024-09 のように不連続な活動群）が検出された場合、**全てのクラスタについて代表的なイベントを確認する**。具体的には各クラスタの時間範囲で以下のSQLを実行する:
 
 ```sql
-SELECT Timestamp, Computer, RuleTitle, Level, Details
+SELECT Timestamp, Computer, RuleTitle, Level, RecordID, Details
 FROM logs WHERE Timestamp >= '[クラスタ開始]' AND Timestamp <= '[クラスタ終了]'
 AND Level IN ('high','crit')
 ORDER BY Timestamp LIMIT 20
 ```
 
+（`detail_source` が `AllFieldInfo` の場合は `Details` → `AllFieldInfo`）
+
 これにより「第N波攻撃」と推定していたものが実は正常活動（Windowsスケジュールタスク等）であるケースを識別できる。明確な攻撃活動がないクラスタはレポートで「攻撃キャンペーン」として記載しない。
+
+**カバレッジをステートに記録する**:
+
+- 調査したホスト（軽微なホストはルールトリアージ経由のレビューでも可）→ `python3 "$STATE_PY" host --dir "$STATE_DIR" --name [ホスト名] --status investigated --note "[確認内容]"`。調査対象レベルのイベントを持つ全ホストにエントリが必要（ゲート G2）
+- 各活動クラスタ（`init` がタイムスタンプからシード済み。IDは `status` で確認）→ `python3 "$STATE_PY" cluster --dir "$STATE_DIR" --id cN --verdict attack|benign|indeterminate --note "[根拠]"`。全クラスタに判定が必要（ゲート G3）
 
 ### Step 5.5: プロセス相関・ネットワークマッピング（並列実行）
 
@@ -149,7 +266,7 @@ Step 4-5 の結果から重要なイベントが特定された後、以下の�
 - PsExec.exe（PID Y）がネットワーク接続（port 135/445）を行い、同時にリモートサービスを作成している → 横展開の全体像
 
 #### IP→ホスト名マッピング:
-IOC抽出やDetails内で検出された内部IPアドレスについて、同じIPが他のイベントでどのComputer名と紐づいているかを確認する:
+IOC抽出や詳細フィールド内で検出された内部IPアドレスについて、同じIPが他のイベントでどのComputer名と紐づいているかを確認する:
 ```sql
 SELECT DISTINCT Computer, Details FROM logs
 WHERE Details LIKE '%10.65.45.XXX%' LIMIT 5
@@ -161,11 +278,15 @@ WHERE Details LIKE '%10.65.45.XXX%' LIMIT 5
 SELECT Details FROM logs WHERE Details LIKE '%S-1-5-21-XXXX%' LIMIT 5
 ```
 
+（上記2つのSQLも `detail_source` が `AllFieldInfo` の場合は `Details` → `AllFieldInfo`。横断検索には `mcp__hayabusa__search_all_fields` も利用できる）
+
 #### ハッシュIOCの収集:
 Step 3.5〜5 で確認したDetailsフィールド内のHashes値（SHA256, SHA1, MD5）を、攻撃に関連するプロセス・DLLについて記録する。特に以下のハッシュはレポートのIOCセクションに含める:
 - 攻撃者がステージングディレクトリに配置したファイルのハッシュ
 - 攻撃ツール（PsExec, Mimikatz, BloodHound等）のハッシュ
 - 不審なDLLのハッシュ
+
+相関分析の結果とハッシュIOCもステートに記録する（`state.py finding` / `state.py ioc --type hash`）。出典イベントの `record_ids` を含めること。
 
 ### Step 6: 可視化グラフ生成
 
@@ -178,17 +299,11 @@ SCRIPT_DIR="$HOME/.claude/skills/investigate_jp/scripts"
 
 **注意**: `~` やGlobツールではパスを解決できない場合がある。スクリプトの存在確認や実行は**必ずBashツール**を使用し、`$HOME` を用いた絶対パスで参照すること。Globツールでスクリプトを探さないこと。
 
-#### 6-0. 出力ディレクトリの作成
+#### 6-0. 出力ディレクトリ
 
-出力ファイルを生成する前に、CSVファイルと同じディレクトリにCSVファイル名（拡張子なし）+タイムスタンプのディレクトリを作成する。全ての出力ファイル（チャートおよびレポート）はこのディレクトリ内に保存する。
+Step 1 で作成したステートディレクトリ `$STATE_DIR`（`[CSVのディレクトリ]/[CSV拡張子なしのファイル名]_[YYYY-MM-DDTHHMI]/`）を出力ディレクトリとして使用する。全ての出力ファイル（チャートおよびレポート）は調査ステートJSONと同じこのディレクトリ内に保存する。
 
-```bash
-mkdir -p "[CSVのディレクトリ]/[CSV拡張子なしのファイル名]_[YYYY-MM-DDTHHMI]"
-```
-
-- `[YYYY-MM-DDTHHMI]`: ディレクトリ作成時のローカルタイムスタンプ（時分まで）
-
-例: CSVが `/data/hayabusa-results.csv` の場合、`/data/hayabusa-results_2026-02-20T0723/` を作成し、全出力をその中に保存する。以降の Step 6-1, 6-2, 7 では全てこの同じディレクトリパスを使用する。
+例: CSVが `/data/hayabusa-results.csv` の場合、ディレクトリは `/data/hayabusa-results_2026-02-20T0723/` となり、全出力をその中に保存する。以降の Step 6-1〜6-3, 7 では全てこの同じディレクトリパスを使用する。
 
 #### 6-1. タイムラインチャート生成
 
@@ -282,6 +397,7 @@ JSON入力の構造:
 - タイムラインチャート → セクション3「侵害タイムライン」の冒頭に `[タイムラインチャート（インタラクティブ）](ファイル名_timeline.html)` で挿入
 - MITREフロー図 → セクション4「攻撃フロー」の冒頭に `[攻撃フロー図（インタラクティブ）](ファイル名_mitre_flow.html)` で挿入
 - 横展開チャート → セクション8「伝播経路」の冒頭に `[伝播経路チャート（インタラクティブ）](ファイル名_lateral_movement.html)` で挿入
+- **各チャートのリンクは本文中に1回だけ**、上記の指定セクションに記載する（同じチャートを複数箇所に書いても iframe 埋め込みされるのは初出の1箇所のみで、2回目以降は通常のリンクとして表示される）
 
 #### 6-5. レポートメタデータ用の時刻・バージョン情報取得
 
@@ -291,11 +407,22 @@ JSON入力の構造:
 
 **順序要件**: これらのコマンドは**必ず可視化グラフ生成後**に実行すること。先に実行しない。
 
-> **注記**: Step 6-0 の説明で「Step 6-1, 6-2, 7」と記載されているが、6-3 も同様に含まれる。
-
 ### Step 7: レポート生成
 
-収集した全データを分析し、以下の出力フォーマットに従って**日本語の**インシデント・フォレンジックレポートを生成する。
+#### Step 7-0: カバレッジゲート（レポート作成前に必須）
+
+レポート本文を組み立てる前にカバレッジチェックを実行し、PASS させる:
+
+```bash
+python3 "$STATE_PY" check --dir "$STATE_DIR"
+```
+
+- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack判定ルール、G5 未解決のページネーション、G6 データセットに存在しない引用RecordID、G7 RecordIDを1件も引用していないattack判定ルール/finding、G8 findingが引用しているのにトリアージ未判定のルール。該当ステップに戻ってギャップを解消し、再実行する
+- **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
+- レポート生成時もこのゲートが再実行される: `report.py` は `state_dir` を渡し忘れても出力ディレクトリ（`manifest.json` がある場所）から `$STATE_DIR` を自動検出するため、ゲートを暗黙にスキップできない
+- 不完全な調査のままの生成をユーザーが明示的に了承した場合に限り、Step 7-1 で `"force": true` を指定して先へ進んでよい（未解決ギャップはレポート付録に明記される）
+
+収集した全データを分析し、以下の出力フォーマットに従って**日本語の**インシデント・フォレンジックレポートを生成する。ステートファイルを情報源として使うこと: セクション9の偽陽性テーブルは `rule_triage.json`（verdict=false_positive）から、判定不能リストは verdict=indeterminate から生成し、IOCセクションは `iocs.json` と整合させる。
 
 #### ファイル出力
 
@@ -331,13 +458,15 @@ JSON入力の構造:
     "timeline": "/path/to/timeline.html",
     "mitre_flow": "/path/to/mitre_flow.html",
     "lateral_movement": "/path/to/lateral_movement.html"
-  }
+  },
+  "state_dir": "/path/to/STATE_DIR"
 }
 ```
 
 - `content`: レポート本文全体。Markdown記法ベースの文字列を直接渡す
 - `output`: 最終出力のHTMLファイルパス
 - `charts`: Step 6で生成したチャートHTMLファイルのパス。本文中のチャートリンク `[...](xxx.html)` が自動的にiframe埋め込みに変換される。単一ホストのインシデントでチャートを生成しなかった場合は `lateral_movement` を省略可
+- `state_dir`: **必ず `$STATE_DIR` を渡す。** report.py はカバレッジゲートを再実行し、FAIL があればレポート生成を拒否する（終了コード3）。成功時は自動生成の「カバレッジと再現性」付録（データセットsha256、トリアージ集計、ゲート結果）をレポート末尾に追加する。`"force": true` は不完全な調査をユーザーが明示的に了承した場合のみ指定する
 
 変換後、最終的な `.html` ファイルのパスをユーザーに通知する。
 
@@ -446,6 +575,7 @@ MITRE ATT&CKタクティクスと時間的クラスタリングに基づいて�
 - crit/highイベントは原則すべて記載
 - 同一ルール・同一ホストの繰り返しは代表的な1件+件数注記
 - 同一タイムスタンプで複数ルールが発火した場合は最も重要度の高いルールを採用し、他を注記
+- **フェーズ見出しの時間範囲は、そのフェーズのテーブルに実際に記載したイベントの範囲と一致させる**（範囲外の時刻の行を含めない。含める必要があるならフェーズの時間範囲を広げるか、別フェーズに分ける）
 
 ### セクション 4: 攻撃フロー図
 
@@ -454,14 +584,18 @@ MITRE ATT&CKタクティクスと時間的クラスタリングに基づいて�
 ```markdown
 ## 4. 攻撃フロー (MITRE ATT&CK)
 
-[検出タクティクス1] → [検出タクティクス2] → ... → [検出タクティクスN]
-     (TID)              (TID)                        (TID)
-   [関連ホスト]        [関連ホスト]                  [関連ホスト]
+[攻撃フロー図（インタラクティブ）](ファイル名_mitre_flow.html)
+
+| # | タクティク (TA番号) | 主なテクニック (Txxxx) | 関連ホスト | 時間帯 |
+|---|---|---|---|---|
+| 1 | Initial Access (TA0001) | T1566 Phishing 等 | HOST-A | YYYY-MM-DD HH:MM |
+| 2 | Credential Access (TA0006) | T1003 等 | HOST-A | YYYY-MM-DD HH:MM |
 ```
 
-- 実際に検出されたタクティクスのみ記載する
-- 各タクティクスの下に、最も代表的なテクニックIDと関連ホストを付記
-- 検出間にギャップがある場合（例: 初期アクセス→C2の間が不明）、「(未検出/推定)」と注記して攻撃チェーンの欠落を明示
+- 攻撃進行順（時系列）にタクティクスを並べ、実際に検出されたタクティクスのみ記載する
+- 各行に最も代表的なテクニックID・関連ホスト・時間帯を付記する
+- 検出間にギャップがある場合（例: 初期アクセス→C2の間が不明）、該当行のテクニック欄に「(未検出/推定)」と注記して攻撃チェーンの欠落を明示する
+- **テキストのASCIIアート矢印図（`A → B → C` を空白で桁揃えする図）は使用しない**。全角文字で桁が崩れる上、冒頭のインタラクティブ図と重複するため。フローの可視化はインタラクティブ図に委ね、本文は上記の表で示す
 
 ### セクション 5: 影響を受けた資産とアカウント
 
@@ -627,7 +761,7 @@ Step 3.5 の検証で偽陽性（または偽陽性の可能性が高い）と�
 > **Report Metadata**
 > - Generated by: Claude Code (`claude --version` の出力結果)
 > - Model: [システムプロンプトに記載されているモデルID（例: claude-opus-4-6）]
-> - Analysis duration: [Step 1 の開始時刻から Step 6-4 または Step 7 の時刻までの経過時間（分:秒）]
+> - Analysis duration: [Step 1 の開始時刻から Step 6-4 または Step 7 の時刻までの経過時間。`分:秒` 形式（例: `11:23`）で記載し、「約N分」のような概算にしない]
 > - Report generated at: YYYY-MM-DD HH:MM:SS (Local)
 ```
 
@@ -644,6 +778,9 @@ Step 3.5 の検証で偽陽性（または偽陽性の可能性が高い）と�
 
 レポート全体を通じて以下に留意する:
 
+- **ステートの逐次記録（最重要）**: トリアージ判定・finding・IOC・ホストカバレッジ・クラスタ判定は、**確定したその時点で**ステートファイルに記録する（最後にまとめて記録しない）。ステートファイルは調査の一次情報源であり、コンテキスト圧縮を越えて残り、再開を可能にし、カバレッジゲート（`state.py check`）が PASS するまでレポートは生成できない
+- **証跡RecordIDの引用（最重要）**: `attack` 判定のトリアージと全てのfindingには、裏付けイベントの `record_ids` を必ず含める（ゲート G7）。IOCにも可能な限り出典 `record_ids` を付ける。RecordIDは検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い
+- **ステート記録の時刻表記**: finding や triage の `summary` / `rationale` に時刻を書く場合は、タイムゾーンオフセット付き（例: `2023-10-10T14:11:45+09:00`）またはTZ注記付きで記録する。レポート本文の表記タイムゾーン（UTC）と元ログのタイムゾーンが異なっても、ステートとレポートを突合できるようにするため
 - **攻撃者ツールの特定**: Hayabusaのルール名には攻撃ツール名が含まれることが多い（例: "HackTool - [ツール名]", "[ツール名] Execution"）。ルール名のパターンから攻撃ツール/フレームワークを識別し、セクション2に反映する
 - **正規活動との区別**: 構成管理ツール（Packer, Ansible, SCCM等）やIT管理ツール由来の活動は攻撃と誤認しやすい。コンテキスト（実行パス、実行ユーザー、タイミング）から判断し、判断根拠をセクション9に記載する
 - **重複検出の扱い**: 同一タイムスタンプで複数ルールが発火するのは同一イベントへの複数ルールマッチの可能性が高い。タイムラインでは最も重要度の高いルールを代表として採用する
@@ -657,7 +794,8 @@ Step 3.5 の検証で偽陽性（または偽陽性の可能性が高い）と�
   - 上記以外は状況に応じて判断。ページングよりもフィルタ条件の絞り込み（level, rule_title, time_range等）で必要なデータに到達することを優先する
 - **大きなツール出力への対応**: `decode_powershell_commands` や `run_sql` の結果がトークン上限を超えてファイルに保存される場合がある。この場合はTaskツール（バックグラウンドエージェント）にファイルの読み取りと要約を委任し、メインの調査フローを止めない。バックグラウンドエージェントへの指示には「デコード結果の要約」「ホスト・タイムスタンプの抽出」「攻撃目的の分類」を含める
 - **データ不在への対応**: 特定のカテゴリのイベントが検出されないことも重要な情報。「検出なし」は「発生していない」ではなく「検出ルールに合致するものがなかった」ことを意味する。この区別をレポートに反映する
-- **偽陽性の積極的排除（最重要）**: **ルールタイトルだけで攻撃と断定してはならない。必ずDetailsフィールドの実際の内容を確認してから判断する。** "Suspicious Service Path" が正規の印刷サービス、"LOLBAS Renamed" が正規のElastic Winlogbeatのリネーム、"Proc Access" がVeeam Backupの正規動作である場合がある。各ルールの最初の発見時に必ず1-2件のDetailsを確認し、偽陽性かどうかを判定するステップ（Step 3.5）を省略しない
+- **偽陽性の積極的排除（最重要）**: **ルールタイトルだけで攻撃と断定してはならない。必ず詳細フィールド（Details / AllFieldInfo）の実際の内容を確認してから判断する。** "Suspicious Service Path" が正規の印刷サービス、"LOLBAS Renamed" が正規のElastic Winlogbeatのリネーム、"Proc Access" がVeeam Backupの正規動作である場合がある。各ルールの最初の発見時に必ず1-2件の詳細フィールドを確認し、偽陽性かどうかを判定するステップ（Step 3.5）を省略しない
+- **attack判定の過剰適用の抑制**: 逆方向の誤りにも注意する。詳細フィールドに実体的証拠が無く、攻撃チェーンとの時間的相関のみが根拠のイベントは `attack` ではなく `indeterminate` と判定し、セクション9「判断が困難なイベント」に記載する。トリアージの判定とレポート本文の記述を矛盾させない（例: トリアージで attack としたイベントをセクション9で「正規の可能性もある」と書かない）
 - **攻撃者のステージングディレクトリ検索**: 攻撃者は頻繁に `C:\Users\Public\`、`C:\ProgramData\`、`C:\Windows\Temp\<ランダム>\`、`C:\Perflogs\` 等にツールを配置する。Detailsフィールドのプロセスパスにこれらのディレクトリが含まれる場合、`search_all_fields` で同じディレクトリパスを横断検索し、他に配置されたツールを網羅的に発見する
 - **PID/PGUIDによるプロセス相関**: 同一PID/PGUIDが異なるルールで検出されている場合、それは同一プロセスの異なる側面の検出であることを意味する。例えば、あるrundll32.exe（PID X）がQakbot DLLをロードし、同じPID XでRDP接続を行っている場合、DLLにRDP機能が内蔵されていると結論づけられる。レポートのタイムライン・横展開分析でこの相関を反映する
 - **IP→ホスト名マッピング**: IOCや横展開分析で検出された内部IPアドレスは、可能な限り対応するホスト名に解決する。同じIPが別のイベントでComputer名と共に登場していないか確認するか、SrcIP/TgtIPとComputer名の対応関係をSQLで照合する

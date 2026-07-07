@@ -505,7 +505,11 @@ def _validate_select_on_logs_only(sql: str) -> str:
     try:
         plan_nodes = repo.explain_json(normalized_sql)
     except duckdb.Error as exc:
-        raise ValueError("run_sql can only execute SELECT statements that reference the logs table.") from exc
+        # Surface the planner's own message (e.g. Binder Error: column not
+        # found, with its "Did you mean ...?" candidates). Reporting every
+        # planning failure as a table-policy violation sends the analyst off
+        # rewriting a query whose only problem is a typo'd column name.
+        raise ValueError(f"SQL could not be planned: {exc}") from exc
 
     scanned_tables, scanned_functions = _collect_plan_sources(plan_nodes)
 

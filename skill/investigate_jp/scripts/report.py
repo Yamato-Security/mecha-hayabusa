@@ -10,12 +10,19 @@ Input: JSON from stdin:
   "charts": {
     "timeline": "/path/to/timeline.html",
     "mitre_flow": "/path/to/mitre_flow.html"
-  }
+  },
+  "state_dir": "/path/to/investigation/state (optional)",
+  "force": false
 }
 
 - "charts" is optional. When provided, markdown links to chart HTML files
   are replaced with <iframe> embeds.
 - "title" is optional (extracted from first H1 in markdown if omitted).
+- "state_dir" is optional but auto-detected from the output directory when a
+  manifest.json sits there. When set, coverage gates (state.py check) are run
+  first: if any gate FAILs, report generation is refused (exit code 3) unless
+  "force" is true, and a Coverage & Reproducibility appendix generated from the
+  investigation state is added to the end of the report.
 """
 
 import html as html_mod
@@ -55,8 +62,10 @@ def _safe_href(url: str):
         if scheme not in ('http', 'https', 'mailto'):
             return None
     else:
-        # Disallow protocol-relative URLs like "//example.com"
-        if url.startswith('//'):
+        # Disallow protocol-relative URLs like "//example.com". Browsers treat
+        # backslashes as forward slashes, so normalize first to also reject
+        # "\\host", "/\host" etc.
+        if url.replace("\\", "/").startswith('//'):
             return None
     # Escape for inclusion inside an href attribute
     return html_mod.escape(url, quote=True)
@@ -88,6 +97,19 @@ def _inline(text):
     parts.append(_escape(text))
     text = ''.join(parts)
 
+    # Protect <code>...</code> spans from further inline formatting.
+    # The placeholder is delimited by NUL bytes (never present in report text and
+    # not matched by the bold/italic/link regexes) so it survives those passes;
+    # an underscore-based placeholder would be mangled by the __bold__ regex.
+    code_spans = {}
+
+    def _store_code_span(match):
+        key = f"\x00CODESPAN{len(code_spans)}\x00"
+        code_spans[key] = match.group(0)
+        return key
+
+    text = re.sub(r'(?s)<code>.*?</code>', _store_code_span, text)
+
     # bold **text** or __text__
     text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
     text = re.sub(r'__(.+?)__', r'<strong>\1</strong>', text)
@@ -97,6 +119,10 @@ def _inline(text):
     # links [text](url) with scheme validation and href escaping
     link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
     text = link_pattern.sub(_link_replacer, text)
+
+    # Restore original code spans
+    for placeholder, span_html in code_spans.items():
+        text = text.replace(placeholder, span_html)
 
     return text
 
@@ -162,6 +188,7 @@ def md_to_html(md_text, chart_files=None):
     nav_items = []
     title = ''
     section_ids = {}
+    embedded_charts = set()
 
     i = 0
     while i < len(lines):
@@ -216,6 +243,13 @@ def md_to_html(md_text, chart_files=None):
             link_href = chart_match.group(2)
             # check if this matches one of our chart files
             basename = os.path.basename(link_href)
+            if basename in embedded_charts:
+                # Chart already embedded above: render repeat references as a
+                # plain link instead of loading the same (large) chart twice.
+                body_parts.append(f'<p>{_inline(line.strip())}</p>')
+                i += 1
+                continue
+            embedded_charts.add(basename)
             replaced = False
             for key, chart_path in chart_files.items():
                 if basename == os.path.basename(chart_path):
@@ -314,11 +348,111 @@ def render_report(template, *, title, body_html, nav_items_html):
     return html
 
 
+APPENDIX_LANG = "ja"
+
+
+def _run_coverage_gate(state_dir, force):
+    """Run state.py coverage gates; exit unless they PASS (or force). Returns appendix md."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import state as investigation_state
+    except ImportError:
+        if force:
+            print(
+                "warning: state.py not found next to report.py;"
+                " generating the report without the coverage appendix",
+                file=sys.stderr,
+            )
+            return ""
+        print(
+            "state.py not found next to report.py - report generation refused."
+            ' Reinstall/update the skill scripts, or pass "force": true.',
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+    def _unreadable(detail):
+        # A missing/corrupt/wrong-shaped state must not crash report.py: force
+        # generates the report without the appendix, otherwise refuse cleanly.
+        if force:
+            print(
+                f"warning: coverage state unreadable ({detail});"
+                " generating the report without the coverage appendix",
+                file=sys.stderr,
+            )
+            return ""
+        print(
+            f"Coverage state could not be checked ({detail}) - report generation refused."
+            ' Fix the state directory or pass "force": true.',
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+    # Strict re-check: the coverage appendix certifies host/RecordID coverage
+    # against the dataset, so the CSV must be present (a missing CSV fails G0 and
+    # the report is refused unless forced). A present CSV is re-hashed to catch
+    # tampering between Step 7-0 and report time.
+    try:
+        result = investigation_state.run_check(state_dir)
+    except SystemExit as exc:
+        return _unreadable(f"state.py exited {exc.code}")
+    except Exception as exc:
+        return _unreadable(f"{type(exc).__name__}: {exc}")
+
+    if not result["ok"] and not force:
+        print("Coverage gates FAILED - report generation refused.", file=sys.stderr)
+        for g in result["gates"]:
+            if g["status"] == "FAIL":
+                print(f"  [{g['id']}] {g['name']}: {g['detail']}", file=sys.stderr)
+                for gap in g["gaps"][:10]:
+                    print(f"      - {gap}", file=sys.stderr)
+        print(
+            "Resolve the gaps (state.py status / triage / host / cluster ...) "
+            'or pass "force": true to generate anyway.',
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+    # The appendix dereferences manifest fields run_check does not, so guard it
+    # with the same fall-back rather than letting a malformed manifest crash.
+    # _load/_fail inside appendix_markdown raise SystemExit, so catch that too.
+    try:
+        return investigation_state.appendix_markdown(state_dir, lang=APPENDIX_LANG, result=result)
+    except SystemExit as exc:
+        return _unreadable(f"appendix build failed: state.py exited {exc.code}")
+    except Exception as exc:
+        return _unreadable(f"appendix build failed: {type(exc).__name__}: {exc}")
+
+
+def _looks_like_state_manifest(path):
+    """True only if path is a Hayabusa investigation manifest (has our keys),
+    so an unrelated manifest.json in the output directory is not mistaken for
+    investigation state."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and "dataset" in data and "strategy" in data
+
+
+def _parse_force(value):
+    """Interpret the 'force' field strictly: only JSON true or an explicit
+    truthy string forces. In particular the string 'false' must NOT force."""
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
 def main():
     data = json.load(sys.stdin)
     output_path = data["output"]
     given_title = data.get("title", "")
     chart_files = data.get("charts", {})
+    state_dir = data.get("state_dir", "")
+    force = _parse_force(data.get("force", False))
 
     if not output_path.lower().endswith(".html"):
         print(f"Output path must end with .html, got: {output_path}", file=sys.stderr)
@@ -328,7 +462,26 @@ def main():
         print('Input must include "content"', file=sys.stderr)
         sys.exit(1)
 
+    # The report is written inside STATE_DIR (SKILL.md guarantees this), so if
+    # state_dir was omitted but a Hayabusa manifest.json sits next to the output,
+    # use it. This keeps the coverage gate from being silently bypassed by a
+    # forgotten field after context compaction. An unrelated manifest.json is
+    # ignored (schema-checked), so reports written elsewhere are unaffected.
+    if not state_dir:
+        candidate = os.path.dirname(os.path.abspath(output_path))
+        if _looks_like_state_manifest(os.path.join(candidate, "manifest.json")):
+            state_dir = candidate
+            print(
+                f"note: state_dir not provided; found manifest.json in the output "
+                f"directory, enforcing coverage gates against {candidate}",
+                file=sys.stderr,
+            )
+
     md_text = data["content"]
+    if state_dir:
+        appendix_md = _run_coverage_gate(state_dir, force)
+        if appendix_md:
+            md_text = md_text.rstrip() + "\n\n---\n\n" + appendix_md + "\n"
     body_html, nav_items_html, extracted_title = md_to_html(md_text, chart_files)
 
     title = given_title or extracted_title or "Incident Report"

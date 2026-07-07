@@ -177,6 +177,19 @@ class DeterminismTests(unittest.TestCase):
         server._LOG_COLUMNS_CACHE = self.orig_cache
         self.tmp.cleanup()
 
+    def test_run_sql_unknown_column_error_names_the_column(self) -> None:
+        # A binder error (typo'd / non-existent column) must surface DuckDB's
+        # own message, not masquerade as the logs-table policy violation.
+        with self.assertRaises(ValueError) as ctx:
+            server.run_sql(
+                sql='SELECT "NoSuchColumn" FROM logs GROUP BY "NoSuchColumn"',
+                page_size=2,
+                page_offset=0,
+            )
+        message = str(ctx.exception)
+        self.assertIn("NoSuchColumn", message)
+        self.assertNotIn("reference the logs table", message)
+
     def test_run_sql_requires_order_by_for_offset(self) -> None:
         with self.assertRaises(ValueError):
             server.run_sql(sql='SELECT "RuleTitle" FROM logs', page_size=2, page_offset=1)
