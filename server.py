@@ -382,7 +382,19 @@ def _query_with_pagination(
     """
     paging_params: list[object] = list(params or [])
     paging_params.extend([page_size, page_offset])
-    return repo.query_dataframe(paging_sql, paging_params), total_count
+    page_df = repo.query_dataframe(paging_sql, paging_params)
+    # Stamp a page-independent query identity for the G5 pagination audit trail
+    # (state.py log-query): the hash covers the logical SQL and its parameters
+    # but NOT page_size/page_offset, so every page of the same logical query
+    # reports the same query_hash and a fully paginated query can be re-logged
+    # with has_more cleared. _attach_pagination_metadata surfaces it.
+    page_df.attrs["hayabusa_query_meta"] = {
+        "query_hash": _query_hash(
+            normalized_sql + "|" + json.dumps(list(params or []), ensure_ascii=False, default=str)
+        ),
+        "dataset_version": _dataset_version(),
+    }
+    return page_df, total_count
 
 
 def _attach_pagination_metadata(
@@ -403,6 +415,12 @@ def _attach_pagination_metadata(
         has_more = (page_offset + returned_count) < total_count
         next_offset = (page_offset + returned_count) if has_more else None
 
+    # Merge the query identity stamped by _query_with_pagination (df.attrs) with
+    # any caller-provided extra_meta; explicit extra_meta wins (run_sql supplies
+    # its own query_hash, which must keep pairing with query_hash_hint).
+    stamped_meta = getattr(df, "attrs", {}).get("hayabusa_query_meta") or {}
+    merged_meta = {**stamped_meta, **(extra_meta or {})}
+
     if df.empty:
         row: dict[str, object] = {
             "status": status,
@@ -413,8 +431,8 @@ def _attach_pagination_metadata(
             "page_size": page_size,
             "page_offset": page_offset,
         }
-        if extra_meta:
-            row.update(extra_meta)
+        if merged_meta:
+            row.update(merged_meta)
         return pd.DataFrame([row])
 
     out = df.copy()
@@ -425,8 +443,8 @@ def _attach_pagination_metadata(
     out["next_offset"] = next_offset
     out["page_size"] = page_size
     out["page_offset"] = page_offset
-    if extra_meta:
-        for key, value in extra_meta.items():
+    if merged_meta:
+        for key, value in merged_meta.items():
             out[key] = value
     return out
 
@@ -2253,6 +2271,9 @@ def decode_powershell_commands(
     all_df = pd.DataFrame(decoded_rows)
     total = len(all_df)
     paged = all_df.iloc[page_offset : page_offset + page_size].reset_index(drop=True)
+    # The decoded frame is rebuilt from scratch, so carry over the query
+    # identity stamped on the raw query result (G5 audit trail).
+    paged.attrs = dict(raw_df.attrs)
 
     if paged.empty:
         return _WideDisplayDataFrame(_attach_pagination_metadata(

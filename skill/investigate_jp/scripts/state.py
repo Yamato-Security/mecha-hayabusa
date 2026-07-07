@@ -85,9 +85,22 @@ def _parse_ts(value: str):
             return datetime.strptime(value, fmt)
         except ValueError:
             continue
-    # Last resort: ISO-8601 via fromisoformat. Normalize 'Z' and trim
-    # >6 fractional digits (Hayabusa -O emits 7) for Python 3.9 compatibility.
-    normalized = re.sub(r"(\.\d{6})\d+", r"\1", value.replace("Z", "+00:00"))
+    # Last resort: trim >6 fractional digits (Hayabusa -O emits 7; %f accepts at
+    # most 6) and retry the known formats. This must NOT rely on fromisoformat:
+    # before Python 3.11 it rejects the space between seconds and the UTC offset
+    # that Hayabusa emits ('... 00:00:00.0000000 +00:00'), so on 3.9/3.10 the
+    # strptime retry is what actually parses the trimmed value.
+    trimmed = re.sub(r"(\.\d{6})\d+", r"\1", value)
+    if trimmed != value:
+        for fmt in TS_FORMATS:
+            try:
+                return datetime.strptime(trimmed, fmt)
+            except ValueError:
+                continue
+    # Then ISO-8601 via fromisoformat, normalized for pre-3.11: 'Z' -> '+00:00'
+    # and the offset joined onto the time (no space).
+    normalized = trimmed.replace("Z", "+00:00")
+    normalized = re.sub(r"(?<=\d) (?=[+-]\d{2}:\d{2}$)", "", normalized)
     try:
         return datetime.fromisoformat(normalized)
     except ValueError:
@@ -363,9 +376,9 @@ def cmd_init(args) -> None:
     if facts.ts_total > 0 and facts.ts_parsed == 0:
         print(
             "  warning: no Timestamp values could be parsed (unsupported format?) —"
-            " no activity clusters were derived. Check the timestamp format; if a wave is"
-            " known, add it manually with 'state.py cluster --add --start ... --end ...'."
-            " (This is reported as a warning in gate G3, not a hard failure.)"
+            " no activity clusters were derived, so gate G3 will FAIL until the known"
+            " activity window(s) are added manually with"
+            " 'state.py cluster --add --dir <dir> --start ... --end ...'."
         )
     elif unparsed > 0:
         print(
@@ -408,9 +421,13 @@ def cmd_strategy(args) -> None:
             _fail(f"could not re-scan CSV to re-derive clusters: {exc} (no changes written)")
         clusters = _load(args.dir, CLUSTERS)
         manual = [c for c in clusters["clusters"] if c.get("manual")]
+        judged_reset = sum(
+            1 for c in clusters["clusters"]
+            if not c.get("manual") and c.get("verdict") is not None
+        )
         fresh = derive_clusters(facts, new_levels, clusters.get("gap_days", DEFAULT_CLUSTER_GAP_DAYS))
         clusters["clusters"] = fresh + manual
-        rederived_clusters = (clusters, len(fresh), len(manual))
+        rederived_clusters = (clusters, len(fresh), len(manual), judged_reset)
 
     if args.hypothesis is not None:
         strategy["hypothesis"] = args.hypothesis
@@ -423,7 +440,7 @@ def cmd_strategy(args) -> None:
     # the two saves the manifest still shows the OLD levels and a re-run will
     # re-derive (self-healing) rather than leaving stale clusters undetected.
     if rederived_clusters is not None:
-        clusters, n_fresh, n_manual = rederived_clusters
+        clusters, n_fresh, n_manual, n_judged_reset = rederived_clusters
         _save(args.dir, CLUSTERS, clusters)
     _save(args.dir, MANIFEST, manifest)
     if rederived_clusters is not None:
@@ -431,6 +448,13 @@ def cmd_strategy(args) -> None:
         if n_manual:
             msg += f" (kept {n_manual} manual cluster(s))"
         print(msg)
+        if n_judged_reset:
+            print(
+                f"warning: {n_judged_reset} previously judged cluster verdict(s) were reset"
+                " by the level change — re-judge them with 'state.py cluster --id ...'"
+                " (gate G3 fails until every cluster is judged)",
+                file=sys.stderr,
+            )
     print(f"strategy updated: {json.dumps(strategy, ensure_ascii=False)}")
 
 
@@ -455,10 +479,7 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
             _fail(f"verdict for {title!r} must be one of: {', '.join(TRIAGE_VERDICTS)}")
         if not rationale:
             _fail(f"rationale is required for {title!r} (record why, so the report and reviewers can re-evaluate)")
-        record_ids = entry.get("record_ids")
-        if isinstance(record_ids, str):
-            record_ids = _split_arg(record_ids)
-        record_ids = [str(r) for r in (record_ids or [])]
+        record_ids = _normalize_record_ids(entry.get("record_ids"))
         if verdict == "attack" and has_record_id_col and not record_ids:
             _fail(
                 f"record_ids is required for an 'attack' verdict on {title!r}: cite the"
@@ -470,7 +491,8 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
         rule["verdict"] = verdict
         rule["rationale"] = rationale
         rule["evidence"]["record_ids"] = record_ids
-        rule["evidence"]["detail_excerpt"] = (entry.get("excerpt") or "")[:2000]
+        excerpt = entry.get("excerpt")
+        rule["evidence"]["detail_excerpt"] = ("" if excerpt is None else str(excerpt))[:2000]
         rule["verified_at"] = _now()
     _save(state_dir, RULE_TRIAGE, triage)
     pending_all = [rule for rule in triage["rules"] if rule["status"] == "pending"]
@@ -498,17 +520,27 @@ def cmd_triage(args) -> None:
 
 
 def _normalize_record_ids(value) -> list[str]:
-    """Accept a comma string or a list; return a list of string RecordIDs."""
+    """Accept a comma string, a list, or a bare scalar; return string RecordIDs.
+    Batch JSON often carries a single numeric ID ("record_ids": 4624) — treat it
+    as a one-element list rather than crashing on iteration."""
+    if value is None:
+        return []
     if isinstance(value, str):
-        value = _split_arg(value)
-    return [str(item) for item in (value or [])]
+        return [str(item) for item in _split_arg(value)]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
 
 
 def _normalize_hosts(value) -> list[str]:
-    """Accept a comma string or a list; return a list of host names."""
+    """Accept a comma string, a list, or a bare scalar; return host names."""
+    if value is None:
+        return []
     if isinstance(value, str):
         return _split_arg(value)
-    return list(value or [])
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
 
 
 def _resolve_rule_titles(value, known_titles: set[str]) -> list[str]:
@@ -697,6 +729,19 @@ def cmd_cluster(args) -> None:
     if args.add:
         if not args.start or not args.end:
             _fail("cluster --add requires --start and --end (YYYY-MM-DD)")
+        # Manual clusters are the sole remedy for a G3 failure and their windows
+        # are printed in the certified appendix, so reject malformed or reversed
+        # dates instead of letting the gate pass on an unvalidated window.
+        try:
+            start_date = datetime.strptime(args.start, "%Y-%m-%d").date()
+            end_date = datetime.strptime(args.end, "%Y-%m-%d").date()
+        except ValueError:
+            _fail(
+                f"--start/--end must be YYYY-MM-DD dates"
+                f" (got --start {args.start!r} --end {args.end!r})"
+            )
+        if end_date < start_date:
+            _fail(f"--end {args.end} is before --start {args.start}")
         existing = {c["id"] for c in clusters["clusters"]}
         n = 1
         while f"m{n}" in existing:
@@ -704,15 +749,15 @@ def cmd_cluster(args) -> None:
         new_id = f"m{n}"
         clusters["clusters"].append({
             "id": new_id,
-            "start": args.start,
-            "end": args.end,
+            "start": str(start_date),
+            "end": str(end_date),
             "verdict": args.verdict,
             "note": args.note or "",
             "manual": True,
         })
         _save(args.dir, CLUSTERS, clusters)
         verdict_label = args.verdict or "(unjudged)"
-        print(f"added cluster {new_id} ({args.start} ~ {args.end}) -> {verdict_label}")
+        print(f"added cluster {new_id} ({start_date} ~ {end_date}) -> {verdict_label}")
         return
     if not args.id:
         _fail("cluster requires --id (to judge an existing cluster) or --add (to add one)")
@@ -725,7 +770,10 @@ def cmd_cluster(args) -> None:
     if args.verdict not in CLUSTER_VERDICTS:
         _fail(f"verdict must be one of: {', '.join(CLUSTER_VERDICTS)}")
     target["verdict"] = args.verdict
-    target["note"] = args.note or ""
+    # Preserve an existing note when this re-judge omits one (note=None), so
+    # upgrading a verdict does not erase the recorded basis (same rule as hosts).
+    if args.note is not None:
+        target["note"] = args.note
     _save(args.dir, CLUSTERS, clusters)
     print(f"cluster {args.id} ({target['start']} ~ {target['end']}) -> {args.verdict}")
 
@@ -770,8 +818,13 @@ def _load_queries(state_dir: str) -> tuple[list[dict], int]:
                     entries.append(obj)
                 else:
                     corrupt += 1
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        # An existing-but-unreadable audit log must not read as "no queries
+        # logged" — that would let G5 pass vacuously while recorded truncation
+        # gaps silently vanish. Fail loudly like _load does for the JSON files.
+        _fail(f"{QUERIES} could not be read: {exc}")
     return entries, corrupt
 
 
@@ -1241,7 +1294,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start", help="cluster start date YYYY-MM-DD (with --add)")
     p.add_argument("--end", help="cluster end date YYYY-MM-DD (with --add)")
     p.add_argument("--verdict", choices=CLUSTER_VERDICTS)
-    p.add_argument("--note", default="")
+    # default None so omitting --note on a re-judge preserves the existing note
+    p.add_argument("--note", default=None)
     p.set_defaults(func=cmd_cluster)
 
     p = sub.add_parser("log-query", help="append a query audit entry")

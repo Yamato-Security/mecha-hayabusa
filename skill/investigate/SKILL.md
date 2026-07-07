@@ -71,7 +71,7 @@ Based on these results, **form a hypothesis about the nature of the incident** a
 python3 "$STATE_PY" strategy --dir "$STATE_DIR" --hypothesis "[one-line hypothesis]" --interval "[chosen interval]" --levels "high,crit"
 ```
 
-- `--levels` defines which severity levels the coverage gates enforce (e.g., pass `med` too when expanding to med). Changing levels re-derives the activity clusters if none have been judged yet
+- `--levels` defines which severity levels the coverage gates enforce (e.g., pass `med` too when expanding to med). **Changing levels re-derives the auto-derived activity clusters and resets their verdicts to unjudged** (newly in-scope events must not be masked by an old verdict; manually added clusters are kept). The command warns when judged verdicts were reset — re-judge the clusters afterwards, so decide the levels before judging clusters when possible
 
 ### Step 3: Establish Attack Overview (Parallel Execution)
 
@@ -115,10 +115,9 @@ When there are many rule titles (>10), parallelize/optimize using:
 
 After verifying each batch of rules, record the verdicts immediately (do not defer to the end — context may be compacted). Verdict is one of `attack` / `false_positive` / `indeterminate`; `rationale` is mandatory.
 
-**Write the JSON to a file and redirect it in** (inline `echo` breaks on Windows paths in rationale/excerpt with `Invalid \escape` — see the batch-JSON rule above):
+**Write the JSON to a file (e.g. `$STATE_DIR/triage_batch.json`, with the Write tool) and redirect it in** (inline `echo` breaks on Windows paths in rationale/excerpt with `Invalid \escape` — see the batch-JSON rule above). The file must be pure JSON — no comment lines:
 
 ```json
-// e.g. $STATE_DIR/triage_batch.json (create with the Write tool)
 [
  {"rule_title": "[exact title]", "verdict": "attack", "rationale": "[why]", "record_ids": ["123"], "excerpt": "[key detail-field excerpt]"},
  {"rule_title": "[exact title]", "verdict": "false_positive", "rationale": "[why]"}
@@ -169,14 +168,13 @@ Call the following 4 **simultaneously**:
 1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` to get full details of all crit events (replace `Details` with `AllFieldInfo` when `detail_source` is `AllFieldInfo`). Expand to high if no crit events exist
 2. **`mcp__hayabusa__extract_iocs`** — with `level: ["high", "crit"]` to extract IOCs (processes, command lines, IPs, users, hashes, etc.)
 3. **`mcp__hayabusa__correlate_lateral_movement`** — with `time_window_minutes: 60`, `level: ["high", "crit"]` to detect inter-host lateral movement patterns. Empty results for single-host incidents are themselves evidence of no lateral movement
-4. **`mcp__hayabusa__parse_details_field`** — with `level: ["high", "crit"]`, `unique: true` to aggregate accounts involved in the attack. Identifying the attack principal is required for virtually all incidents. **`field_name` depends on detail_source**: on a `Details` profile use `field_name: "User"`; on an **`AllFieldInfo` profile there is no `User` field, so use `field_name: "SubjectUserName"`** (and `"TargetUserName"` as needed) — passing `"User"` on AllFieldInfo returns `no_data`. Calling with an empty `field_name` returns the list of available field names, so query that first when unsure
+4. **`mcp__hayabusa__parse_details_field`** — with `level: ["high", "crit"]`, `unique: true` to aggregate accounts involved in the attack. Identifying the attack principal is required for virtually all incidents. **`field_name` depends on detail_source**: on a `Details` profile use `field_name: "User"` (Hayabusa's abbreviated common field). On an **`AllFieldInfo` profile fields keep their original per-provider event names, so no single field covers all events**: aggregate `"SubjectUserName"` / `"TargetUserName"` (Security-log events) **and** `"User"` / `"ParentUser"` (Sysmon events). Calling with an empty `field_name` returns the list of available field names, so query that first to see which are present
 
 **Record results in state as they are confirmed**:
 
-- Attack activity confirmed from crit/high events → `state.py finding --batch`. `title` and `summary` are **required**, and so are **`record_ids`** (RecordIDs of the supporting events, at least one — rejected at entry time and enforced by gate G7 when the dataset has a RecordID column); include related `rules`, `hosts`, and the `query` used, so every report claim is traceable to data. Every rule cited in `rules` needs a triage verdict regardless of level (gate G8; citing an untriaged rule prints a warning). **Write the JSON to a file and redirect it in** (inline `echo` breaks on Windows paths):
+- Attack activity confirmed from crit/high events → `state.py finding --batch`. `title` and `summary` are **required**, and so are **`record_ids`** (RecordIDs of the supporting events, at least one — rejected at entry time and enforced by gate G7 when the dataset has a RecordID column); include related `rules`, `hosts`, and the `query` used, so every report claim is traceable to data. Every rule cited in `rules` needs a triage verdict regardless of level (gate G8; citing an untriaged rule prints a warning). **Write the JSON to a file (e.g. `$STATE_DIR/finding_batch.json`) and redirect it in** (inline `echo` breaks on Windows paths):
 
 ```json
-// e.g. $STATE_DIR/finding_batch.json
 [
  {"title": "[short finding title]", "summary": "[what happened]", "phase": "Execution",
   "hosts": ["HOST-A"], "rules": ["[exact rule title]"], "record_ids": ["123"],
@@ -188,10 +186,9 @@ Call the following 4 **simultaneously**:
 python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
 ```
 
-- Extracted IOCs → `state.py ioc --batch`. `type` and `value` are **required**; `hosts`, `context`, `record_ids` optional (types: process / cmdline / filepath / ip / user / hash / service / other). Likewise pass via a file:
+- Extracted IOCs → `state.py ioc --batch`. `type` and `value` are **required**; `hosts`, `context`, `record_ids` optional (types: process / cmdline / filepath / ip / user / hash / service / other). Likewise pass via a file (e.g. `$STATE_DIR/ioc_batch.json`):
 
 ```json
-// e.g. $STATE_DIR/ioc_batch.json
 [
  {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[role in the attack]", "record_ids": ["123"]}
 ]
@@ -207,7 +204,7 @@ python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/ioc_batch.json"
 python3 "$STATE_PY" log-query --dir "$STATE_DIR" --tool extract_iocs --query-hash "[query_hash from the tool result]" --has-more
 ```
 
-  - **Pass `--query-hash [hash]`** (the `query_hash` from the tool result). To clear it after fully paginating, log the **same** `--query-hash` again without `--has-more`. Resolution is matched by query_hash, so the hash is what lets a follow-up clear the gap.
+  - **Pass `--query-hash [hash]`** (the `query_hash` column in the tool result — every dataset-query tool attaches one, and it is stable across pages of the same logical query). To clear it after fully paginating, log the **same** `--query-hash` again without `--has-more`. Resolution is matched by query_hash, so the hash is what lets a follow-up clear the gap.
   - To record a **justified cap** (result confirmed benign/noise, etc.) instead, log `--has-more --accept-truncation --note "[reason]"` in one entry.
   - A `--has-more` entry logged **without** a `--query-hash` can only be resolved by its own `--accept-truncation` (there is no hash to correlate a follow-up), so always pass the hash when you intend to paginate later.
 
@@ -416,7 +413,7 @@ python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
 - **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack-verdict rules not referenced by any finding, G5 unresolved pagination, G6 cited RecordIDs absent from the dataset, G7 attack-verdict rules/findings citing no RecordIDs, G8 finding-cited rules without a triage verdict. Go back to the corresponding step, close the gaps, and re-run
-- **G3 timestamp warning**: if the G3 detail warns that some rows have unparseable Timestamps, they were excluded from the auto-derived clusters (this is a visible warning, not a failure). If you know a distinct activity wave was missed, add it manually and judge it: `python3 "$STATE_PY" cluster --add --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
+- **G3 timestamp warning**: if the G3 detail warns that some rows have unparseable Timestamps, they were excluded from the auto-derived clusters (this is a visible warning, not a failure; when NO timestamps parsed at all, G3 hard-fails until windows are added). If you know a distinct activity wave was missed, add it manually and judge it: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - Report generation also re-runs this gate: `report.py` auto-detects `$STATE_DIR` from the output directory (where `manifest.json` sits) even if you forget to pass `state_dir`, so the gate cannot be silently skipped
 - Only if the user explicitly accepts an incomplete investigation may you proceed with `"force": true` in Step 7-1 (the unresolved gaps are then printed in the report appendix)
 
@@ -440,10 +437,10 @@ File naming convention:
 
 First, assemble the full report body as a string. Do not save it as a `.md` file at any point.
 
-Then execute the following via Bash tool to convert the report body directly to HTML and save it:
+Then **write the JSON input to a file with the Write tool** (e.g. `$STATE_DIR/report_input.json`) and execute the following via Bash tool to convert the report body directly to HTML and save it. Do NOT pipe the JSON through an inline `echo`: the report content routinely embeds Windows paths (`C:\Users\...`), which become invalid JSON escapes exactly as described in the batch-JSON rule above:
 
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/report.py"
+python3 "$HOME/.claude/skills/investigate/scripts/report.py" < "$STATE_DIR/report_input.json"
 ```
 
 JSON input structure:

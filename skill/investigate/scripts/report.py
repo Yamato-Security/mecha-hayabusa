@@ -31,7 +31,6 @@ import os
 import re
 import sys
 from pathlib import Path
-import urllib.parse
 
 TEMPLATE_PATH = Path(__file__).with_name("report.html")
 
@@ -46,25 +45,37 @@ def _escape(text):
 
 
 def _sanitize_href(url):
-    """
-    Sanitize a URL for use in an href attribute.
+    """Return a safely escaped href value or None if the URL is not allowed.
 
-    Allows only relative URLs (no scheme) and a small set of safe schemes.
-    Returns a safe fallback ("#") for anything else.
-    """
-    parsed = urllib.parse.urlparse(url)
-    scheme = (parsed.scheme or "").lower()
-    allowed_schemes = {"", "http", "https", "mailto"}
-    # Browsers treat backslashes as forward slashes, so normalize before the
-    # protocol-relative check: "\\host", "/\host" etc. would otherwise slip past
-    # a literal "//" test yet still navigate off-site.
-    normalized = url.strip().replace("\\", "/")
-    if scheme not in allowed_schemes or (scheme == "" and normalized.startswith("//")):
-        safe_url = "#"
+    The scheme is detected with a regex on the stripped URL rather than
+    urllib.parse.urlparse: pre-gh-102153 Pythons (e.g. 3.9.x) let a leading
+    space/control character hide the scheme (" javascript:..." parses as
+    scheme=""), which browsers would still execute. Control characters are
+    rejected outright because browsers strip tab/newline inside URLs, turning
+    e.g. "/\\t/host" into a protocol-relative "//host"."""
+    if url is None:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    # Disallow control characters in URLs
+    if any(ord(ch) < 32 for ch in url):
+        return None
+    # Detect an explicit scheme, e.g. "http:" or "javascript:"
+    m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*):', url)
+    if m:
+        scheme = m.group(1).lower()
+        # Allow only a small set of safe schemes
+        if scheme not in ('http', 'https', 'mailto'):
+            return None
     else:
-        safe_url = url
-    # Escape for safe use inside an href attribute (quotes included).
-    return html_mod.escape(safe_url, quote=True)
+        # Disallow protocol-relative URLs like "//example.com". Browsers treat
+        # backslashes as forward slashes, so normalize first to also reject
+        # "\\host", "/\host" etc.
+        if url.replace("\\", "/").startswith('//'):
+            return None
+    # Escape for inclusion inside an href attribute
+    return html_mod.escape(url, quote=True)
 
 
 def _link_replacer(match):
@@ -72,6 +83,9 @@ def _link_replacer(match):
     link_text = match.group(1)
     raw_url = match.group(2)
     safe_href = _sanitize_href(raw_url)
+    if not safe_href:
+        # If URL is unsafe, render just the label (already escaped) without a link.
+        return link_text
     # link_text has already been through _escape and any formatting regexes will
     # operate on this string, so we can insert it as-is.
     return f'<a href="{safe_href}">{link_text}</a>'
@@ -238,31 +252,30 @@ def md_to_html(md_text, chart_files=None):
             link_href = chart_match.group(2)
             # check if this matches one of our chart files
             basename = os.path.basename(link_href)
-            if basename in embedded_charts:
+            src = link_href
+            extra_cls = ''
+            for key, chart_path in chart_files.items():
+                if basename == os.path.basename(chart_path):
+                    src = os.path.basename(chart_path)
+                    if key == 'mitre_flow':
+                        extra_cls = ' chart-wide'
+                    break
+            # Dedupe on the resolved iframe src, not the basename: two distinct
+            # files may share a basename (hosts/a/timeline.html vs
+            # hosts/b/timeline.html) and both must be embedded.
+            if src in embedded_charts:
                 # Chart already embedded above: render repeat references as a
                 # plain link instead of loading the same (large) chart twice.
                 body_parts.append(f'<p>{_inline(line.strip())}</p>')
                 i += 1
                 continue
-            embedded_charts.add(basename)
-            replaced = False
-            for key, chart_path in chart_files.items():
-                if basename == os.path.basename(chart_path):
-                    rel = os.path.basename(chart_path)
-                    extra_cls = ' chart-wide' if key == 'mitre_flow' else ''
-                    body_parts.append(
-                        f'<div class="chart-container{extra_cls}">'
-                        f'<span class="chart-label">{_escape(link_text)}</span>'
-                        f'<iframe src="{_escape(rel)}" loading="lazy"></iframe>'
-                        f'</div>'
-                    )
-                    replaced = True
-                    break
-            if not replaced:
-                body_parts.append(f'<div class="chart-container">'
-                                  f'<span class="chart-label">{_escape(link_text)}</span>'
-                                  f'<iframe src="{_escape(link_href)}" loading="lazy"></iframe>'
-                                  f'</div>')
+            embedded_charts.add(src)
+            body_parts.append(
+                f'<div class="chart-container{extra_cls}">'
+                f'<span class="chart-label">{_escape(link_text)}</span>'
+                f'<iframe src="{_escape(src)}" loading="lazy"></iframe>'
+                f'</div>'
+            )
             i += 1
             continue
 
@@ -420,15 +433,27 @@ def _run_coverage_gate(state_dir, force):
 
 
 def _looks_like_state_manifest(path):
-    """True only if path is a Hayabusa investigation manifest (has our keys),
-    so an unrelated manifest.json in the output directory is not mistaken for
-    investigation state."""
+    """True only if path is a state.py investigation manifest, so an unrelated
+    manifest.json in the output directory is not mistaken for investigation
+    state. Match the exact nested fields run_check dereferences: a generic
+    manifest whose top-level "dataset"/"strategy" are strings or differently
+    shaped dicts (common in ML/build outputs) must not turn the gate on."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return False
-    return isinstance(data, dict) and "dataset" in data and "strategy" in data
+    if not isinstance(data, dict):
+        return False
+    dataset = data.get("dataset")
+    strategy = data.get("strategy")
+    return (
+        isinstance(dataset, dict)
+        and "path" in dataset
+        and "sha256" in dataset
+        and isinstance(strategy, dict)
+        and "levels_investigated" in strategy
+    )
 
 
 def _parse_force(value):
@@ -442,7 +467,18 @@ def _parse_force(value):
 
 
 def main():
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        # Same failure mode state.py guards against: JSON built via a
+        # single-quoted echo with Windows paths (C:\Users\...) in the content.
+        print(
+            f"error: stdin must be a JSON object: {exc}"
+            " — write the JSON to a file with the Write tool and redirect it in"
+            " (report.py < input.json); inline echo breaks on Windows paths.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     output_path = data["output"]
     given_title = data.get("title", "")
     chart_files = data.get("charts", {})

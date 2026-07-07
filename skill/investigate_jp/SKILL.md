@@ -71,7 +71,7 @@ python3 "$STATE_PY" init --csv "[CSVパス]" --dir "$STATE_DIR" --model "[モデ
 python3 "$STATE_PY" strategy --dir "$STATE_DIR" --hypothesis "[仮説を一行で]" --interval "[選択したinterval]" --levels "high,crit"
 ```
 
-- `--levels` はカバレッジゲートが強制する重要度レベルを定義する（medに拡大する場合は `med` も含める）。クラスタが未判定のうちにレベルを変更すると活動クラスタが再導出される
+- `--levels` はカバレッジゲートが強制する重要度レベルを定義する（medに拡大する場合は `med` も含める）。**レベルを変更すると自動導出の活動クラスタが再導出され、その判定は未判定にリセットされる**（新たにスコープ入りしたイベントを古い判定で覆い隠さないため。手動追加クラスタは維持される）。判定済みの評決がリセットされた場合はコマンドが警告を出すので、その後に再判定すること。可能ならクラスタ判定の前にレベルを確定させる
 
 ### Step 3: 攻撃の全体像把握（並列実行）
 
@@ -115,10 +115,9 @@ ORDER BY Timestamp LIMIT 2
 
 ルールをひとまとまり検証するごとに、判定を即座に記録する（最後にまとめて記録しない — コンテキストが圧縮される可能性がある）。verdict は `attack` / `false_positive` / `indeterminate` の3値、`rationale`（判定根拠）は必須。
 
-**JSONはWriteツールでファイルに書き、リダイレクトで渡す**（rationale/excerptにWindowsパスが入るとインライン `echo` は `Invalid \escape` で失敗するため。前述の「一括登録のJSON」ルール参照）:
+**JSONはWriteツールでファイル（例: `$STATE_DIR/triage_batch.json`）に書き、リダイレクトで渡す**（rationale/excerptにWindowsパスが入るとインライン `echo` は `Invalid \escape` で失敗するため。前述の「一括登録のJSON」ルール参照）。ファイルは純粋なJSONにすること — コメント行は書けない:
 
 ```json
-// 例: $STATE_DIR/triage_batch.json （Writeツールで作成）
 [
  {"rule_title": "[正確なタイトル]", "verdict": "attack", "rationale": "[根拠]", "record_ids": ["123"], "excerpt": "[詳細フィールドの要点]"},
  {"rule_title": "[正確なタイトル]", "verdict": "false_positive", "rationale": "[根拠]"}
@@ -169,16 +168,15 @@ Detailsの確認中に、以下の攻撃インフラパターンを発見した�
 1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` でcritイベントの全詳細を取得する（`detail_source` が `AllFieldInfo` の場合は `Details` → `AllFieldInfo`）。critが存在しない場合はhighに拡大する
 2. **`mcp__hayabusa__extract_iocs`** — `level: ["high", "crit"]` でIOC（プロセス、コマンドライン、IP、ユーザー、ハッシュ等）を抽出する
 3. **`mcp__hayabusa__correlate_lateral_movement`** — `time_window_minutes: 60`, `level: ["high", "crit"]` でホスト間の横展開パターンを検出する。単一ホストのインシデントでは結果が空になる場合があるが、それ自体が横展開なしの証拠となる
-4. **`mcp__hayabusa__parse_details_field`** — `level: ["high", "crit"]`, `unique: true` で攻撃に関与したアカウントを集計する。攻撃主体の特定はほぼ全てのインシデントで必要なため、常に実行する。**`field_name` は detail_source に依存する**: `Details` プロファイルでは `field_name: "User"`、**`AllFieldInfo` プロファイルでは `User` フィールドは存在しないため `field_name: "SubjectUserName"`（および必要に応じ `"TargetUserName"`）を指定する**（`AllFieldInfo` で `"User"` を渡すと `no_data` になる）。`field_name` を空で呼ぶと利用可能なフィールド名一覧が返るため、不明な場合はまず空で呼んで確認する
+4. **`mcp__hayabusa__parse_details_field`** — `level: ["high", "crit"]`, `unique: true` で攻撃に関与したアカウントを集計する。攻撃主体の特定はほぼ全てのインシデントで必要なため、常に実行する。**`field_name` は detail_source に依存する**: `Details` プロファイルでは `field_name: "User"`（Hayabusaの短縮共通フィールド）。**`AllFieldInfo` プロファイルではフィールド名がプロバイダごとの元のイベントフィールド名のままなので、単一のフィールド名では全イベントを網羅できない**: `"SubjectUserName"` / `"TargetUserName"`（Securityログのイベント）**と** `"User"` / `"ParentUser"`（Sysmonのイベント）の両方を集計する。`field_name` を空で呼ぶと利用可能なフィールド名一覧が返るため、まず空で呼んでどれが存在するか確認する
 
 **確定した結果はその場でステートに記録する**:
 
 - crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`record_ids` も必須**（裏付けイベントのRecordID、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。`rules` に引用したルールは重要度に関わらずトリアージ判定が必要（ゲート G8。未判定のまま引用すると警告が出る）:
 
-JSONはWriteツールでファイルに書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
+JSONはWriteツールでファイル（例: `$STATE_DIR/finding_batch.json`）に書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
 
 ```json
-// 例: $STATE_DIR/finding_batch.json
 [
  {"title": "[findingの短いタイトル]", "summary": "[何が起きたか]", "phase": "Execution",
   "hosts": ["HOST-A"], "rules": ["[正確なルールタイトル]"], "record_ids": ["123"],
@@ -190,10 +188,9 @@ JSONはWriteツールでファイルに書き、リダイレクトで渡す（Wi
 python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
 ```
 
-- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `record_ids` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル経由で渡す:
+- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `record_ids` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル（例: `$STATE_DIR/ioc_batch.json`）経由で渡す:
 
 ```json
-// 例: $STATE_DIR/ioc_batch.json
 [
  {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[攻撃における役割]", "record_ids": ["123"]}
 ]
@@ -209,7 +206,7 @@ python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/ioc_batch.json"
 python3 "$STATE_PY" log-query --dir "$STATE_DIR" --tool extract_iocs --query-hash "[ツール結果のquery_hash]" --has-more
 ```
 
-  - **`--query-hash [hash]` を必ず渡す**（ツール結果の `query_hash`）。全ページ取得後に解決するには、**同じ** `--query-hash` を `--has-more` なしで再記録する。解決は query_hash で突き合わせるため、後続で解消できるのはハッシュを付けた場合のみ。
+  - **`--query-hash [hash]` を必ず渡す**（ツール結果の `query_hash` カラム — データセットを検索する全ツールが付与し、同一クエリの全ページで同じ値になる）。全ページ取得後に解決するには、**同じ** `--query-hash` を `--has-more` なしで再記録する。解決は query_hash で突き合わせるため、後続で解消できるのはハッシュを付けた場合のみ。
   - 正当な打ち切り（結果が無害・ノイズと確認済み等）として記録する場合は、1エントリで `--has-more --accept-truncation --note "[理由]"` を記録する。
   - `--query-hash` なしの `--has-more` エントリは、突き合わせるハッシュが無いため後続では解消できず、その同じエントリの `--accept-truncation` でしか解決できない。後でページネーションする意図があるなら必ずハッシュを渡すこと。
 
@@ -418,7 +415,7 @@ python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
 - **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack判定ルール、G5 未解決のページネーション、G6 データセットに存在しない引用RecordID、G7 RecordIDを1件も引用していないattack判定ルール/finding、G8 findingが引用しているのにトリアージ未判定のルール。該当ステップに戻ってギャップを解消し、再実行する
-- **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
+- **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告。ただし**1件もパースできなかった場合はウィンドウを手動追加するまでG3はハードFAIL**になる）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - レポート生成時もこのゲートが再実行される: `report.py` は `state_dir` を渡し忘れても出力ディレクトリ（`manifest.json` がある場所）から `$STATE_DIR` を自動検出するため、ゲートを暗黙にスキップできない
 - 不完全な調査のままの生成をユーザーが明示的に了承した場合に限り、Step 7-1 で `"force": true` を指定して先へ進んでよい（未解決ギャップはレポート付録に明記される）
 
@@ -442,10 +439,10 @@ python3 "$STATE_PY" check --dir "$STATE_DIR"
 
 まずレポート本文を文字列として組み立てる。途中で `.md` ファイルとして保存してはいけない。
 
-次に Bashツールで以下を実行し、レポート本文を直接HTMLに変換して保存する:
+次に **JSON入力をWriteツールでファイル（例: `$STATE_DIR/report_input.json`）に書き**、Bashツールで以下を実行してレポート本文を直接HTMLに変換して保存する。インライン `echo` でJSONを渡してはいけない: レポート本文にはWindowsパス（`C:\Users\...`）が頻繁に含まれ、前述の「一括登録のJSON」ルールと同じ `Invalid \escape` 失敗になる:
 
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate_jp/scripts/report.py"
+python3 "$HOME/.claude/skills/investigate_jp/scripts/report.py" < "$STATE_DIR/report_input.json"
 ```
 
 JSON入力の構造:
