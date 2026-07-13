@@ -87,6 +87,10 @@ class ReportGateTests(unittest.TestCase):
         result = run_cli(STATE_PY, "cluster", "--dir", str(self.state_dir),
                          "--id", "c1", "--verdict", "attack", "--note", "single wave")
         self.assertEqual(result.returncode, 0, result.stderr)
+        result = run_cli(STATE_PY, "verify", "--dir", str(self.state_dir),
+                         "--target-type", "finding", "--target", "f1",
+                         "--verdict", "attack", "--note", "independently confirmed via refs")
+        self.assertEqual(result.returncode, 0, result.stderr)
         result = run_cli(STATE_PY, "check", "--dir", str(self.state_dir))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

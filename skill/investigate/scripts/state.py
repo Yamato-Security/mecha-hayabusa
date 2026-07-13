@@ -17,6 +17,7 @@ State directory layout:
   hosts.json        per-host investigation coverage
   environment.json  known-good products/accounts with provenance
   queries.jsonl     audit log of executed queries (query_hash, has_more)
+  verification_votes.jsonl  independent fresh-context verification votes
 
 Evidence refs:
   Windows EventRecordIDs are NOT globally unique — the same RecordID can
@@ -34,6 +35,7 @@ Commands (all stdlib, no external dependencies):
   host      record host investigation coverage (or --batch from stdin)
   cluster   record a verdict for an activity cluster
   env       record environment facts with provenance (or --none / --list)
+  verify    record an independent verification vote for a finding/rule verdict
   log-query append a query audit entry (tracks unresolved has_more)
   status    human-readable progress summary (for resuming)
   check     run coverage gates; exit 0 = PASS, 1 = FAIL
@@ -99,8 +101,11 @@ IOCS = "iocs.json"
 HOSTS = "hosts.json"
 QUERIES = "queries.jsonl"
 ENVIRONMENT = "environment.json"
+VOTES = "verification_votes.jsonl"
 
 ENV_STATUSES = ("operator_confirmed", "observed", "inferred")
+VOTE_TARGET_TYPES = ("rule", "finding")
+VOTE_VERDICTS = ("attack", "false_positive", "mixed", "indeterminate", "cannot_verify")
 
 TS_FORMATS = (
     "%Y-%m-%d %H:%M:%S.%f %z",
@@ -476,8 +481,10 @@ def cmd_init(args) -> None:
     _save(state_dir, HOSTS, {"hosts": []})
     _save(state_dir, ENVIRONMENT, {"entries": [], "declared_no_info": False})
     # Truncate: a re-init after an interrupted run must not inherit stale
-    # query-log entries (they would resurface as phantom G5 failures).
+    # query-log or vote entries (they would resurface as phantom G5 failures
+    # or as votes for verdicts that no longer exist).
     open(_path(state_dir, QUERIES), "w", encoding="utf-8").close()
+    open(_path(state_dir, VOTES), "w", encoding="utf-8").close()
     _save(state_dir, MANIFEST, manifest)
 
     gate_rules = [r for r in rules if set(r["levels"]) & set(levels)]
@@ -1148,6 +1155,115 @@ def cmd_env(args) -> None:
     print(f"recorded environment entry ({status}): {args.value.strip()}")
 
 
+def cmd_verify(args) -> None:
+    """Record an independent verification vote. The vote should come from a
+    FRESH-CONTEXT verifier (subagent) that examined the evidence itself via
+    the read-only MCP tools, given a neutral packet (target + refs, but NOT
+    the investigator's rationale/story). state.py cannot prove the context
+    isolation — the vote is a procedural record checked by gate G11."""
+    _require_initialized(args.dir)
+    target_type = (args.target_type or "").strip()
+    if target_type not in VOTE_TARGET_TYPES:
+        _fail(f"--target-type must be one of: {', '.join(VOTE_TARGET_TYPES)}")
+    target = (args.target or "").strip()
+    if not target:
+        _fail("--target is required (rule title, or finding id like f1)")
+    verdict = (args.verdict or "").strip()
+    if verdict not in VOTE_VERDICTS:
+        _fail(f"--verdict must be one of: {', '.join(VOTE_VERDICTS)}")
+    if target_type == "rule":
+        triage = _load(args.dir, RULE_TRIAGE)
+        if target not in {r["rule_title"] for r in triage["rules"]}:
+            _fail(f"unknown rule_title: {target!r} (copy it exactly from rule_triage.json)")
+    else:
+        findings = _load(args.dir, FINDINGS)
+        if target not in {f["id"] for f in findings["findings"]}:
+            known = ", ".join(f["id"] for f in findings["findings"]) or "(none)"
+            _fail(f"unknown finding id: {target!r}. Known findings: {known}")
+    entry = {
+        "ts": _now(),
+        "target_type": target_type,
+        "target": target,
+        "verdict": verdict,
+        "verifier": (args.verifier or "fresh-context-subagent").strip(),
+        "note": (args.note or "").strip(),
+    }
+    with open(_path(args.dir, VOTES), "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"vote recorded: {target_type} {target} -> {verdict}")
+
+
+def _load_votes(state_dir: str) -> tuple[list[dict], int]:
+    """Return (parsed vote entries, count of corrupt lines skipped)."""
+    entries: list[dict] = []
+    corrupt = 0
+    try:
+        with open(_path(state_dir, VOTES), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    corrupt += 1
+                    continue
+                if isinstance(obj, dict):
+                    entries.append(obj)
+                else:
+                    corrupt += 1
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _fail(f"{VOTES} could not be read: {exc}")
+    return entries, corrupt
+
+
+def _vote_consensus(votes: list[dict], expected_kind: str) -> tuple[bool, str]:
+    """
+    Aggregate independent verification votes for one target.
+
+    expected_kind: "attack" (a finding's claim), "false_positive" or "mixed"
+    (a rule's recorded verdict). Asymmetric policy: cannot_verify never counts
+    as agreement; a lone attack vote always blocks a false_positive verdict
+    (missed attacks cost more than extra review); a genuine conflict needs a
+    strict majority over >= 3 counted votes, except against false_positive
+    where re-triage is the only way out.
+    """
+    if not votes:
+        return False, "no verification vote"
+    counted = [v for v in votes if v.get("verdict") in ("attack", "false_positive", "mixed", "indeterminate")]
+    if not counted:
+        return False, "only cannot_verify votes (cannot_verify confirms nothing)"
+    attack = sum(1 for v in counted if v["verdict"] in ("attack", "mixed"))
+    fp = sum(1 for v in counted if v["verdict"] == "false_positive")
+    ind = sum(1 for v in counted if v["verdict"] == "indeterminate")
+    summary = f"attack/mixed {attack} : false_positive {fp} : indeterminate {ind}"
+    if expected_kind == "false_positive":
+        if attack:
+            return False, (
+                f"{attack} independent vote(s) see attack activity ({summary}) — a"
+                " false_positive verdict cannot stand against an attack vote;"
+                " re-triage the rule (mixed/attack/indeterminate)"
+            )
+        if fp:
+            return True, ""
+        return False, f"no false_positive-confirming vote ({summary})"
+    # expected_kind in ("attack", "mixed"): the attack part must be confirmed.
+    if attack and not fp:
+        return True, ""
+    if attack and fp:
+        if len(counted) >= 3 and attack > (fp + ind):
+            return True, ""
+        return False, (
+            f"conflicting votes ({summary}) — escalate to 3+ votes (strict majority"
+            " required) or revisit the verdict"
+        )
+    if fp:
+        return False, f"refuted by independent vote(s) ({summary}) — revisit the verdict"
+    return False, f"no attack-confirming vote ({summary})"
+
+
 def cmd_log_query(args) -> None:
     _require_initialized(args.dir)
     entry = {
@@ -1627,6 +1743,33 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         g10_detail = "structural checks only (dataset unavailable)"
     gate("G10", "variant coverage for high-volume verdicts", not g10_gaps, g10_detail, g10_gaps[:50])
 
+    # G11: every report-bound claim carries an independent fresh-context
+    # verification vote that agrees with it: all findings (attack claims), and
+    # false_positive/mixed verdicts over high-volume rules (mass exclusions).
+    # The vote is procedural — state.py cannot prove the verifier ran in an
+    # isolated context — but a missing or contradicting vote is caught here.
+    votes, corrupt_votes = _load_votes(state_dir)
+    votes_by_target: dict[tuple, list] = {}
+    for v in votes:
+        votes_by_target.setdefault((v.get("target_type"), v.get("target")), []).append(v)
+    g11_gaps: list[str] = []
+    g11_required = 0
+    for finding in findings["findings"]:
+        g11_required += 1
+        ok, msg = _vote_consensus(votes_by_target.get(("finding", finding["id"]), []), "attack")
+        if not ok:
+            g11_gaps.append(f"finding {finding['id']} ({finding['title']}): {msg}")
+    for r in triage["rules"]:
+        if r["verdict"] in ("false_positive", "mixed") and r["count"] > VARIANT_EVIDENCE_THRESHOLD:
+            g11_required += 1
+            ok, msg = _vote_consensus(votes_by_target.get(("rule", r["rule_title"]), []), r["verdict"])
+            if not ok:
+                g11_gaps.append(f"rule {r['rule_title']} ({r['verdict']}, {r['count']} events): {msg}")
+    g11_detail = f"{g11_required - len(g11_gaps)}/{g11_required} report-bound verdicts independently verified"
+    if corrupt_votes:
+        g11_detail += f" (warning: {corrupt_votes} unparseable line(s) in {VOTES} ignored)"
+    gate("G11", "independent verification votes", not g11_gaps, g11_detail, g11_gaps)
+
     return {
         "ok": all(g["status"] == "PASS" for g in gates),
         "checked_at": _now(),
@@ -1844,7 +1987,8 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
     lines += [
         "",
         f"- **{labels['state_files']}**: `manifest.json`, `rule_triage.json`, `clusters.json`, "
-        "`findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `queries.jsonl`",
+        "`findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `queries.jsonl`, "
+        "`verification_votes.jsonl`",
     ]
     return "\n".join(lines)
 
@@ -1945,6 +2089,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--none", action="store_true", help="declare that no environment information is available")
     p.add_argument("--list", action="store_true", help="print recorded entries")
     p.set_defaults(func=cmd_env)
+
+    p = sub.add_parser("verify", help="record an independent verification vote")
+    p.add_argument("--dir", required=True)
+    p.add_argument("--target-type", default="", help="rule | finding")
+    p.add_argument("--target", default="", help="exact rule title, or finding id (f1, f2, ...)")
+    p.add_argument("--verdict", default="",
+                   help="the verifier's OWN conclusion: attack | false_positive | mixed"
+                        " | indeterminate | cannot_verify")
+    p.add_argument("--verifier", default="fresh-context-subagent",
+                   help="who verified (default: fresh-context-subagent)")
+    p.add_argument("--note", default="", help="verifier's key reasoning (summary)")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("log-query", help="append a query audit entry")
     p.add_argument("--dir", required=True)
