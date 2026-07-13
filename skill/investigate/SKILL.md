@@ -36,9 +36,10 @@ STATE_PY="$HOME/.claude/skills/investigate/scripts/state.py"
 Rules:
 
 - **All state.py invocations use the Bash tool** with absolute paths (same restriction as chart scripts)
-- The state directory `STATE_DIR` is the report output directory created in Step 1. All state files (`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `queries.jsonl`) live there alongside the charts and report
+- The state directory `STATE_DIR` is the report output directory created in Step 1. All state files (`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `queries.jsonl`, `verification_votes.jsonl`) live there alongside the charts and report
 - **Record state as you go** at each step (commands are described inline in the steps below). Batch entry is supported: pipe a JSON array to `state.py triage --batch` / `finding --batch` / `ioc --batch` / `host --batch` via stdin
-- **★ Always pass batch JSON via a file, not inline `echo` (important)**: rationale and excerpt fields routinely contain Windows paths (`C:\Users\...`, `\Device\...`, `C:\$SNAP_...`). Piping these through a single-quoted `echo '[...]'` makes `\U` `\D` `\$` etc. **invalid JSON escapes**, so `state.py` fails with `Invalid \escape` every time. The canonical procedure is to **write the JSON to a file with the Write tool and redirect it in with `--batch < /path/to/batch.json`**. Avoid inline `echo`. If you must inline, double every backslash (`\\`) or use forward slashes in the path (forward slashes still read fine as prose)
+- **★ Always pass batch JSON via a file, not inline `echo` (important)**: rationale and excerpt fields routinely contain Windows paths (`C:\Users\...`, `\Device\...`, `C:\$SNAP_...`). Piping these through a single-quoted `echo '[...]'` makes `\U` `\D` `\$` etc. **invalid JSON escapes**, so `state.py` fails with `Invalid \escape` every time. The canonical procedure is to **write the JSON to a file under `$STATE_DIR/work/` with the Write tool and redirect it in with `--batch < "$STATE_DIR/work/batch.json"`**. Avoid inline `echo`. If you must inline, double every backslash (`\\`) or use forward slashes in the path (forward slashes still read fine as prose)
+- **Working files live in `$STATE_DIR/work/`**: temporary files — batch JSON, chart input JSON, the report-body draft, `report_input.json` — go into the `$STATE_DIR/work/` subdirectory that `init` creates, so they do not mingle with the canonical state files (`manifest.json`, ...) or the final deliverables
 - **Resume**: if the target CSV already has a state directory from a previous session (a `manifest.json` inside a `[CSV name]_[timestamp]` directory), run `python3 "$STATE_PY" status --dir <dir>` and continue from the pending items instead of starting over. Confirm with the user before resuming
 - **Report gate**: Step 7 requires `state.py check` to PASS (all coverage gates green). `report.py` refuses to generate the report otherwise
 
@@ -133,7 +134,7 @@ When there are many rule titles (>10), parallelize/optimize using:
 
 After verifying each batch of rules, record the verdicts immediately (do not defer to the end — context may be compacted). Verdict is one of `attack` / `false_positive` / `indeterminate`; `rationale` is mandatory.
 
-**Write the JSON to a file (e.g. `$STATE_DIR/triage_batch.json`, with the Write tool) and redirect it in** (inline `echo` breaks on Windows paths in rationale/excerpt with `Invalid \escape` — see the batch-JSON rule above). The file must be pure JSON — no comment lines:
+**Write the JSON to a file (e.g. `$STATE_DIR/work/triage_batch.json`, with the Write tool) and redirect it in** (inline `echo` breaks on Windows paths in rationale/excerpt with `Invalid \escape` — see the batch-JSON rule above). The file must be pure JSON — no comment lines:
 
 ```json
 [
@@ -145,7 +146,7 @@ After verifying each batch of rules, record the verdicts immediately (do not def
 ```
 
 ```bash
-python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch.json"
+python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/work/triage_batch.json"
 ```
 
 - **Every verdict (`attack` / `false_positive` / `indeterminate`) requires `refs`** (references to the representative events you actually verified, at least one) when the dataset has a RecordID column. The command rejects the entry otherwise, and gates G6/G7 enforce it again at report time. A false-positive exclusion must be as auditable down to the row as an attack claim
@@ -187,6 +188,7 @@ Discriminating-field guidance: process execution = Computer + Proc/Image + Cmdli
 ```
 
 Rules:
+- **`fields` must include at least one content-bearing field (Cmdline / Proc / Path / TgtUser / Svc / ...)**: grouping only by metadata such as `Computer` is just a per-host count and distinguishes no behavior (recording one prints a warning). When such a metadata-only key lets a benign variant absorb diverse content (>3 distinct Cmdline values within one group, etc.), **G10 FAILs**
 - **The variant `count`s must sum to the rule's total event count** (checked at entry time, and G10 recounts every group against the CSV — a dataset variant missing from the declaration also FAILs)
 - **Any attack variant makes the verdict `mixed`** (`false_positive` is only for all-benign variants). Record the attack events of a mixed rule as findings too (they fall under G4)
 - A variant whose grouping fields are all empty can never be `benign` (nothing to base benignity on — judge it `indeterminate`)
@@ -233,7 +235,7 @@ Call the following 4 **simultaneously**:
 
 **Record results in state as they are confirmed**:
 
-- Attack activity confirmed from crit/high events → `state.py finding --batch`. `title` and `summary` are **required**, and so are **`refs`** (qualified references to the supporting events, at least one — rejected at entry time and enforced by gates G6/G7 when the dataset has a RecordID column); include related `rules`, `hosts`, and the `query` used, so every report claim is traceable to data. Consistency rules: (1) every rule cited in `rules` needs a triage verdict regardless of level, and **citing a false_positive-verdict rule as finding evidence makes G8 FAIL**; (2) each event in `refs` must have been detected by one of the rules listed in `rules` (G6); (3) **every host listed in `hosts` needs at least one ref to an event on that host** (G9 — prevents host attribution without evidence). **Write the JSON to a file (e.g. `$STATE_DIR/finding_batch.json`) and redirect it in** (inline `echo` breaks on Windows paths):
+- Attack activity confirmed from crit/high events → `state.py finding --batch`. `title` and `summary` are **required**, and so are **`refs`** (qualified references to the supporting events, at least one — rejected at entry time and enforced by gates G6/G7 when the dataset has a RecordID column); include related `rules`, `hosts`, and the `query` used, so every report claim is traceable to data. Consistency rules: (1) every rule cited in `rules` needs a triage verdict regardless of level, and **citing a false_positive-verdict rule as finding evidence makes G8 FAIL**; (2) each event in `refs` must have been detected by one of the rules listed in `rules` (G6); (3) **every host listed in `hosts` needs at least one ref to an event on that host** (G9 — prevents host attribution without evidence). **Write the JSON to a file (e.g. `$STATE_DIR/work/finding_batch.json`) and redirect it in** (inline `echo` breaks on Windows paths):
 
 ```json
 [
@@ -245,10 +247,10 @@ Call the following 4 **simultaneously**:
 ```
 
 ```bash
-python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
+python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/work/finding_batch.json"
 ```
 
-- Extracted IOCs → `state.py ioc --batch`. `type` and `value` are **required**; `hosts`, `context`, `refs` optional (types: process / cmdline / filepath / ip / user / hash / service / other). Likewise pass via a file (e.g. `$STATE_DIR/ioc_batch.json`):
+- Extracted IOCs → `state.py ioc --batch`. `type` and `value` are **required**; `hosts`, `context`, `refs` optional (types: process / cmdline / filepath / ip / user / hash / service / other). Likewise pass via a file (e.g. `$STATE_DIR/work/ioc_batch.json`):
 
 ```json
 [
@@ -258,7 +260,7 @@ python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_bat
 ```
 
 ```bash
-python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/ioc_batch.json"
+python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/work/ioc_batch.json"
 ```
 
 - **★ When a tool result has `has_more: true`, log it with `log-query` right then (important)**: gate G5 is **self-reported** — if you never call `log-query`, G5 goes green as "no queries logged", which is NOT proof that nothing was truncated. Whenever a tool that can paginate (`extract_iocs`, `correlate_lateral_movement`, `run_sql`, `analyze_host_timeline`, etc.) returns `has_more: true` and you stop or continue, record it:
@@ -411,10 +413,10 @@ For example, if the CSV is `/data/hayabusa-results.csv`, the directory is `/data
 
 #### 6-1. Timeline Chart Generation
 
-Execute the following via Bash tool, piping JSON input:
+Write the JSON input to `$STATE_DIR/work/chart_timeline.json` with the Write tool, then redirect it in via the Bash tool (never inline `echo` — Windows paths break it with `Invalid \escape`, same rule as batch JSON):
 
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/timeline_chart.py"
+python3 "$HOME/.claude/skills/investigate/scripts/timeline_chart.py" < "$STATE_DIR/work/chart_timeline.json"
 ```
 
 JSON input structure:
@@ -437,8 +439,10 @@ JSON input structure:
 
 #### 6-2. MITRE ATT&CK Flow Diagram Generation
 
+Write the JSON to `$STATE_DIR/work/chart_mitre.json` and redirect it in:
+
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/mitre_flow.py"
+python3 "$HOME/.claude/skills/investigate/scripts/mitre_flow.py" < "$STATE_DIR/work/chart_mitre.json"
 ```
 
 JSON input structure:
@@ -465,8 +469,10 @@ JSON input structure:
 
 #### 6-3. Lateral Movement (Propagation Path) Chart Generation
 
+Write the JSON to `$STATE_DIR/work/chart_lateral.json` and redirect it in:
+
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate/scripts/lateral_movement_chart.py"
+python3 "$HOME/.claude/skills/investigate/scripts/lateral_movement_chart.py" < "$STATE_DIR/work/chart_lateral.json"
 ```
 
 JSON input structure:
@@ -531,7 +537,7 @@ Analyze all collected data and generate an **English** incident forensic report 
 
 #### File Output
 
-The report should be generated as an **HTML file only**. Do not create an intermediate Markdown file.
+The report is delivered as an **HTML file only**. Markdown stays a working file inside `$STATE_DIR/work/` and is never presented as the deliverable.
 
 ##### Step 7-1: HTML Report Output
 
@@ -545,12 +551,12 @@ File naming convention:
 - `{YYYY-MM-DDTHHMI}`: Local timestamp at report generation time (to the minute)
 - Save location: Inside the output directory created in Step 6-0 (`[CSV directory]/[CSV filename without extension]_[YYYY-MM-DDTHHMI]/`)
 
-First, assemble the full report body as a string. Do not save it as a `.md` file at any point.
+The report body may be assembled in the working file `$STATE_DIR/work/report_body.md` (writing long bodies with the Write tool is safer than inline strings). The final deliverable is HTML only — never present the `.md` as the deliverable or leave it directly under `$STATE_DIR`.
 
-Then **write the JSON input to a file with the Write tool** (e.g. `$STATE_DIR/report_input.json`) and execute the following via Bash tool to convert the report body directly to HTML and save it. Do NOT pipe the JSON through an inline `echo`: the report content routinely embeds Windows paths (`C:\Users\...`), which become invalid JSON escapes exactly as described in the batch-JSON rule above:
+Then **write the JSON input to a file with the Write tool** (e.g. `$STATE_DIR/work/report_input.json`) and execute the following via Bash tool to convert the report body directly to HTML and save it. Do NOT pipe the JSON through an inline `echo`: the report content routinely embeds Windows paths (`C:\Users\...`), which become invalid JSON escapes exactly as described in the batch-JSON rule above:
 
 ```bash
-python3 "$HOME/.claude/skills/investigate/scripts/report.py" < "$STATE_DIR/report_input.json"
+python3 "$HOME/.claude/skills/investigate/scripts/report.py" < "$STATE_DIR/work/report_input.json"
 ```
 
 JSON input structure:

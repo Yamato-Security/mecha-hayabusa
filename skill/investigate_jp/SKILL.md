@@ -36,9 +36,10 @@ STATE_PY="$HOME/.claude/skills/investigate_jp/scripts/state.py"
 ルール:
 
 - **state.py の実行は必ずBashツール**を使い、絶対パスで参照する（チャートスクリプトと同じ制約）
-- ステートディレクトリ `STATE_DIR` は Step 1 で作成するレポート出力ディレクトリと同一。全ステートファイル（`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `queries.jsonl`）はチャート・レポートと同じ場所に置かれる
+- ステートディレクトリ `STATE_DIR` は Step 1 で作成するレポート出力ディレクトリと同一。全ステートファイル（`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `queries.jsonl`, `verification_votes.jsonl`）はチャート・レポートと同じ場所に置かれる
 - **確定した事実はその場で記録する**（各Stepの本文にコマンドを記載）。一括登録は `state.py triage --batch` / `finding --batch` / `ioc --batch` / `host --batch` にJSON配列をstdinで渡す
-- **★一括登録のJSONは必ずファイル経由で渡す（重要）**: rationale や excerpt には Windows パス（`C:\Users\...`、`\Device\...`、`C:\$SNAP_...`）が頻出する。これを `echo '[...]' | ... --batch` のようにシングルクォートのインラインで渡すと、`\U` `\D` `\$` 等が**JSONの不正エスケープ**となり `Invalid \escape` で必ず失敗する。**WriteツールでスクラッチパッドにJSONファイルを書き、`--batch < /path/to/batch.json` でリダイレクト入力する**のを正規の手順とする。インラインの `echo` は避ける。どうしてもインラインで書く場合はバックスラッシュを `\\` に二重化するか、パスを `/` 表記にする（本文の記述としては `/` 表記でも意味は通じる）
+- **★一括登録のJSONは必ずファイル経由で渡す（重要）**: rationale や excerpt には Windows パス（`C:\Users\...`、`\Device\...`、`C:\$SNAP_...`）が頻出する。これを `echo '[...]' | ... --batch` のようにシングルクォートのインラインで渡すと、`\U` `\D` `\$` 等が**JSONの不正エスケープ**となり `Invalid \escape` で必ず失敗する。**Writeツールで `$STATE_DIR/work/` にJSONファイルを書き、`--batch < "$STATE_DIR/work/batch.json"` でリダイレクト入力する**のを正規の手順とする。インラインの `echo` は避ける。どうしてもインラインで書く場合はバックスラッシュを `\\` に二重化するか、パスを `/` 表記にする（本文の記述としては `/` 表記でも意味は通じる）
+- **作業ファイルは `$STATE_DIR/work/` に置く**: バッチJSON、チャート入力JSON、レポート本文の組み立てファイル、`report_input.json` などの一時ファイルは、`init` が作成する `$STATE_DIR/work/` サブディレクトリに置き、正規のステートファイル（`manifest.json` 等）や最終成果物と混在させない
 - **再開**: 対象CSVに前回セッションのステートディレクトリ（`[CSV名]_[タイムスタンプ]` 内の `manifest.json`）が既に存在する場合は、`python3 "$STATE_PY" status --dir <dir>` で残作業を確認し、最初からやり直さずに続きから再開する。再開するかはユーザーに確認する
 - **レポートゲート**: Step 7 は `state.py check` が PASS（全カバレッジゲート green）であることが前提。そうでない場合 `report.py` はレポート生成を拒否する
 
@@ -133,7 +134,7 @@ ORDER BY Timestamp LIMIT 2
 
 ルールをひとまとまり検証するごとに、判定を即座に記録する（最後にまとめて記録しない — コンテキストが圧縮される可能性がある）。verdict は `attack` / `false_positive` / `indeterminate` の3値、`rationale`（判定根拠）は必須。
 
-**JSONはWriteツールでファイル（例: `$STATE_DIR/triage_batch.json`）に書き、リダイレクトで渡す**（rationale/excerptにWindowsパスが入るとインライン `echo` は `Invalid \escape` で失敗するため。前述の「一括登録のJSON」ルール参照）。ファイルは純粋なJSONにすること — コメント行は書けない:
+**JSONはWriteツールでファイル（例: `$STATE_DIR/work/triage_batch.json`）に書き、リダイレクトで渡す**（rationale/excerptにWindowsパスが入るとインライン `echo` は `Invalid \escape` で失敗するため。前述の「一括登録のJSON」ルール参照）。ファイルは純粋なJSONにすること — コメント行は書けない:
 
 ```json
 [
@@ -145,7 +146,7 @@ ORDER BY Timestamp LIMIT 2
 ```
 
 ```bash
-python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch.json"
+python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/work/triage_batch.json"
 ```
 
 - **全ての評決（`attack` / `false_positive` / `indeterminate`）に `refs`（実際に検証した代表イベントへの参照、最低1件）が必須**（RecordIDカラムを持つデータセットの場合。記録時に拒否され、ゲート G6/G7 でも強制される）。偽陽性の除外も攻撃の認定と同じく、行レベルまで監査可能でなければならない
@@ -187,6 +188,7 @@ GROUP BY 1, 2, 3 ORDER BY cnt DESC
 ```
 
 ルール:
+- **`fields` には内容系フィールド（Cmdline / Proc / Path / TgtUser / Svc 等）を最低1つ含める**: `Computer` などメタデータのみのグループ化は「ホスト別件数」にすぎず挙動を判別できない（記録時に警告が出る）。メタデータのみのキーで benign バリアントが多様な内容（同一グループ内に4種超のCmdline等）を吸収している場合、**G10 が FAIL する**
 - **全バリアントの `count` 合計 = ルールのイベント総数**（記録時に検証され、G10がCSV再集計と突合する。宣言に無いバリアントがCSVに存在してもFAIL）
 - **攻撃バリアントが1つでもあれば verdict は `mixed`**（`false_positive` は全バリアントがbenignの場合のみ）。mixed ルールの攻撃イベントは finding にも記録する（G4の対象になる）
 - 判別フィールドが全て空のバリアントは `benign` にできない（判断材料が無いため `indeterminate` にする）
@@ -235,7 +237,7 @@ Detailsの確認中に、以下の攻撃インフラパターンを発見した�
 
 - crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`refs` も必須**（裏付けイベントへの修飾参照、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G6/G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。整合性ルール: (1) `rules` に引用したルールは重要度に関わらずトリアージ判定が必要で、**偽陽性判定のルールをfindingの証拠に引用すると G8 が FAIL する**、(2) `refs` の各イベントは `rules` に挙げたいずれかのルールが検出したものであること（G6）、(3) **`hosts` に挙げた各ホストには、そのホスト上のイベントへの ref が最低1件必要**（G9 — 証拠のないホスト帰属を防ぐ）:
 
-JSONはWriteツールでファイル（例: `$STATE_DIR/finding_batch.json`）に書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
+JSONはWriteツールでファイル（例: `$STATE_DIR/work/finding_batch.json`）に書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
 
 ```json
 [
@@ -247,10 +249,10 @@ JSONはWriteツールでファイル（例: `$STATE_DIR/finding_batch.json`）�
 ```
 
 ```bash
-python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
+python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/work/finding_batch.json"
 ```
 
-- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `refs` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル（例: `$STATE_DIR/ioc_batch.json`）経由で渡す:
+- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `refs` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル（例: `$STATE_DIR/work/ioc_batch.json`）経由で渡す:
 
 ```json
 [
@@ -260,7 +262,7 @@ python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_bat
 ```
 
 ```bash
-python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/ioc_batch.json"
+python3 "$STATE_PY" ioc --dir "$STATE_DIR" --batch < "$STATE_DIR/work/ioc_batch.json"
 ```
 
 - **★ `has_more: true` を受け取ったら、その場で必ず `log-query` に記録する（重要）**: ゲート G5 は**自己申告制**であり、記録しなければ検知できない。log-query を一度も呼ばなければ G5 は「no queries logged」で緑になるが、これは「打ち切りが無かった」ことの証明にはならない。`has_more: true` を返す代表的なツール（`extract_iocs`, `correlate_lateral_movement`, `run_sql`, `analyze_host_timeline` 等）で打ち切る/追加取得する場合は、以下で必ず記録する:
@@ -411,10 +413,10 @@ Step 1 で作成したステートディレクトリ `$STATE_DIR`（`[CSVのデ�
 
 #### 6-1. タイムラインチャート生成
 
-Bashツールで以下を実行する。JSON入力をパイプで渡す:
+JSON入力をWriteツールで `$STATE_DIR/work/chart_timeline.json` に書き、Bashツールでリダイレクト実行する（インライン `echo` はWindowsパスで `Invalid \escape` になるため使わない — バッチJSONと同じ規則）:
 
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate_jp/scripts/timeline_chart.py"
+python3 "$HOME/.claude/skills/investigate_jp/scripts/timeline_chart.py" < "$STATE_DIR/work/chart_timeline.json"
 ```
 
 JSON入力の構造:
@@ -437,8 +439,10 @@ JSON入力の構造:
 
 #### 6-2. MITRE ATT&CKフロー図生成
 
+JSONをWriteツールで `$STATE_DIR/work/chart_mitre.json` に書き、リダイレクト実行する:
+
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate_jp/scripts/mitre_flow.py"
+python3 "$HOME/.claude/skills/investigate_jp/scripts/mitre_flow.py" < "$STATE_DIR/work/chart_mitre.json"
 ```
 
 JSON入力の構造:
@@ -465,8 +469,10 @@ JSON入力の構造:
 
 #### 6-3. 横展開（伝播経路）チャート生成
 
+JSONをWriteツールで `$STATE_DIR/work/chart_lateral.json` に書き、リダイレクト実行する:
+
 ```bash
-echo '<JSON>' | python3 "$HOME/.claude/skills/investigate_jp/scripts/lateral_movement_chart.py"
+python3 "$HOME/.claude/skills/investigate_jp/scripts/lateral_movement_chart.py" < "$STATE_DIR/work/chart_lateral.json"
 ```
 
 JSON入力の構造:
@@ -531,7 +537,7 @@ python3 "$STATE_PY" check --dir "$STATE_DIR"
 
 #### ファイル出力
 
-レポートは **HTMLファイルのみ** を最終成果物として生成する。Markdown中間ファイルは作成しない。
+レポートは **HTMLファイルのみ** を最終成果物として生成する。Markdownは `$STATE_DIR/work/` 内の作業ファイルに留め、最終成果物として提示しない。
 
 ##### Step 7-1: HTMLレポート書き出し
 
@@ -545,12 +551,12 @@ python3 "$STATE_PY" check --dir "$STATE_DIR"
 - `{YYYY-MM-DDTHHMI}`: レポート生成時のローカルタイムスタンプ（時分まで）
 - 保存先: Step 6-0で作成した出力ディレクトリ内（`[CSVのディレクトリ]/[CSV拡張子なしのファイル名]_[YYYY-MM-DDTHHMI]/`）
 
-まずレポート本文を文字列として組み立てる。途中で `.md` ファイルとして保存してはいけない。
+レポート本文は作業ファイル `$STATE_DIR/work/report_body.md` で組み立ててよい（長文はWriteツールで直接書く方が安全）。ただし最終成果物はHTMLのみ — `.md` を最終成果物として提示したり、`$STATE_DIR` 直下に残置したりしない。
 
-次に **JSON入力をWriteツールでファイル（例: `$STATE_DIR/report_input.json`）に書き**、Bashツールで以下を実行してレポート本文を直接HTMLに変換して保存する。インライン `echo` でJSONを渡してはいけない: レポート本文にはWindowsパス（`C:\Users\...`）が頻繁に含まれ、前述の「一括登録のJSON」ルールと同じ `Invalid \escape` 失敗になる:
+次に **JSON入力をWriteツールでファイル（例: `$STATE_DIR/work/report_input.json`）に書き**、Bashツールで以下を実行してレポート本文を直接HTMLに変換して保存する。インライン `echo` でJSONを渡してはいけない: レポート本文にはWindowsパス（`C:\Users\...`）が頻繁に含まれ、前述の「一括登録のJSON」ルールと同じ `Invalid \escape` 失敗になる:
 
 ```bash
-python3 "$HOME/.claude/skills/investigate_jp/scripts/report.py" < "$STATE_DIR/report_input.json"
+python3 "$HOME/.claude/skills/investigate_jp/scripts/report.py" < "$STATE_DIR/work/report_input.json"
 ```
 
 JSON入力の構造:

@@ -18,6 +18,8 @@ State directory layout:
   environment.json  known-good products/accounts with provenance
   queries.jsonl     audit log of executed queries (query_hash, has_more)
   verification_votes.jsonl  independent fresh-context verification votes
+  work/             scratch area for batch JSON, chart inputs and report
+                    body drafts (kept out of the canonical state files)
 
 Evidence refs:
   Windows EventRecordIDs are NOT globally unique — the same RecordID can
@@ -76,6 +78,29 @@ VARIANT_EVIDENCE_THRESHOLD = 20
 # Distinct variant keys tracked per rule during the recount; beyond this the
 # chosen fields are too unstable to be a meaningful grouping.
 VARIANT_GROUPS_CAP = 2000
+
+# Grouping fields that carry no event content: a variant key made ONLY of
+# these (e.g. per-host counts) satisfies the count arithmetic without
+# distinguishing any behavior. G10 probes such rules and fails benign
+# variants that absorb diverse content values.
+NON_CONTENT_FIELDS = {
+    "Computer", "Channel", "EventID", "Level", "RuleTitle", "RecordID",
+    "Timestamp", "Provider", "MitreTactics", "MitreTags", "OtherTags",
+    "RuleFile", "RuleID", "EvtxFile", "RecoveredRecord",
+}
+# Content fields sampled inside each variant group of a non-content-keyed
+# rule (Details-profile and AllFieldInfo-profile names).
+VARIANT_PROBE_FIELDS = (
+    "Cmdline", "CommandLine", "ParentCommandLine",
+    "Proc", "Image", "NewProcessName", "ParentImage",
+    "Path", "ImagePath", "TgtFile", "TargetFilename",
+    "Svc", "ServiceName", "TaskName",
+    "TgtObj", "TargetObject",
+)
+# A benign variant of a non-content-keyed rule may span at most this many
+# distinct values per probed content field; beyond that the key is hiding
+# behaviors that were never individually judged.
+VARIANT_KEY_DIVERSITY_CAP = 3
 
 # Hayabusa detail-field separator (" ¦ ", broken bar U+00A6).
 DETAILS_SEPARATOR = " ¦ "
@@ -300,15 +325,20 @@ class DatasetFacts:
         # the rules that declared variant evidence (gate G10).
         self.variant_counts: dict[str, dict[tuple, int]] = {}
         self.variant_overflow: set[str] = set()
+        # rule title -> {variant key: {probe field: distinct values (capped)}}
+        # for rules whose grouping fields carry no event content.
+        self.variant_probe: dict[str, dict[tuple, dict[str, set]]] = {}
 
 
 def scan_csv(
     csv_path: str,
     cited_ids: "set[str] | None" = None,
     variant_specs: "dict[str, list] | None" = None,
+    probe_titles: "set[str] | None" = None,
 ) -> DatasetFacts:
     cited_ids = cited_ids or set()
     variant_specs = variant_specs or {}
+    probe_titles = probe_titles or set()
     facts = DatasetFacts()
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -326,11 +356,22 @@ def scan_csv(
                 spec = variant_specs.get(title)
                 if spec is not None and title not in facts.variant_overflow:
                     counts = facts.variant_counts.setdefault(title, {})
-                    key = _variant_key(row, _parse_detail_fields(detail), spec)
+                    detail_fields = _parse_detail_fields(detail)
+                    key = _variant_key(row, detail_fields, spec)
                     if key in counts or len(counts) < VARIANT_GROUPS_CAP:
                         counts[key] = counts.get(key, 0) + 1
                     else:
                         facts.variant_overflow.add(title)
+                    if title in probe_titles:
+                        group_probe = facts.variant_probe.setdefault(title, {}).setdefault(key, {})
+                        for probe_field in VARIANT_PROBE_FIELDS:
+                            value = detail_fields.get(probe_field)
+                            if value:
+                                seen = group_probe.setdefault(probe_field, set())
+                                # Keep at most CAP+1 values: enough to know the
+                                # cap was exceeded without unbounded memory.
+                                if len(seen) <= VARIANT_KEY_DIVERSITY_CAP:
+                                    seen.add(value)
             if host:
                 facts.hosts.setdefault(host, {}).setdefault(level, 0)
                 facts.hosts[host][level] += 1
@@ -427,6 +468,9 @@ def cmd_init(args) -> None:
     # against a manifest-less directory (see _require_initialized), so no
     # analyst-entered data can exist to be lost.
     os.makedirs(state_dir, exist_ok=True)
+    # Scratch area for working files (batch JSON, chart inputs, report body
+    # drafts), so they do not mingle with the canonical state files.
+    os.makedirs(os.path.join(state_dir, "work"), exist_ok=True)
 
     facts = scan_csv(csv_path)
     levels = _validate_levels(args.levels) if args.levels else default_levels(facts)
@@ -788,6 +832,14 @@ def _validate_variants(raw, title: str, verdict: str, rule_count: int) -> dict:
     if not isinstance(fields, list) or not fields or not all(isinstance(f, str) and f.strip() for f in fields):
         _fail(f"variants.fields for {title!r} must be a non-empty list of field names")
     fields = [f.strip() for f in fields]
+    if all(f in NON_CONTENT_FIELDS for f in fields):
+        print(
+            f"warning: variants for {title!r} group only by non-content fields"
+            f" ({', '.join(fields)}) — per-host/per-channel counts cannot distinguish"
+            " behaviors. Add a content-bearing field (Cmdline/Proc/Path/User/Svc/...)."
+            " Gate G10 FAILs benign variants that absorb diverse content values.",
+            file=sys.stderr,
+        )
     if not isinstance(groups, list) or not groups:
         _fail(f"variants.groups for {title!r} must be a non-empty list")
     if len(groups) > VARIANT_GROUPS_CAP:
@@ -1422,7 +1474,12 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
             for r in triage["rules"]
             if isinstance(r.get("variants"), dict) and r["variants"].get("fields")
         }
-        facts = scan_csv(csv_path, cited_ids=cited_ids, variant_specs=variant_specs)
+        probe_titles = {
+            title for title, fields in variant_specs.items()
+            if all(f in NON_CONTENT_FIELDS for f in fields)
+        }
+        facts = scan_csv(csv_path, cited_ids=cited_ids, variant_specs=variant_specs,
+                         probe_titles=probe_titles)
 
     # G1: rule triage coverage at investigated levels
     gate_rules = [r for r in triage["rules"] if set(r["levels"]) & set(levels)]
@@ -1681,6 +1738,7 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     # 39,582" structurally impossible.
     g10_gaps: list[str] = []
     recounted = 0
+    weak_keyed = 0
     for r in triage["rules"]:
         verdict = r["verdict"]
         if verdict not in ("false_positive", "mixed"):
@@ -1738,7 +1796,34 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                 f"rule {title}: dataset variant ({label}, {actual[key]} events) is not"
                 " judged — every variant needs a verdict"
             )
+        # Non-content grouping keys (e.g. per-host counts) satisfy the count
+        # arithmetic without distinguishing behaviors: probe the content
+        # fields inside each benign group and fail when a single group absorbs
+        # more distinct values than a variant may legitimately span.
+        if all(f in NON_CONTENT_FIELDS for f in fields):
+            weak_keyed += 1
+            probe = facts.variant_probe.get(title, {})
+            for g in groups:
+                if g.get("verdict") != "benign":
+                    continue
+                key = tuple(str((g.get("key") or {}).get(f, "") or "").strip() for f in fields)
+                label = ", ".join(f"{f}={v!r}" for f, v in zip(fields, key))
+                for probe_field in sorted(probe.get(key) or {}):
+                    seen = probe[key][probe_field]
+                    if len(seen) > VARIANT_KEY_DIVERSITY_CAP:
+                        g10_gaps.append(
+                            f"rule {title}: benign variant ({label}) absorbs more than"
+                            f" {VARIANT_KEY_DIVERSITY_CAP} distinct {probe_field!r} values while"
+                            f" the grouping fields {fields} carry no event content —"
+                            " re-group with a content-bearing field (Cmdline/Proc/Path/...)"
+                        )
+                        break
     g10_detail = f"{recounted} rule(s) with variant evidence recounted against the dataset"
+    if weak_keyed:
+        g10_detail += (
+            f" (warning: {weak_keyed} rule(s) grouped only by non-content fields —"
+            " prefer content-bearing grouping fields)"
+        )
     if facts is None:
         g10_detail = "structural checks only (dataset unavailable)"
     gate("G10", "variant coverage for high-volume verdicts", not g10_gaps, g10_detail, g10_gaps[:50])

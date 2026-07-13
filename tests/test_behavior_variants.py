@@ -32,6 +32,15 @@ def build_rows() -> list[list[str]]:
     for i in range(21):
         rows.append(["2024-01-01 02:00:00.000 +00:00", "Empty", "high", "HOST-B", "Sec",
                      "4624", str(2000 + i), ""])
+    # "HostKeyed" (24 events, ONE host, SIX distinct command lines): a
+    # Computer-only variant key hides the diversity entirely.
+    for i in range(24):
+        rows.append(["2024-01-01 03:00:00.000 +00:00", "HostKeyed", "high", "HOST-D", "Sysmon",
+                     "1", str(3000 + i), f"Cmdline: cmd{i % 6}.exe /install ¦ Proc: host.exe"])
+    # "Uniform" (24 events, one host, a single identical command line).
+    for i in range(24):
+        rows.append(["2024-01-01 04:00:00.000 +00:00", "Uniform", "high", "HOST-E", "Sysmon",
+                     "1", str(4000 + i), "Cmdline: saltcall.exe remove ¦ Proc: python.exe"])
     return rows
 
 
@@ -186,6 +195,63 @@ class BehaviorVariantTests(unittest.TestCase):
         g10 = self.gates()["G10"]
         self.assertEqual(g10["status"], "FAIL")
         self.assertTrue(any("evil.exe" in gap and "not" in gap for gap in g10["gaps"]), g10["gaps"])
+
+    # -- G10 probe: non-content grouping keys --------------------------------
+
+    def test_non_content_key_hiding_diversity_fails_g10(self) -> None:
+        result = self.triage({
+            "rule_title": "HostKeyed", "verdict": "false_positive",
+            "rationale": "bulk software rollout across the fleet",
+            "refs": [{"record_id": "3000", "computer": "HOST-D"}],
+            "excerpt": "Proc: host.exe",
+            "variants": {
+                "fields": ["Computer"],
+                "groups": [{"key": {"Computer": "HOST-D"}, "count": 24, "verdict": "benign"}],
+            },
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("non-content", result.stderr)  # entry-time warning
+        g10 = self.gates()["G10"]
+        self.assertEqual(g10["status"], "FAIL")
+        self.assertTrue(
+            any("content-bearing" in gap and "Cmdline" in gap for gap in g10["gaps"]),
+            g10["gaps"],
+        )
+
+    def test_non_content_key_over_homogeneous_content_passes_with_warning(self) -> None:
+        result = self.triage({
+            "rule_title": "Uniform", "verdict": "false_positive",
+            "rationale": "saltstack agent cleanup, identical on every event",
+            "refs": [{"record_id": "4000", "computer": "HOST-E"}],
+            "excerpt": "Cmdline: saltcall.exe remove",
+            "variants": {
+                "fields": ["Computer"],
+                "groups": [{"key": {"Computer": "HOST-E"}, "count": 24, "verdict": "benign"}],
+            },
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        g10 = self.gates()["G10"]
+        self.assertEqual(g10["status"], "PASS", g10)
+        self.assertIn("non-content", g10["detail"])
+
+    def test_content_keyed_grouping_with_arg_diversity_passes(self) -> None:
+        # Grouping by Proc while Cmdline varies is a deliberate, content-based
+        # choice (e.g. same binary with random per-event arguments) — no probe.
+        result = self.triage({
+            "rule_title": "HostKeyed", "verdict": "false_positive",
+            "rationale": "single installer binary invoked with varying arguments",
+            "refs": [{"record_id": "3000", "computer": "HOST-D"}],
+            "excerpt": "Proc: host.exe",
+            "variants": {
+                "fields": ["Proc"],
+                "groups": [{"key": {"Proc": "host.exe"}, "count": 24, "verdict": "benign"}],
+            },
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("non-content", result.stderr)
+        g10 = self.gates()["G10"]
+        self.assertEqual(g10["status"], "PASS", g10)
+        self.assertNotIn("non-content", g10["detail"])
 
     # -- environment profile ------------------------------------------------
 
