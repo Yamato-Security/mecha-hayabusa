@@ -433,6 +433,191 @@ def _unverified_banner_html(unverified):
     )
 
 
+# Markers the report body places where the false-positive table and the
+# indeterminate list belong. report.py renders both DIRECTLY from the
+# investigation state (rule_triage.json), so the tables cannot contradict the
+# recorded verdicts. The narrative stays free-form; only these mechanical
+# tables are generated.
+FP_TABLE_MARKER = "<!--STATE:FP_TABLE-->"
+INDETERMINATE_MARKER = "<!--STATE:INDETERMINATE_LIST-->"
+
+STATE_TABLE_LABELS = {
+    "en": {
+        "fp_header": ["Rule title", "Count", "Verdict basis"],
+        "fp_none": "None — no rules were triaged as false positives.",
+        "ind_none": "None — no rules were triaged as indeterminate.",
+        "mixed_note": "mixed rule, benign variant",
+        "evidence": "evidence",
+        "ind_events": "events",
+    },
+    "ja": {
+        "fp_header": ["ルールタイトル", "件数", "判定根拠"],
+        "fp_none": "該当なし — 偽陽性と判定されたルールはない。",
+        "ind_none": "該当なし — 判定不能とされたルールはない。",
+        "mixed_note": "mixedルールの正常バリアント",
+        "evidence": "証拠",
+        "ind_events": "件",
+    },
+}
+
+
+def _table_cell(text):
+    """Make free text safe inside a markdown table cell."""
+    return str(text).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _load_state_json(state_dir, name):
+    try:
+        with open(os.path.join(state_dir, name), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _generate_fp_table(rules, labels):
+    lines = ["| " + " | ".join(labels["fp_header"]) + " |", "|---|---|---|"]
+    rows = 0
+    for rule in rules:
+        if rule.get("verdict") == "false_positive":
+            basis = rule.get("rationale") or ""
+            excerpt = ((rule.get("evidence") or {}).get("detail_excerpt") or "").strip()
+            if excerpt:
+                basis += f" — {labels['evidence']}: `{excerpt[:120]}`"
+            lines.append(
+                f"| {_table_cell(rule['rule_title'])} | {rule.get('count', '?')} |"
+                f" {_table_cell(basis)} |"
+            )
+            rows += 1
+        elif rule.get("verdict") == "mixed":
+            variants = rule.get("variants") or {}
+            fields = variants.get("fields") or []
+            for group in variants.get("groups") or []:
+                if group.get("verdict") != "benign":
+                    continue
+                key = group.get("key") or {}
+                key_label = ", ".join(f"{f}={key.get(f, '')}" for f in fields)
+                basis = f"{key_label}"
+                if group.get("note"):
+                    basis += f" — {group['note']}"
+                lines.append(
+                    f"| {_table_cell(rule['rule_title'])} ({labels['mixed_note']}) |"
+                    f" {group.get('count', '?')} | {_table_cell(basis)} |"
+                )
+                rows += 1
+    if rows == 0:
+        return labels["fp_none"]
+    return "\n".join(lines)
+
+
+def _generate_indeterminate_list(rules, labels):
+    lines = []
+    for rule in rules:
+        if rule.get("verdict") == "indeterminate":
+            lines.append(
+                f"- {_table_cell(rule['rule_title'])} ({rule.get('count', '?')} "
+                f"{labels['ind_events']}): {_table_cell(rule.get('rationale') or '')}"
+            )
+    if not lines:
+        return labels["ind_none"]
+    return "\n".join(lines)
+
+
+def _apply_state_markers(md_text, state_dir):
+    """Replace the state markers with tables generated from rule_triage.json.
+    Returns (new_md_text, markers_found_set)."""
+    markers_found = set()
+    if FP_TABLE_MARKER in md_text:
+        markers_found.add(FP_TABLE_MARKER)
+    if INDETERMINATE_MARKER in md_text:
+        markers_found.add(INDETERMINATE_MARKER)
+    if not markers_found:
+        return md_text, markers_found
+    labels = STATE_TABLE_LABELS.get(APPENDIX_LANG, STATE_TABLE_LABELS["en"])
+    triage = _load_state_json(state_dir, "rule_triage.json") if state_dir else None
+    rules = (triage or {}).get("rules") or []
+    if triage is None:
+        print(
+            "warning: state markers present but rule_triage.json is unreadable;"
+            " the markers were removed from the output",
+            file=sys.stderr,
+        )
+        md_text = md_text.replace(FP_TABLE_MARKER, "").replace(INDETERMINATE_MARKER, "")
+        return md_text, markers_found
+    md_text = md_text.replace(FP_TABLE_MARKER, _generate_fp_table(rules, labels))
+    md_text = md_text.replace(INDETERMINATE_MARKER, _generate_indeterminate_list(rules, labels))
+    return md_text, markers_found
+
+
+def _lint_report_consistency(md_text, state_dir, markers_found):
+    """Cross-check the report body against the investigation state.
+
+    Returns (problems, warnings): problems refuse generation (exit 4) unless
+    forced; warnings only print. Cell matching is exact, so the linter never
+    wrongly blocks a report — it catches the blatant contradictions
+    (a false_positive rule presented as an attack-timeline row, mechanical
+    tables not generated from state).
+    """
+    problems = []
+    warnings = []
+    triage = _load_state_json(state_dir, "rule_triage.json")
+    if triage is None:
+        return problems, warnings
+    rules = triage.get("rules") or []
+    fp_titles = {r["rule_title"] for r in rules if r.get("verdict") == "false_positive"}
+
+    # A false_positive rule must not appear as a timeline-table row.
+    sections = {}
+    current = None
+    for line in md_text.split("\n"):
+        heading = re.match(r"^##\s+(.*)", line)
+        if heading:
+            current = heading.group(1).strip()
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    for heading, lines in sections.items():
+        lowered = heading.lower()
+        if "タイムライン" not in heading and "timeline" not in lowered:
+            continue
+        for line in lines:
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            for cell in cells:
+                if cell in fp_titles:
+                    problems.append(
+                        f"false_positive rule {cell!r} appears in the timeline section"
+                        f" {heading!r} — a rule excluded as a false positive cannot be"
+                        " presented as attack activity (re-triage it, or remove the row)"
+                    )
+
+    # The mechanical tables must come from state, not be hand-written.
+    has_fp_like = any(r.get("verdict") in ("false_positive", "mixed") for r in rules)
+    has_ind = any(r.get("verdict") == "indeterminate" for r in rules)
+    if has_fp_like and FP_TABLE_MARKER not in markers_found:
+        problems.append(
+            f"the report must place {FP_TABLE_MARKER} where the false-positive table"
+            " belongs (Section 9): the table is generated from rule_triage.json so it"
+            " cannot contradict the recorded verdicts"
+        )
+    if has_ind and INDETERMINATE_MARKER not in markers_found:
+        problems.append(
+            f"the report must place {INDETERMINATE_MARKER} where the indeterminate"
+            " list belongs (Section 9): the list is generated from rule_triage.json"
+        )
+
+    # IOCs recorded in state should be visible in the report body.
+    iocs = _load_state_json(state_dir, "iocs.json")
+    for ioc in (iocs or {}).get("iocs") or []:
+        value = str(ioc.get("value") or "")
+        if len(value) >= 4 and value not in md_text:
+            warnings.append(
+                f"IOC recorded in state but absent from the report body:"
+                f" {ioc.get('type')}: {value}"
+            )
+    return problems, warnings
+
+
 def _run_coverage_gate(state_dir, force):
     """Run state.py coverage gates; exit unless they PASS (or force).
 
@@ -605,8 +790,26 @@ def main():
     unverified = None
     if state_dir:
         appendix_md, unverified = _run_coverage_gate(state_dir, force)
+        md_text, markers_found = _apply_state_markers(md_text, state_dir)
+        problems, warnings = _lint_report_consistency(md_text, state_dir, markers_found)
+        for warning in warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        if problems:
+            if not force:
+                print("Report/state consistency check FAILED - report generation refused.", file=sys.stderr)
+                for problem in problems:
+                    print(f"  - {problem}", file=sys.stderr)
+                print('Fix the report body (or the state), or pass "force": true.', file=sys.stderr)
+                sys.exit(4)
+            consistency_failures = [("R1", "report consistency", p) for p in problems]
+            if unverified is None:
+                unverified = {"reason": "gates_failed", "failed": consistency_failures}
+            elif unverified.get("reason") == "gates_failed":
+                unverified["failed"].extend(consistency_failures)
         if appendix_md:
             md_text = md_text.rstrip() + "\n\n---\n\n" + appendix_md + "\n"
+    else:
+        md_text, _ = _apply_state_markers(md_text, state_dir)
     body_html, nav_items_html, extracted_title = md_to_html(md_text, chart_files)
 
     title = given_title or extracted_title or "Incident Report"

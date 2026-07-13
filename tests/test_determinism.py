@@ -165,16 +165,19 @@ class DeterminismTests(unittest.TestCase):
         self.orig_db_path = server.DB_PATH
         self.orig_repo = server.repo
         self.orig_cache = server._LOG_COLUMNS_CACHE
+        self.orig_roots = server.DATASET_ROOTS
 
         server.DB_PATH = self.db_path
         server.repo = server.DuckDBRepository(self.db_path)
         server._LOG_COLUMNS_CACHE = None
+        server.DATASET_ROOTS = [pathlib.Path(self.tmp.name).resolve()]
         server.switch_dataset(target=str(self.csv_path))
 
     def tearDown(self) -> None:
         server.DB_PATH = self.orig_db_path
         server.repo = self.orig_repo
         server._LOG_COLUMNS_CACHE = self.orig_cache
+        server.DATASET_ROOTS = self.orig_roots
         self.tmp.cleanup()
 
     def test_run_sql_unknown_column_error_names_the_column(self) -> None:
@@ -466,16 +469,19 @@ class AllFieldInfoProfileTests(unittest.TestCase):
         self.orig_db_path = server.DB_PATH
         self.orig_repo = server.repo
         self.orig_cache = server._LOG_COLUMNS_CACHE
+        self.orig_roots = server.DATASET_ROOTS
 
         server.DB_PATH = self.db_path
         server.repo = server.DuckDBRepository(self.db_path)
         server._LOG_COLUMNS_CACHE = None
+        server.DATASET_ROOTS = [pathlib.Path(self.tmp.name).resolve()]
         server.switch_dataset(target=str(self.csv_path))
 
     def tearDown(self) -> None:
         server.DB_PATH = self.orig_db_path
         server.repo = self.orig_repo
         server._LOG_COLUMNS_CACHE = self.orig_cache
+        server.DATASET_ROOTS = self.orig_roots
         self.tmp.cleanup()
 
     def test_parse_details_field_default_raises_with_guidance(self) -> None:

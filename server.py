@@ -15,6 +15,53 @@ from mcp.server.fastmcp import FastMCP
 DB_PATH = pathlib.Path("hayabusa.duckdb")
 app = FastMCP("Hayabusa MCP")
 
+# Directories the server may read CSV datasets from. Defaults to the working
+# directory at startup; extend with --dataset-root. This is defense-in-depth
+# against log-embedded instructions steering the server at arbitrary files —
+# not a sandbox for the MCP client itself, which has its own file access.
+DATASET_ROOTS: list[pathlib.Path] = [pathlib.Path.cwd().resolve()]
+
+# Control characters and Unicode bidi/format overrides that can reorder or
+# hide log-embedded text when displayed. Escaped to \xNN / \uNNNN on display
+# so evidence shows exactly which codepoints are present.
+_DISPLAY_ESCAPE_PATTERN = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"   # C0 controls (except \\t \\n \\r)
+    "\u200e\u200f"                        # LRM / RLM
+    "\u202a-\u202e"                       # LRE / RLE / PDF / LRO / RLO
+    "\u2066-\u2069]"                      # LRI / RLI / FSI / PDI
+)
+
+
+def _escape_untrusted_display(value: str) -> str:
+    """Make control and bidi-override characters visible without dropping
+    information (log values are untrusted, attacker-influenced data)."""
+    def repl(match: "re.Match[str]") -> str:
+        codepoint = ord(match.group(0))
+        return f"\\x{codepoint:02x}" if codepoint < 0x100 else f"\\u{codepoint:04x}"
+    return _DISPLAY_ESCAPE_PATTERN.sub(repl, value)
+
+
+def _is_within_dataset_roots(path: pathlib.Path) -> bool:
+    for root in DATASET_ROOTS:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _ensure_within_dataset_roots(path: pathlib.Path) -> pathlib.Path:
+    """Reject a (resolved) path outside every allowed dataset root."""
+    if _is_within_dataset_roots(path):
+        return path
+    roots_label = ", ".join(str(root) for root in DATASET_ROOTS)
+    raise ValueError(
+        f"Path is outside the allowed dataset root(s): {path}."
+        f" Allowed roots: {roots_label}."
+        " Start the server with --dataset-root DIR to permit other directories."
+    )
+
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 RUN_SQL_MAX_ROWS = 500
@@ -567,7 +614,11 @@ def _search_csv_files(base_dir: pathlib.Path, recursive: bool, name_filter: str 
             continue
         if name_filter_lower and name_filter_lower not in path.name.lower():
             continue
-        files.append(path.resolve())
+        resolved = path.resolve()
+        # Drop symlinks whose target escapes the allowed dataset roots.
+        if not _is_within_dataset_roots(resolved):
+            continue
+        files.append(resolved)
 
     return sorted(files, key=lambda p: str(p).lower())
 
@@ -582,11 +633,14 @@ def _resolve_dataset_target(target: str, search_root: str = ".", recursive: bool
         resolved = explicit.resolve()
         if resolved.suffix.lower() != ".csv":
             raise ValueError(f"Please specify a CSV file: {resolved}")
-        return resolved
+        # Containment happens after resolve(), so ../ traversal and symlinks
+        # pointing outside the allowed roots are both rejected.
+        return _ensure_within_dataset_roots(resolved)
 
     root = pathlib.Path(search_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"Invalid search_root: {root}")
+    _ensure_within_dataset_roots(root)
 
     target_lower = target_text.lower()
     matches: list[pathlib.Path] = []
@@ -620,7 +674,7 @@ def _resolve_dataset_target(target: str, search_root: str = ".", recursive: bool
             f"Please specify a more specific path. Candidates: {candidates}"
         )
 
-    return matches[0]
+    return _ensure_within_dataset_roots(matches[0])
 
 
 # ──────────────────────────────────────────
@@ -667,6 +721,7 @@ def list_datasets(
     root = pathlib.Path(search_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"Invalid search_root: {root}")
+    _ensure_within_dataset_roots(root)
 
     files = _search_csv_files(root, recursive=recursive, name_filter=name_filter)
     paged_files = files[page_offset : page_offset + page_size]
@@ -1188,7 +1243,9 @@ def get_event_detail(
 
     for col in row_df.columns:
         val = row[col]
-        str_val = "" if pd.isna(val) else str(val)
+        # Log values are untrusted: make control/bidi characters visible so
+        # display-order tricks (e.g. RLO filename spoofing) cannot hide content.
+        str_val = "" if pd.isna(val) else _escape_untrusted_display(str(val))
 
         if col in ("Details", "ExtraFieldInfo", "AllFieldInfo") and str_val:
             prefix = {"Details": "Details", "ExtraFieldInfo": "Extra", "AllFieldInfo": "AllField"}[col]
@@ -2343,7 +2400,9 @@ def decode_powershell_commands(
                 "RuleTitle": str(row.get("RuleTitle", "")),
                 "Level": str(row.get("Level", "")),
                 "EncodedCommand": encoded_short,
-                "DecodedCommand": decoded,
+                # Decoded payloads are attacker-controlled bytes: keep control
+                # and bidi characters visible instead of rendering them.
+                "DecodedCommand": _escape_untrusted_display(decoded),
             })
 
     if not decoded_rows:
@@ -2518,7 +2577,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable JSON response mode",
     )
+    parser.add_argument(
+        "--dataset-root",
+        action="append",
+        default=None,
+        metavar="DIR",
+        help="Directory the server may read CSV datasets from (repeatable)."
+             " Defaults to the current working directory. Paths outside every"
+             " root — including symlink targets — are rejected.",
+    )
     args = parser.parse_args()
+    if args.dataset_root:
+        roots = []
+        for raw in args.dataset_root:
+            root = pathlib.Path(raw).expanduser().resolve()
+            if not root.is_dir():
+                parser.error(f"--dataset-root is not a directory: {root}")
+            roots.append(root)
+        DATASET_ROOTS = roots
     transport = "streamable-http" if args.transport == "http" else args.transport
     status = repo.get_dataset_status()
 
@@ -2539,6 +2615,7 @@ if __name__ == "__main__":
         print(f"Current dataset: {status.get('dataset_path', '')}")
     else:
         print("No dataset loaded. Please load a CSV using the switch_dataset tool.")
+    print("Dataset root(s): " + ", ".join(str(root) for root in DATASET_ROOTS))
 
     try:
         app.run(transport=transport)
