@@ -44,8 +44,15 @@ def _escape(text):
     return html_mod.escape(text)
 
 
-def _safe_href(url: str):
-    """Return a safely escaped href value or None if the URL is not allowed."""
+def _sanitize_href(url):
+    """Return a safely escaped href value or None if the URL is not allowed.
+
+    The scheme is detected with a regex on the stripped URL rather than
+    urllib.parse.urlparse: pre-gh-102153 Pythons (e.g. 3.9.x) let a leading
+    space/control character hide the scheme (" javascript:..." parses as
+    scheme=""), which browsers would still execute. Control characters are
+    rejected outright because browsers strip tab/newline inside URLs, turning
+    e.g. "/\\t/host" into a protocol-relative "//host"."""
     if url is None:
         return None
     url = url.strip()
@@ -71,15 +78,17 @@ def _safe_href(url: str):
     return html_mod.escape(url, quote=True)
 
 
-def _link_replacer(match: "re.Match[str]") -> str:
-    """Regex replacer to convert [text](url) into a safe <a> tag."""
-    label = match.group(1)
+def _link_replacer(match):
+    """Replacer for markdown links [text](url) to safe <a href="...">."""
+    link_text = match.group(1)
     raw_url = match.group(2)
-    safe_url = _safe_href(raw_url)
-    if not safe_url:
+    safe_href = _sanitize_href(raw_url)
+    if not safe_href:
         # If URL is unsafe, render just the label (already escaped) without a link.
-        return label
-    return f'<a href="{safe_url}">{label}</a>'
+        return link_text
+    # link_text has already been through _escape and any formatting regexes will
+    # operate on this string, so we can insert it as-is.
+    return f'<a href="{safe_href}">{link_text}</a>'
 
 
 def _inline(text):
@@ -108,6 +117,7 @@ def _inline(text):
         code_spans[key] = match.group(0)
         return key
 
+    # Use DOTALL so code spans containing newlines are also preserved
     text = re.sub(r'(?s)<code>.*?</code>', _store_code_span, text)
 
     # bold **text** or __text__
@@ -116,9 +126,8 @@ def _inline(text):
     # italic *text* or _text_  (but not inside words with underscores)
     text = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', r'<em>\1</em>', text)
     text = re.sub(r'(?<!\w)_(.+?)_(?!\w)', r'<em>\1</em>', text)
-    # links [text](url) with scheme validation and href escaping
-    link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
-    text = link_pattern.sub(_link_replacer, text)
+    # links [text](url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _link_replacer, text)
 
     # Restore original code spans
     for placeholder, span_html in code_spans.items():
