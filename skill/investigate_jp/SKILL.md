@@ -73,6 +73,15 @@ python3 "$STATE_PY" strategy --dir "$STATE_DIR" --hypothesis "[仮説を一行�
 
 - `--levels` はカバレッジゲートが強制する重要度レベルを定義する（medに拡大する場合は `med` も含める）。**レベルを変更すると自動導出の活動クラスタが再導出され、その判定は未判定にリセットされる**（新たにスコープ入りしたイベントを古い判定で覆い隠さないため。手動追加クラスタは維持される）。判定済みの評決がリセットされた場合はコマンドが警告を出すので、その後に再判定すること。可能ならクラスタ判定の前にレベルを確定させる
 
+**環境プロファイルを記録する**: 調査対象環境で正規に導入されている製品（EDR、バックアップ、構成管理等）や正規のサービスアカウント・保守時間帯が分かると、偽陽性判定の精度が大きく上がる。ユーザーに確認できる場合は `AskUserQuestion` で「この環境で正規導入されているセキュリティ/バックアップ/管理製品」を確認し、`state.py env` に**出所（provenance）付き**で記録する:
+
+```bash
+python3 "$STATE_PY" env --dir "$STATE_DIR" --value "Veeam Backupが全サーバーに導入済み" --category backup --status operator_confirmed --source "ユーザー回答"
+```
+
+- `--status` は3値: `operator_confirmed`（ユーザー/運用者が明言）/ `observed`（ログから観測した事実）/ `inferred`(モデルの推測)。**`inferred` の情報だけを根拠に false_positive を確定してはならない**（正常仮説として扱い、実イベントの内容で裏付ける）
+- 環境情報が得られない場合（トレーニングデータ、CTF等）は `python3 "$STATE_PY" env --dir "$STATE_DIR" --none` で「環境情報なし」を明示的に記録する（レポート付録に記載され、判定の前提が読者に伝わる）
+
 ### Step 3: 攻撃の全体像把握（並列実行）
 
 以下3つを**同時に**呼び出す:
@@ -138,6 +147,44 @@ python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch
 
 ルールタイトルはシード済みのタイトルと完全一致させる（`status` の出力またはCSVからコピー）。コマンドは残りの pending 件数を出力する。**pending = 0 になって初めてこのステップは完了**（後段のゲート G1 が強制する）。なお G1 の対象は調査対象レベルのルールのみだが、**findingに引用したルールは重要度に関わらず判定が必要**（ゲート G8）— info/lowのルールを証拠として使う場合も、この手順で判定を記録する。
 
+#### 大量イベントルールの偽陽性判定（バリアント網羅） ★重要
+
+**イベント数が20件を超えるルールを `false_positive` にする場合、1〜2件のサンプル確認では不十分**。正常イベントの山に少数の攻撃イベントが隠れ得る（例: 同じ "Proc Access" ルールにVeeamの正規アクセス数万件と攻撃者プロセスのlsassアクセス数件が混在する）。判別フィールドでGROUP BYして**全バリアントを列挙し、バリアントごとに判定**し、triageエントリの `variants` に記録する。ゲート G10 がCSVから決定論的に再集計し、宣言と完全一致することを検証する。
+
+1. バリアント列挙（例: プロセスアクセス系ルール、`detail_source` が `Details` の場合）:
+
+```sql
+SELECT Computer,
+  trim(regexp_extract(Details, 'SrcProc: ([^¦]*)', 1)) AS SrcProc,
+  trim(regexp_extract(Details, 'TgtProc: ([^¦]*)', 1)) AS TgtProc,
+  COUNT(*) AS cnt
+FROM logs WHERE RuleTitle = '[ルールタイトル]'
+GROUP BY 1, 2, 3 ORDER BY cnt DESC
+```
+
+判別フィールドの目安: プロセス実行系 = Computer + Proc/Image + Cmdline、プロセスアクセス系 = Computer + SrcProc + TgtProc、認証系 = Computer + TgtUser + LogonType、サービス/タスク系 = Computer + Svc/TaskName + Path。**PID・タイムスタンプのような毎イベント変わる値を fields に入れない**（バリアントが爆発しG10が拒否する）。コマンド引数・パス・ユーザー等のセキュリティ上重要な差を吸収するような粗いフィールド選択もしない
+
+2. 各バリアントを判定し、triageエントリに含める:
+
+```json
+{"rule_title": "[タイトル]", "verdict": "mixed", "rationale": "[根拠]",
+ "refs": [{"record_id": "[攻撃イベントのID]", "computer": "HOST-A"}], "excerpt": "[攻撃バリアントの逐語引用]",
+ "variants": {
+   "fields": ["SrcProc", "TgtProc"],
+   "groups": [
+     {"key": {"SrcProc": "C:\\Program Files\\Veeam\\veeam.exe", "TgtProc": "C:\\Windows\\system32\\lsass.exe"}, "count": 124, "verdict": "benign", "note": "正規バックアップ"},
+     {"key": {"SrcProc": "C:\\Users\\Public\\evil.exe", "TgtProc": "C:\\Windows\\system32\\lsass.exe"}, "count": 4, "verdict": "attack", "note": "資格情報アクセス"}
+   ]}}
+```
+
+ルール:
+- **全バリアントの `count` 合計 = ルールのイベント総数**（記録時に検証され、G10がCSV再集計と突合する。宣言に無いバリアントがCSVに存在してもFAIL）
+- **攻撃バリアントが1つでもあれば verdict は `mixed`**（`false_positive` は全バリアントがbenignの場合のみ）。mixed ルールの攻撃イベントは finding にも記録する（G4の対象になる）
+- 判別フィールドが全て空のバリアントは `benign` にできない（判断材料が無いため `indeterminate` にする）
+- `fields` には `Computer` 等のトップレベルカラムと、Details/AllFieldInfo 内のサブフィールド名（`detail_source` に応じた名前）の両方を使える
+- SQLの `trim` に合わせ、`key` の値は前後空白なしで記録する
+- 20件以下のルールはバリアント記録は任意（refs + excerpt のみで可）だが、複数の挙動が見える場合は同じ手順を推奨
+
 #### 検証すべき観点
 
 各ルールのDetailsから以下を確認し、**偽陽性と判断されたルールはレポートから除外する（またはセクション9の偽陽性セクションに記載する）**:
@@ -151,7 +198,7 @@ python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch
 
 #### 偽陽性の典型パターン（除外候補）
 
-以下は偽陽性として頻出するパターン。Detailsの内容が合致する場合はレポートの攻撃タイムラインから除外し、セクション9に記載する:
+以下は偽陽性として頻出するパターン。**ただしパターン一致は「正常仮説」であって確定ではない** — 実イベントの内容（パス、署名者、実行コンテキスト）で裏付け、可能なら環境プロファイル（Step 2 の `state.py env`、特に `operator_confirmed` の情報）と突合する。Detailsの内容が合致する場合はレポートの攻撃タイムラインから除外し、セクション9に記載する:
 
 - **Suspicious Service Path**: `svchost.exe -k print`（印刷サービス）、`svchost.exe -k netsvcs`（一般Windowsサービス）等の正規サービスパス
 - **LOLBAS Renamed**: 正規ツール（Elastic Winlogbeat, Velociraptor等）のリネームされたバイナリで、Description/Product が正規ベンダーを示す場合。ただし**攻撃者がツールの属性を偽装している可能性もあるため、配置パスや実行コンテキストも含めて総合判断する**
@@ -421,13 +468,13 @@ JSON入力の構造:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはexcerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト。該当ステップに戻ってギャップを解消し、再実行する
+- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack/mixed判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはexcerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト、G10 大量イベント（20件超）のfalse_positive/mixed判定にバリアント網羅証拠が無い、または宣言バリアントがCSV再集計と一致しない。該当ステップに戻ってギャップを解消し、再実行する
 - **G6 の曖昧性FAIL**: 「RecordID X is ambiguous」と出た場合、そのRecordIDは複数ホスト/チャネルの別イベントに使われている。`get_event_detail(record_id=...)` も候補一覧（status=ambiguous）を返すので、`computer`（必要なら `channel`）を指定して対象イベントを確定し、refs を修飾形式で記録し直す
 - **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告。ただし**1件もパースできなかった場合はウィンドウを手動追加するまでG3はハードFAIL**になる）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - レポート生成時もこのゲートが再実行される: `report.py` は `state_dir` を渡し忘れても出力ディレクトリ（`manifest.json` がある場所）から `$STATE_DIR` を自動検出するため、ゲートを暗黙にスキップできない
 - 不完全な調査のままの生成をユーザーが明示的に了承した場合に限り、Step 7-1 で `"force": true` を指定して先へ進んでよい。**forceで生成されたレポートは通常レポートと区別される**: ファイル名に `_UNVERIFIED` サフィックスが付き、タイトルに【未検証】が付き、先頭にFAILしたゲート一覧の警告バナーが表示される。未解決ギャップはレポート付録にも明記される
 
-収集した全データを分析し、以下の出力フォーマットに従って**日本語の**インシデント・フォレンジックレポートを生成する。ステートファイルを情報源として使うこと: セクション9の偽陽性テーブルは `rule_triage.json`（verdict=false_positive）から、判定不能リストは verdict=indeterminate から生成し、IOCセクションは `iocs.json` と整合させる。
+収集した全データを分析し、以下の出力フォーマットに従って**日本語の**インシデント・フォレンジックレポートを生成する。ステートファイルを情報源として使うこと: セクション9の偽陽性テーブルは `rule_triage.json`（verdict=false_positive、および mixed 判定ルールの benign バリアント）から、判定不能リストは verdict=indeterminate から生成し、IOCセクションは `iocs.json` と整合させる。mixed 判定ルールは攻撃バリアントをタイムライン・findingに、benignバリアントをセクション9に分けて記載する（全体を攻撃としても偽陽性としても扱わない）。
 
 #### ファイル出力
 

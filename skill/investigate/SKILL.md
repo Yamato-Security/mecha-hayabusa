@@ -73,6 +73,15 @@ python3 "$STATE_PY" strategy --dir "$STATE_DIR" --hypothesis "[one-line hypothes
 
 - `--levels` defines which severity levels the coverage gates enforce (e.g., pass `med` too when expanding to med). **Changing levels re-derives the auto-derived activity clusters and resets their verdicts to unjudged** (newly in-scope events must not be masked by an old verdict; manually added clusters are kept). The command warns when judged verdicts were reset — re-judge the clusters afterwards, so decide the levels before judging clusters when possible
 
+**Record the environment profile**: knowing which products (EDR, backup, configuration management, ...) are legitimately deployed in the environment — and which service accounts and maintenance windows are approved — sharply improves false-positive triage. When the user can be asked, use `AskUserQuestion` for "which security/backup/management products are legitimately deployed here" and record the answers with `state.py env`, **with provenance**:
+
+```bash
+python3 "$STATE_PY" env --dir "$STATE_DIR" --value "Veeam Backup deployed on all servers" --category backup --status operator_confirmed --source "user statement"
+```
+
+- `--status` is one of: `operator_confirmed` (the user/operator stated it) / `observed` (seen in the logs) / `inferred` (model assumption). **Never settle a false_positive verdict on `inferred` information alone** — treat it as a benign hypothesis to be backed by the actual event content
+- When no environment information is available (training data, CTFs, ...), declare that explicitly with `python3 "$STATE_PY" env --dir "$STATE_DIR" --none` (it is printed in the report appendix so readers know the verdicts' premises)
+
 ### Step 3: Establish Attack Overview (Parallel Execution)
 
 Call the following 3 **simultaneously**:
@@ -138,6 +147,44 @@ python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch
 
 Rule titles must match the seeded titles exactly (copy from `status` output or the CSV). The command reports the remaining pending count. **This step is complete only when pending = 0** (enforced later by gate G1). Note that G1 only covers rules at the investigated levels, but **any rule cited by a finding needs a verdict regardless of level** (gate G8) — when you use info/low rules as evidence, triage them here too.
 
+#### False-positive verdicts on high-volume rules (variant coverage) — critical
+
+**Sampling 1-2 events is NOT sufficient to mark a rule with more than 20 events `false_positive`.** A few attack events can hide inside a mountain of benign ones (e.g. the same "Proc Access" rule carrying tens of thousands of legitimate Veeam accesses plus a handful of attacker lsass accesses). GROUP BY the discriminating fields, **enumerate ALL behavior variants, judge each variant**, and record them in the triage entry's `variants`. Gate G10 recounts the declared variants deterministically from the CSV and fails on any mismatch.
+
+1. Enumerate the variants (example for a process-access rule, `detail_source` = `Details`):
+
+```sql
+SELECT Computer,
+  trim(regexp_extract(Details, 'SrcProc: ([^¦]*)', 1)) AS SrcProc,
+  trim(regexp_extract(Details, 'TgtProc: ([^¦]*)', 1)) AS TgtProc,
+  COUNT(*) AS cnt
+FROM logs WHERE RuleTitle = '[rule title]'
+GROUP BY 1, 2, 3 ORDER BY cnt DESC
+```
+
+Discriminating-field guidance: process execution = Computer + Proc/Image + Cmdline; process access = Computer + SrcProc + TgtProc; authentication = Computer + TgtUser + LogonType; services/tasks = Computer + Svc/TaskName + Path. **Never put per-event values (PIDs, timestamps) into fields** (the variant space explodes and G10 rejects it), and never pick fields so coarse that they erase security-relevant differences (command arguments, paths, users)
+
+2. Judge every variant and include them in the triage entry:
+
+```json
+{"rule_title": "[title]", "verdict": "mixed", "rationale": "[why]",
+ "refs": [{"record_id": "[attack event ID]", "computer": "HOST-A"}], "excerpt": "[verbatim quote of the attack variant]",
+ "variants": {
+   "fields": ["SrcProc", "TgtProc"],
+   "groups": [
+     {"key": {"SrcProc": "C:\\Program Files\\Veeam\\veeam.exe", "TgtProc": "C:\\Windows\\system32\\lsass.exe"}, "count": 124, "verdict": "benign", "note": "legitimate backup"},
+     {"key": {"SrcProc": "C:\\Users\\Public\\evil.exe", "TgtProc": "C:\\Windows\\system32\\lsass.exe"}, "count": 4, "verdict": "attack", "note": "credential access"}
+   ]}}
+```
+
+Rules:
+- **The variant `count`s must sum to the rule's total event count** (checked at entry time, and G10 recounts every group against the CSV — a dataset variant missing from the declaration also FAILs)
+- **Any attack variant makes the verdict `mixed`** (`false_positive` is only for all-benign variants). Record the attack events of a mixed rule as findings too (they fall under G4)
+- A variant whose grouping fields are all empty can never be `benign` (nothing to base benignity on — judge it `indeterminate`)
+- `fields` may mix top-level columns (`Computer`, ...) and detail subfield names (per the `detail_source` naming)
+- Record `key` values without leading/trailing whitespace, matching the SQL `trim`
+- Rules with ≤20 events may skip `variants` (refs + excerpt suffice), but use the same procedure when several behaviors are visible
+
 #### Verification Criteria
 
 Check the following from each rule's Details. **Rules determined to be false positives should be excluded from the report (or listed in Section 9's false positive section)**:
@@ -151,7 +198,7 @@ Check the following from each rule's Details. **Rules determined to be false pos
 
 #### Common False Positive Patterns (Exclusion Candidates)
 
-The following are frequently occurring false positive patterns. If Details content matches, exclude from the attack timeline and list in Section 9:
+The following are frequently occurring false positive patterns. **A pattern match is a benign HYPOTHESIS, not a verdict** — back it with the actual event content (paths, signer, execution context) and, when available, with the environment profile (Step 2's `state.py env`, especially `operator_confirmed` entries). If Details content matches, exclude from the attack timeline and list in Section 9:
 
 - **Suspicious Service Path**: Legitimate service paths like `svchost.exe -k print` (print service), `svchost.exe -k netsvcs` (general Windows service)
 - **LOLBAS Renamed**: Renamed binaries of legitimate tools (Elastic Winlogbeat, Velociraptor, etc.) where Description/Product indicates a legitimate vendor. However, **attackers may also spoof tool attributes, so make a comprehensive judgment including deployment path and execution context**
@@ -419,13 +466,13 @@ Run the coverage check and make it PASS before assembling the report:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs, or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event. Go back to the corresponding step, close the gaps, and re-run
+- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack/mixed-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs, or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event, G10 false_positive/mixed verdicts over high-volume rules (>20 events) without variant evidence, or declared variants that do not match the CSV recount. Go back to the corresponding step, close the gaps, and re-run
 - **G6 ambiguity FAIL**: "RecordID X is ambiguous" means that RecordID denotes different events on several hosts/channels. `get_event_detail(record_id=...)` returns the candidate list too (status=ambiguous); pass `computer` (and `channel` if needed) to pin the event, then re-record the refs in qualified form
 - **G3 timestamp warning**: if the G3 detail warns that some rows have unparseable Timestamps, they were excluded from the auto-derived clusters (this is a visible warning, not a failure; when NO timestamps parsed at all, G3 hard-fails until windows are added). If you know a distinct activity wave was missed, add it manually and judge it: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - Report generation also re-runs this gate: `report.py` auto-detects `$STATE_DIR` from the output directory (where `manifest.json` sits) even if you forget to pass `state_dir`, so the gate cannot be silently skipped
 - Only if the user explicitly accepts an incomplete investigation may you proceed with `"force": true` in Step 7-1. **A forced report is made visibly distinct from a certified one**: the filename gets an `_UNVERIFIED` suffix, the title gets an `[UNVERIFIED]` prefix, and a warning banner listing the failing gates is placed at the top. The unresolved gaps are also printed in the report appendix
 
-Analyze all collected data and generate an **English** incident forensic report following the output format below. Use the state files as the source of truth: Section 9's false positive table comes from `rule_triage.json` (verdict=false_positive), the indeterminate list from verdict=indeterminate, and the IOC section should be consistent with `iocs.json`.
+Analyze all collected data and generate an **English** incident forensic report following the output format below. Use the state files as the source of truth: Section 9's false positive table comes from `rule_triage.json` (verdict=false_positive, plus the benign variants of mixed-verdict rules), the indeterminate list from verdict=indeterminate, and the IOC section should be consistent with `iocs.json`. A mixed-verdict rule splits: its attack variants go to the timeline/findings, its benign variants to Section 9 (never treat the whole rule as either attack or false positive).
 
 #### File Output
 

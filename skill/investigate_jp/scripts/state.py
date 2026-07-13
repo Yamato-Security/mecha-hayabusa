@@ -15,6 +15,7 @@ State directory layout:
   findings.json     confirmed attack findings with evidence refs
   iocs.json         extracted IOCs with source refs
   hosts.json        per-host investigation coverage
+  environment.json  known-good products/accounts with provenance
   queries.jsonl     audit log of executed queries (query_hash, has_more)
 
 Evidence refs:
@@ -32,6 +33,7 @@ Commands (all stdlib, no external dependencies):
   ioc       record an IOC (or --batch from stdin)
   host      record host investigation coverage (or --batch from stdin)
   cluster   record a verdict for an activity cluster
+  env       record environment facts with provenance (or --none / --list)
   log-query append a query audit entry (tracks unresolved has_more)
   status    human-readable progress summary (for resuming)
   check     run coverage gates; exit 0 = PASS, 1 = FAIL
@@ -54,10 +56,27 @@ csv.field_size_limit(1 << 30)
 
 STATE_VERSION = 1
 LEVELS = ("crit", "high", "med", "low", "info")
-TRIAGE_VERDICTS = ("attack", "false_positive", "indeterminate")
+# "mixed" = the same rule matched both benign and attack events; the split is
+# recorded per behavior variant (see "variants" below) instead of forcing an
+# all-or-nothing verdict over thousands of events.
+TRIAGE_VERDICTS = ("attack", "false_positive", "indeterminate", "mixed")
+VARIANT_VERDICTS = ("benign", "attack", "indeterminate")
 CLUSTER_VERDICTS = ("attack", "benign", "indeterminate")
 HOST_STATUSES = ("investigated", "reviewed", "not_applicable")
 DEFAULT_CLUSTER_GAP_DAYS = 7
+
+# A false_positive / mixed verdict on a rule with more events than this must
+# enumerate the rule's behavior variants (GROUP BY over discriminating fields)
+# and judge every variant — sampling 1-2 events and writing off the rest is
+# exactly how real attacks hide inside noisy rules. Gate G10 recounts the
+# declared variants against the CSV.
+VARIANT_EVIDENCE_THRESHOLD = 20
+# Distinct variant keys tracked per rule during the recount; beyond this the
+# chosen fields are too unstable to be a meaningful grouping.
+VARIANT_GROUPS_CAP = 2000
+
+# Hayabusa detail-field separator (" ¦ ", broken bar U+00A6).
+DETAILS_SEPARATOR = " ¦ "
 
 # Rationales that carry no information get rejected at record time: an
 # unauditable verdict ("reviewed") over thousands of events is exactly the
@@ -79,6 +98,9 @@ FINDINGS = "findings.json"
 IOCS = "iocs.json"
 HOSTS = "hosts.json"
 QUERIES = "queries.jsonl"
+ENVIRONMENT = "environment.json"
+
+ENV_STATUSES = ("operator_confirmed", "observed", "inferred")
 
 TS_FORMATS = (
     "%Y-%m-%d %H:%M:%S.%f %z",
@@ -144,6 +166,18 @@ def _load(state_dir: str, name: str):
             return json.load(f)
     except FileNotFoundError:
         _fail(f"{name} not found in {state_dir}. Run 'state.py init' first.")
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        _fail(f"{name} could not be read: {exc}")
+
+
+def _load_optional(state_dir: str, name: str, default):
+    """Like _load, but a missing file returns the default instead of failing —
+    for files newer than the state dir (e.g. environment.json on v1 states)."""
+    try:
+        with open(_path(state_dir, name), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         _fail(f"{name} could not be read: {exc}")
 
@@ -218,6 +252,29 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _parse_detail_fields(detail: str) -> dict:
+    """Split a Hayabusa detail string ('Key: Value ¦ Key: Value') into a dict."""
+    fields: dict[str, str] = {}
+    for pair in detail.split(DETAILS_SEPARATOR):
+        if ": " in pair:
+            key, value = pair.split(": ", 1)
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def _variant_key(row: dict, detail_fields: dict, fields: list) -> tuple:
+    """Value tuple for the declared grouping fields: top-level CSV columns
+    (Computer, Channel, EventID, ...) are read from the row, anything else from
+    the parsed detail string. Missing fields become ''."""
+    values = []
+    for field in fields:
+        if field in row and row.get(field) is not None:
+            values.append(str(row.get(field) or "").strip())
+        else:
+            values.append(detail_fields.get(field, ""))
+    return tuple(values)
+
+
 class DatasetFacts:
     """Single-pass summary of the CSV used to seed and verify state."""
 
@@ -234,10 +291,19 @@ class DatasetFacts:
         # gates resolve a ref to concrete rows and detect duplicated RecordIDs.
         self.cited_rows: dict[str, list[dict]] = {}
         self.cited_rows_truncated: set[str] = set()
+        # rule title -> {variant key tuple: count} recomputed from the CSV for
+        # the rules that declared variant evidence (gate G10).
+        self.variant_counts: dict[str, dict[tuple, int]] = {}
+        self.variant_overflow: set[str] = set()
 
 
-def scan_csv(csv_path: str, cited_ids: "set[str] | None" = None) -> DatasetFacts:
+def scan_csv(
+    csv_path: str,
+    cited_ids: "set[str] | None" = None,
+    variant_specs: "dict[str, list] | None" = None,
+) -> DatasetFacts:
     cited_ids = cited_ids or set()
+    variant_specs = variant_specs or {}
     facts = DatasetFacts()
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -248,9 +314,18 @@ def scan_csv(csv_path: str, cited_ids: "set[str] | None" = None) -> DatasetFacts
             title = (row.get("RuleTitle") or "").strip()
             host = (row.get("Computer") or "").strip()
             record_id = (row.get("RecordID") or "").strip()
+            detail = (row.get("Details") or row.get("AllFieldInfo") or "").strip()
             if title:
                 facts.rules.setdefault(title, {}).setdefault(level, 0)
                 facts.rules[title][level] += 1
+                spec = variant_specs.get(title)
+                if spec is not None and title not in facts.variant_overflow:
+                    counts = facts.variant_counts.setdefault(title, {})
+                    key = _variant_key(row, _parse_detail_fields(detail), spec)
+                    if key in counts or len(counts) < VARIANT_GROUPS_CAP:
+                        counts[key] = counts.get(key, 0) + 1
+                    else:
+                        facts.variant_overflow.add(title)
             if host:
                 facts.hosts.setdefault(host, {}).setdefault(level, 0)
                 facts.hosts[host][level] += 1
@@ -263,7 +338,7 @@ def scan_csv(csv_path: str, cited_ids: "set[str] | None" = None) -> DatasetFacts
                             "computer": host,
                             "channel": (row.get("Channel") or "").strip(),
                             "rule_title": title,
-                            "detail": (row.get("Details") or row.get("AllFieldInfo") or "").strip(),
+                            "detail": detail,
                         })
                     else:
                         facts.cited_rows_truncated.add(record_id)
@@ -387,6 +462,7 @@ def cmd_init(args) -> None:
             "verdict": None,
             "rationale": "",
             "evidence": {"refs": [], "record_ids": [], "detail_excerpt": ""},
+            "variants": None,
             "verified_at": None,
         })
 
@@ -398,6 +474,7 @@ def cmd_init(args) -> None:
     _save(state_dir, FINDINGS, {"findings": []})
     _save(state_dir, IOCS, {"iocs": []})
     _save(state_dir, HOSTS, {"hosts": []})
+    _save(state_dir, ENVIRONMENT, {"entries": [], "declared_no_info": False})
     # Truncate: a re-init after an interrupted run must not inherit stale
     # query-log entries (they would resurface as phantom G5 failures).
     open(_path(state_dir, QUERIES), "w", encoding="utf-8").close()
@@ -530,20 +607,40 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
             )
         excerpt = entry.get("excerpt")
         excerpt_text = ("" if excerpt is None else str(excerpt)).strip()[:2000]
-        if verdict == "false_positive" and has_detail_col and not excerpt_text:
+        if verdict in ("false_positive", "mixed") and has_detail_col and not excerpt_text:
             _fail(
-                f"excerpt is required for a 'false_positive' verdict on {title!r}: quote"
+                f"excerpt is required for a {verdict!r} verdict on {title!r}: quote"
                 " the cited event's detail field VERBATIM (contiguous substring, no"
                 " ellipsis) showing why it is benign. Gate G6 verifies the quote against"
                 " the actual row, so a paraphrase will fail."
             )
         rule = by_title[title]
+        variants_raw = entry.get("variants")
+        if verdict == "mixed" and variants_raw is None:
+            _fail(
+                f"verdict 'mixed' on {title!r} requires variants: enumerate the rule's"
+                " behavior variants (GROUP BY over discriminating fields) and judge"
+                " each one benign/attack/indeterminate, so the attack part is explicit"
+            )
+        if (verdict == "false_positive" and variants_raw is None
+                and rule["count"] > VARIANT_EVIDENCE_THRESHOLD):
+            _fail(
+                f"a false_positive verdict on {title!r} covers {rule['count']} events:"
+                " sampling is not sufficient evidence at this volume (gate G10)."
+                " Enumerate ALL behavior variants with a GROUP BY over the"
+                " discriminating fields (e.g. Computer + SrcProc + TgtProc), judge each"
+                " variant, and record them in 'variants' — or use 'mixed'/'indeterminate'"
+            )
+        variants = None
+        if variants_raw is not None:
+            variants = _validate_variants(variants_raw, title, verdict, rule["count"])
         rule["status"] = "verified"
         rule["verdict"] = verdict
         rule["rationale"] = rationale
         rule["evidence"]["refs"] = refs
         rule["evidence"]["record_ids"] = [r["record_id"] for r in refs]
         rule["evidence"]["detail_excerpt"] = excerpt_text
+        rule["variants"] = variants
         rule["verified_at"] = _now()
     _save(state_dir, RULE_TRIAGE, triage)
     pending_all = [rule for rule in triage["rules"] if rule["status"] == "pending"]
@@ -663,6 +760,95 @@ def _require_substantive_rationale(rationale: str, context: str) -> None:
             " event data justifies the verdict (fields, values, execution context),"
             " so reviewers can re-evaluate it"
         )
+
+
+def _validate_variants(raw, title: str, verdict: str, rule_count: int) -> dict:
+    """
+    Validate a triage entry's behavior-variant evidence:
+      {"fields": ["Computer", "SrcProc", ...],
+       "groups": [{"key": {field: value, ...}, "count": N,
+                   "verdict": "benign|attack|indeterminate", "note": "..."}]}
+
+    Every event of the rule must fall into exactly one declared group (the sum
+    of counts must equal the rule's event count; gate G10 recounts each group
+    against the CSV), so a benign sample can no longer write off the events
+    that were never looked at.
+    """
+    if not isinstance(raw, dict):
+        _fail(f"variants for {title!r} must be an object with 'fields' and 'groups'")
+    fields = raw.get("fields")
+    groups = raw.get("groups")
+    if not isinstance(fields, list) or not fields or not all(isinstance(f, str) and f.strip() for f in fields):
+        _fail(f"variants.fields for {title!r} must be a non-empty list of field names")
+    fields = [f.strip() for f in fields]
+    if not isinstance(groups, list) or not groups:
+        _fail(f"variants.groups for {title!r} must be a non-empty list")
+    if len(groups) > VARIANT_GROUPS_CAP:
+        _fail(
+            f"variants for {title!r} declare {len(groups)} groups (cap {VARIANT_GROUPS_CAP}):"
+            " the chosen fields are too unstable to be a meaningful grouping —"
+            " drop per-event fields (timestamps, PIDs, ...) from variants.fields"
+        )
+    normalized_groups = []
+    seen_keys = set()
+    total = 0
+    attack_groups = 0
+    benign_groups = 0
+    for i, group in enumerate(groups):
+        if not isinstance(group, dict):
+            _fail(f"variants.groups[{i}] for {title!r} must be an object")
+        key = group.get("key")
+        if not isinstance(key, dict) or set(key.keys()) != set(fields):
+            _fail(
+                f"variants.groups[{i}].key for {title!r} must contain exactly the"
+                f" declared fields {fields}"
+            )
+        norm_key = {f: str(key[f] if key[f] is not None else "").strip() for f in fields}
+        key_tuple = tuple(norm_key[f] for f in fields)
+        if key_tuple in seen_keys:
+            _fail(f"variants.groups[{i}] for {title!r} duplicates key {norm_key}")
+        seen_keys.add(key_tuple)
+        count = group.get("count")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            _fail(f"variants.groups[{i}].count for {title!r} must be a positive integer")
+        group_verdict = (group.get("verdict") or "").strip()
+        if group_verdict not in VARIANT_VERDICTS:
+            _fail(
+                f"variants.groups[{i}].verdict for {title!r} must be one of:"
+                f" {', '.join(VARIANT_VERDICTS)}"
+            )
+        if group_verdict == "benign" and all(v == "" for v in key_tuple):
+            _fail(
+                f"variants.groups[{i}] for {title!r}: an empty-detail variant cannot be"
+                " judged benign — there is nothing to base benignity on; use"
+                " 'indeterminate' for events whose grouping fields are all empty"
+            )
+        total += count
+        attack_groups += 1 if group_verdict == "attack" else 0
+        benign_groups += 1 if group_verdict == "benign" else 0
+        normalized_groups.append({
+            "key": norm_key,
+            "count": count,
+            "verdict": group_verdict,
+            "note": str(group.get("note") or "").strip(),
+        })
+    if total != rule_count:
+        _fail(
+            f"variants for {title!r} cover {total} events but the rule has"
+            f" {rule_count}: every event must belong to exactly one group —"
+            " re-run the GROUP BY and include ALL variants"
+        )
+    if verdict == "false_positive" and attack_groups:
+        _fail(
+            f"verdict for {title!r} is false_positive but variants contain"
+            " attack group(s) — use verdict 'mixed'"
+        )
+    if verdict == "mixed" and not attack_groups:
+        _fail(
+            f"verdict for {title!r} is mixed but no variant group is judged"
+            " 'attack' — use false_positive/indeterminate instead"
+        )
+    return {"fields": fields, "groups": normalized_groups}
 
 
 def _normalize_hosts(value) -> list[str]:
@@ -914,6 +1100,54 @@ def cmd_cluster(args) -> None:
     print(f"cluster {args.id} ({target['start']} ~ {target['end']}) -> {args.verdict}")
 
 
+def cmd_env(args) -> None:
+    """Record environment facts (legitimately deployed products, approved
+    accounts, maintenance windows) with provenance, so false-positive
+    rationales can cite them instead of relying on the model's general
+    knowledge. 'inferred' entries alone must not settle a verdict."""
+    _require_initialized(args.dir)
+    env = _load_optional(args.dir, ENVIRONMENT, {"entries": [], "declared_no_info": False})
+    if args.none:
+        env["declared_no_info"] = True
+        _save(args.dir, ENVIRONMENT, env)
+        print("recorded: no environment information available for this investigation")
+        return
+    if args.list:
+        if env.get("declared_no_info"):
+            print("declared: no environment information available")
+        entries = env.get("entries") or []
+        if not entries:
+            print("no environment entries recorded")
+        for e in entries:
+            line = f"  [{e.get('status')}] {e.get('category') or '-'}: {e.get('value')}"
+            if e.get("source"):
+                line += f" (source: {e['source']})"
+            if e.get("note"):
+                line += f" — {e['note']}"
+            print(line)
+        return
+    if not args.value.strip():
+        _fail("env requires --value (to add an entry), or --none / --list")
+    status = (args.status or "").strip()
+    if status not in ENV_STATUSES:
+        _fail(
+            f"--status must be one of: {', '.join(ENV_STATUSES)}"
+            " (operator_confirmed = the user/operator stated it;"
+            " observed = seen in the logs; inferred = model assumption)"
+        )
+    env["entries"].append({
+        "value": args.value.strip(),
+        "category": (args.category or "").strip(),
+        "status": status,
+        "source": (args.source or "").strip(),
+        "note": (args.note or "").strip(),
+        "recorded_at": _now(),
+    })
+    env["declared_no_info"] = False
+    _save(args.dir, ENVIRONMENT, env)
+    print(f"recorded environment entry ({status}): {args.value.strip()}")
+
+
 def cmd_log_query(args) -> None:
     _require_initialized(args.dir)
     entry = {
@@ -1067,7 +1301,12 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                  "sha256 matches manifest" if matches else "CSV changed since init (sha256 mismatch)")
         else:
             gate("G0", "dataset integrity", True, "hash verification skipped")
-        facts = scan_csv(csv_path, cited_ids=cited_ids)
+        variant_specs = {
+            r["rule_title"]: r["variants"]["fields"]
+            for r in triage["rules"]
+            if isinstance(r.get("variants"), dict) and r["variants"].get("fields")
+        }
+        facts = scan_csv(csv_path, cited_ids=cited_ids, variant_specs=variant_specs)
 
     # G1: rule triage coverage at investigated levels
     gate_rules = [r for r in triage["rules"] if set(r["levels"]) & set(levels)]
@@ -1123,14 +1362,16 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
             detail += f"; WARNING: {unparsed}/{ts_total} rows have unparseable Timestamps, excluded from clusters"
         gate("G3", "activity cluster coverage", not unjudged, detail, unjudged)
 
-    # G4: every attack-verdict rule is referenced by at least one finding
-    attack_rules = {r["rule_title"] for r in triage["rules"] if r["verdict"] == "attack"}
+    # G4: every attack- or mixed-verdict rule is referenced by at least one
+    # finding (a mixed rule contains confirmed attack events, so it needs a
+    # finding for its attack part just like a pure attack rule).
+    attack_rules = {r["rule_title"] for r in triage["rules"] if r["verdict"] in ("attack", "mixed")}
     referenced = set()
     for finding in findings["findings"]:
         referenced.update(finding.get("rule_titles") or [])
     unreferenced = sorted(attack_rules - referenced)
     gate("G4", "attack rules linked to findings", not unreferenced,
-         f"{len(attack_rules) - len(unreferenced)}/{len(attack_rules)} attack-verdict rules referenced by findings",
+         f"{len(attack_rules) - len(unreferenced)}/{len(attack_rules)} attack/mixed-verdict rules referenced by findings",
          unreferenced)
 
     # G5: no silently truncated tool results. See _unresolved_truncations for
@@ -1316,6 +1557,76 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     else:
         gate("G9", "finding hosts backed by evidence", True, "skipped (no RecordID/Computer column)")
 
+    # G10: a false_positive/mixed verdict over a high-volume rule must carry
+    # complete behavior-variant evidence, and the declared variants are
+    # recounted against the CSV: every declared group's count must match the
+    # dataset, no dataset variant may be left unjudged, and empty-detail
+    # variants can never be benign. This makes "sampled 2 events, excluded
+    # 39,582" structurally impossible.
+    g10_gaps: list[str] = []
+    recounted = 0
+    for r in triage["rules"]:
+        verdict = r["verdict"]
+        if verdict not in ("false_positive", "mixed"):
+            continue
+        variants = r.get("variants")
+        title = r["rule_title"]
+        if not variants:
+            if r["count"] > VARIANT_EVIDENCE_THRESHOLD:
+                g10_gaps.append(
+                    f"rule {title}: {verdict} over {r['count']} events without variant"
+                    " evidence — enumerate and judge every behavior variant (GROUP BY)"
+                )
+            continue
+        groups = variants.get("groups") or []
+        fields = variants.get("fields") or []
+        attack_groups = sum(1 for g in groups if g.get("verdict") == "attack")
+        if verdict == "false_positive" and attack_groups:
+            g10_gaps.append(f"rule {title}: false_positive but variants contain attack group(s) — use 'mixed'")
+        if verdict == "mixed" and not attack_groups:
+            g10_gaps.append(f"rule {title}: mixed but no variant group is judged 'attack'")
+        for g in groups:
+            if (g.get("verdict") == "benign"
+                    and all(str(v or "").strip() == "" for v in (g.get("key") or {}).values())):
+                g10_gaps.append(
+                    f"rule {title}: empty-detail variant judged benign — nothing to base"
+                    " benignity on; judge it indeterminate"
+                )
+        if facts is None:
+            continue
+        recounted += 1
+        if title in facts.variant_overflow:
+            g10_gaps.append(
+                f"rule {title}: more than {VARIANT_GROUPS_CAP} distinct variants for"
+                f" fields {fields} — choose more stable grouping fields"
+            )
+            continue
+        actual = facts.variant_counts.get(title, {})
+        declared: dict[tuple, int] = {}
+        for g in groups:
+            key = tuple(str((g.get("key") or {}).get(f, "") or "").strip() for f in fields)
+            declared[key] = declared.get(key, 0) + int(g.get("count") or 0)
+        for key in sorted(declared):
+            actual_count = actual.get(key)
+            label = ", ".join(f"{f}={v!r}" for f, v in zip(fields, key))
+            if actual_count is None:
+                g10_gaps.append(f"rule {title}: declared variant ({label}) does not exist in the dataset")
+            elif actual_count != declared[key]:
+                g10_gaps.append(
+                    f"rule {title}: variant ({label}) declared {declared[key]} events"
+                    f" but the dataset has {actual_count}"
+                )
+        for key in sorted(set(actual) - set(declared)):
+            label = ", ".join(f"{f}={v!r}" for f, v in zip(fields, key))
+            g10_gaps.append(
+                f"rule {title}: dataset variant ({label}, {actual[key]} events) is not"
+                " judged — every variant needs a verdict"
+            )
+    g10_detail = f"{recounted} rule(s) with variant evidence recounted against the dataset"
+    if facts is None:
+        g10_detail = "structural checks only (dataset unavailable)"
+    gate("G10", "variant coverage for high-volume verdicts", not g10_gaps, g10_detail, g10_gaps[:50])
+
     return {
         "ok": all(g["status"] == "PASS" for g in gates),
         "checked_at": _now(),
@@ -1424,9 +1735,13 @@ APPENDIX_LABELS = {
         "verdict_attack": "attack",
         "verdict_fp": "false positive",
         "verdict_ind": "indeterminate",
+        "verdict_mixed": "mixed",
         "pending_breakdown": "{in_scope} at investigated levels / {out_scope} at out-of-scope levels",
         "unresolved": "Unresolved coverage gaps",
         "state_files": "Machine-readable state files",
+        "environment": "Environment profile",
+        "env_none": "none available (explicitly declared by the operator)",
+        "env_missing": "not recorded",
     },
     "ja": {
         "title": "## 付録: カバレッジと再現性",
@@ -1439,9 +1754,13 @@ APPENDIX_LABELS = {
         "verdict_attack": "攻撃",
         "verdict_fp": "偽陽性",
         "verdict_ind": "判定不能",
+        "verdict_mixed": "混在",
         "pending_breakdown": "調査対象レベル: {in_scope} / 対象外レベル: {out_scope}",
         "unresolved": "未解決のカバレッジギャップ",
         "state_files": "機械可読ステートファイル",
+        "environment": "環境プロファイル",
+        "env_none": "情報なし（オペレーターが明示的に申告）",
+        "env_missing": "未記録",
     },
 }
 
@@ -1461,7 +1780,7 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
     sha_disp = (ds_sha[:16] + "...") if ds_sha else "(unknown)"
     ds_rows = dataset.get("row_count", "?")
     ds_detail = dataset.get("detail_source", "?")
-    verdicts = {"attack": 0, "false_positive": 0, "indeterminate": 0, "pending": 0}
+    verdicts = {"attack": 0, "false_positive": 0, "indeterminate": 0, "mixed": 0, "pending": 0}
     # Split pending by scope: rules at out-of-scope levels legitimately stay
     # pending under G1, so a bare "pending: N" right next to "G1 PASS" reads as
     # a contradiction unless the breakdown is shown.
@@ -1492,6 +1811,7 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
         f"- **{labels['triage_summary']}**: "
         f"{labels['verdict_attack']}: {verdicts['attack']} / "
         f"{labels['verdict_fp']}: {verdicts['false_positive']} / "
+        f"{labels['verdict_mixed']}: {verdicts['mixed']} / "
         f"{labels['verdict_ind']}: {verdicts['indeterminate']} / "
         f"pending: {verdicts['pending']}{pending_note}",
         "",
@@ -1508,10 +1828,23 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
             for gap in g["gaps"][:10]:
                 lines.append(f"- {g['id']}: {gap}")
 
+    env = _load_optional(state_dir, ENVIRONMENT, None)
+    if env is None or not isinstance(env, dict):
+        env_line = labels["env_missing"]
+    elif env.get("entries"):
+        entries = env["entries"]
+        parts = [f"{e.get('value')} ({e.get('status')})" for e in entries[:10]]
+        env_line = "; ".join(parts) + (" ..." if len(entries) > 10 else "")
+    elif env.get("declared_no_info"):
+        env_line = labels["env_none"]
+    else:
+        env_line = labels["env_missing"]
+    lines += ["", f"- **{labels['environment']}**: {env_line}"]
+
     lines += [
         "",
         f"- **{labels['state_files']}**: `manifest.json`, `rule_triage.json`, `clusters.json`, "
-        "`findings.json`, `iocs.json`, `hosts.json`, `queries.jsonl`",
+        "`findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `queries.jsonl`",
     ]
     return "\n".join(lines)
 
@@ -1601,6 +1934,17 @@ def build_parser() -> argparse.ArgumentParser:
     # default None so omitting --note on a re-judge preserves the existing note
     p.add_argument("--note", default=None)
     p.set_defaults(func=cmd_cluster)
+
+    p = sub.add_parser("env", help="record environment facts with provenance (or --none / --list)")
+    p.add_argument("--dir", required=True)
+    p.add_argument("--value", default="", help="the fact, e.g. 'Veeam Backup is deployed on all servers'")
+    p.add_argument("--category", default="", help="edr / backup / monitoring / config-mgmt / account / maintenance / other")
+    p.add_argument("--status", default="", help="provenance: operator_confirmed | observed | inferred")
+    p.add_argument("--source", default="", help="origin (user statement, CMDB id, log observation)")
+    p.add_argument("--note", default="")
+    p.add_argument("--none", action="store_true", help="declare that no environment information is available")
+    p.add_argument("--list", action="store_true", help="print recorded entries")
+    p.set_defaults(func=cmd_env)
 
     p = sub.add_parser("log-query", help="append a query audit entry")
     p.add_argument("--dir", required=True)
