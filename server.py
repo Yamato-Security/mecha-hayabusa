@@ -1059,16 +1059,35 @@ def run_sql(
     ))
 
 
+# Rows fetched per RecordID to detect duplicated IDs. One event yields one row
+# per matching Sigma rule, and a duplicated RecordID spans a handful of events;
+# 200 rows is far above both.
+EVENT_DETAIL_SCAN_LIMIT = 200
+
+
 @app.tool()
 def get_event_detail(
     record_id: str = "",
+    computer: str = "",
+    channel: str = "",
+    rule_title: str = "",
     sql_filter: str = "",
 ):
     """
     Expands all fields of a single event in Field/Value format and returns them.
 
+    RecordIDs are NOT globally unique: the same value can denote different
+    events on different hosts/channels. When record_id alone matches multiple
+    events, this returns status="ambiguous" with one candidate row per event —
+    call again with computer (and channel) to select one.
+
     Parameters:
-        record_id (str): Specify by RecordID (mutually exclusive)
+        record_id (str): Specify by RecordID (mutually exclusive with sql_filter)
+        computer (str): Narrow record_id to this exact Computer value
+        channel (str): Narrow record_id further to this exact Channel value
+        rule_title (str): When several rules matched the same event, return that
+                          rule's row (exact match). Otherwise the first row is
+                          returned and _MatchedRuleTitles lists the others
         sql_filter (str): Specify by SQL condition equivalent to WHERE clause (mutually exclusive).
                           Example: "Level = 'crit'" -> SELECT * FROM logs WHERE Level = 'crit' LIMIT 1
     """
@@ -1078,11 +1097,67 @@ def get_event_detail(
         raise ValueError("record_id and sql_filter cannot be specified at the same time. Please specify one or the other.")
     if not record_id.strip() and not sql_filter.strip():
         raise ValueError("Please specify either record_id or sql_filter.")
+    if sql_filter.strip() and (computer.strip() or channel.strip() or rule_title.strip()):
+        raise ValueError(
+            "computer/channel/rule_title can only be combined with record_id."
+            " Put the condition inside sql_filter instead."
+        )
 
     if record_id.strip():
         _ensure_columns_exist(["RecordID"], context="get_event_detail")
-        fetch_sql = f'SELECT * FROM logs WHERE "RecordID" = ? LIMIT 1'
-        row_df = repo.query_dataframe(fetch_sql, [record_id.strip()])
+        columns = _get_logs_columns()
+        conditions = ['"RecordID" = ?']
+        params: list[object] = [record_id.strip()]
+        for column_name, value in (("Computer", computer), ("Channel", channel), ("RuleTitle", rule_title)):
+            if value.strip():
+                _ensure_columns_exist([column_name], context="get_event_detail")
+                conditions.append(f'{_quote_identifier(column_name)} = ?')
+                params.append(value.strip())
+        order_parts = [
+            f'{_quote_identifier(c)} ASC'
+            for c in ("Computer", "Channel", "RuleTitle", "Timestamp")
+            if c in columns
+        ]
+        order_expr = f" ORDER BY {', '.join(order_parts)}" if order_parts else ""
+        fetch_sql = (
+            f'SELECT * FROM logs WHERE {" AND ".join(conditions)}'
+            f'{order_expr} LIMIT {EVENT_DETAIL_SCAN_LIMIT}'
+        )
+        row_df = repo.query_dataframe(fetch_sql, params)
+
+        event_cols = [c for c in ("Computer", "Channel") if c in row_df.columns]
+        if not row_df.empty and event_cols:
+            events = row_df[event_cols].drop_duplicates()
+            if len(events) > 1:
+                # The ref is ambiguous: report one candidate per event instead
+                # of silently returning an arbitrary first match.
+                candidates: list[dict[str, object]] = []
+                for _, event_row in events.iterrows():
+                    mask = pd.Series(True, index=row_df.index)
+                    for c in event_cols:
+                        mask &= row_df[c] == event_row[c]
+                    sub = row_df[mask]
+                    cand: dict[str, object] = {"RecordID": record_id.strip()}
+                    for c in event_cols:
+                        cand[c] = str(event_row[c])
+                    if "Timestamp" in sub.columns:
+                        cand["Timestamp"] = str(sub.iloc[0]["Timestamp"])
+                    if "RuleTitle" in sub.columns:
+                        titles = sorted({str(v) for v in sub["RuleTitle"].tolist()})
+                        cand["RuleTitles"] = ", ".join(titles[:5]) + (" ..." if len(titles) > 5 else "")
+                    cand["MatchedRows"] = int(len(sub))
+                    candidates.append(cand)
+                return _WideDisplayDataFrame(_attach_pagination_metadata(
+                    pd.DataFrame(candidates),
+                    total_count=len(candidates),
+                    page_size=len(candidates),
+                    page_offset=0,
+                    status="ambiguous",
+                    message=(
+                        f"RecordID {record_id.strip()} matches {len(candidates)} different events."
+                        " Call get_event_detail again with computer= (and channel=) to select one."
+                    ),
+                ))
     else:
         full_sql = f"SELECT * FROM logs WHERE {sql_filter.strip()} LIMIT 1"
         _validate_select_on_logs_only(full_sql)
@@ -1100,6 +1175,16 @@ def get_event_detail(
 
     row = row_df.iloc[0]
     result_rows: list[dict[str, str]] = []
+
+    # One event detected by several rules: surface the alternatives instead of
+    # hiding them (each row is one rule's view of the same event).
+    if len(row_df) > 1 and "RuleTitle" in row_df.columns:
+        titles = sorted({str(v) for v in row_df["RuleTitle"].tolist()})
+        result_rows.append({"Field": "_MatchedRows", "Value": str(len(row_df))})
+        result_rows.append({
+            "Field": "_MatchedRuleTitles",
+            "Value": ", ".join(titles) + " (pass rule_title= to select another row)",
+        })
 
     for col in row_df.columns:
         val = row[col]

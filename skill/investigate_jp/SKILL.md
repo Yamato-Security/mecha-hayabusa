@@ -99,13 +99,13 @@ python3 "$STATE_PY" status --dir "$STATE_DIR"
 Step 3 で検出された**全ての異なるルールタイトル**について、以下のSQLで代表イベントの詳細フィールドを取得する:
 
 ```sql
-SELECT Timestamp, Computer, RuleTitle, Level, RecordID, Details
+SELECT Timestamp, Computer, Channel, RuleTitle, Level, RecordID, Details
 FROM logs WHERE RuleTitle = '[ルールタイトル]'
 ORDER BY Timestamp LIMIT 2
 ```
 
 - `detail_source` が `AllFieldInfo` の場合は `Details` を `AllFieldInfo` に置き換える
-- `RecordID` を必ずSELECTに含める（判定記録の `record_ids`、ゲート G7 で必要になる）
+- `RecordID` と `Computer`（可能なら `Channel` も）を必ずSELECTに含める（判定記録の証拠 `refs`、ゲート G6/G7 で必要になる）。**RecordIDはホスト・チャネルを跨いで一意ではない**（同じRecordIDが別ホストの別イベントに使われ得る）ため、証拠は `record_id` + `computer`（必要なら `channel`）の組で記録する
 
 ルールタイトルが多い場合（10件超）は、以下の方法で並列化・効率化する:
 - 複数ルールタイトルを `WHERE RuleTitle IN (...)` でまとめてクエリする
@@ -119,8 +119,10 @@ ORDER BY Timestamp LIMIT 2
 
 ```json
 [
- {"rule_title": "[正確なタイトル]", "verdict": "attack", "rationale": "[根拠]", "record_ids": ["123"], "excerpt": "[詳細フィールドの要点]"},
- {"rule_title": "[正確なタイトル]", "verdict": "false_positive", "rationale": "[根拠]"}
+ {"rule_title": "[正確なタイトル]", "verdict": "attack", "rationale": "[根拠]",
+  "refs": [{"record_id": "123", "computer": "HOST-A"}], "excerpt": "[詳細フィールドの逐語引用]"},
+ {"rule_title": "[正確なタイトル]", "verdict": "false_positive", "rationale": "[正常と判断できる積極的根拠]",
+  "refs": [{"record_id": "456", "computer": "HOST-B"}], "excerpt": "[詳細フィールドの逐語引用]"}
 ]
 ```
 
@@ -128,7 +130,10 @@ ORDER BY Timestamp LIMIT 2
 python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch.json"
 ```
 
-- **`attack` 判定には `record_ids`（実際に検証した代表イベントのRecordID、最低1件）が必須**（RecordIDカラムを持つデータセットの場合。記録時に拒否され、ゲート G7 でも強制される）。`excerpt` に判定根拠となった詳細フィールドの要点を残し、読者が再判定できるようにする
+- **全ての評決（`attack` / `false_positive` / `indeterminate`）に `refs`（実際に検証した代表イベントへの参照、最低1件）が必須**（RecordIDカラムを持つデータセットの場合。記録時に拒否され、ゲート G6/G7 でも強制される）。偽陽性の除外も攻撃の認定と同じく、行レベルまで監査可能でなければならない
+- **`refs` は `{"record_id": ..., "computer": ..., "channel": ...}` の修飾形式で記録する**（`channel` は同一ホスト内でRecordIDが衝突する場合のみ必要）。旧形式 `record_ids` も受理され、`"123@HOST-A"` / `"123@HOST-A@Sysmon"` のコンパクト表記が使える。**重複RecordID（複数ホストに同じ値が存在）を computer なしで引用すると G6 が FAIL する**
+- **`excerpt` は詳細フィールドの逐語引用（コピー&ペースト）にする**: `false_positive` では必須。言い換え・要約・省略記号は不可 — G6 が引用イベントの実データと突合し、一致しなければ FAIL する。攻撃判定でも読者が再判定できるように残すことを推奨
+- **`rationale` は実体的に書く**: "reviewed" のようなスタブは記録時に拒否される。判定根拠となったフィールドと値（プロセスパス、ユーザー、署名者等）に言及する
 - **時間的相関だけで `attack` と判定しない**: 詳細フィールドに実体的証拠（コマンドライン、ファイルパス、対象オブジェクト等）が無く、「攻撃チェーン上のタイミングで発生した」ことだけが根拠の場合は `indeterminate` とする（例: CommandLine未記録のrundll32起動、詳細フィールドが空のNTLMv1検知）。攻撃との関連の可能性はレポートの分析所見とセクション9「判断が困難なイベント」で述べる
 
 ルールタイトルはシード済みのタイトルと完全一致させる（`status` の出力またはCSVからコピー）。コマンドは残りの pending 件数を出力する。**pending = 0 になって初めてこのステップは完了**（後段のゲート G1 が強制する）。なお G1 の対象は調査対象レベルのルールのみだが、**findingに引用したルールは重要度に関わらず判定が必要**（ゲート G8）— info/lowのルールを証拠として使う場合も、この手順で判定を記録する。
@@ -165,21 +170,22 @@ Detailsの確認中に、以下の攻撃インフラパターンを発見した�
 
 以下4つを**同時に**呼び出す:
 
-1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` でcritイベントの全詳細を取得する（`detail_source` が `AllFieldInfo` の場合は `Details` → `AllFieldInfo`）。critが存在しない場合はhighに拡大する
+1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, Channel, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` でcritイベントの全詳細を取得する（`detail_source` が `AllFieldInfo` の場合は `Details` → `AllFieldInfo`）。critが存在しない場合はhighに拡大する
 2. **`mcp__hayabusa__extract_iocs`** — `level: ["high", "crit"]` でIOC（プロセス、コマンドライン、IP、ユーザー、ハッシュ等）を抽出する
 3. **`mcp__hayabusa__correlate_lateral_movement`** — `time_window_minutes: 60`, `level: ["high", "crit"]` でホスト間の横展開パターンを検出する。単一ホストのインシデントでは結果が空になる場合があるが、それ自体が横展開なしの証拠となる
 4. **`mcp__hayabusa__parse_details_field`** — `level: ["high", "crit"]`, `unique: true` で攻撃に関与したアカウントを集計する。攻撃主体の特定はほぼ全てのインシデントで必要なため、常に実行する。**`field_name` は detail_source に依存する**: `Details` プロファイルでは `field_name: "User"`（Hayabusaの短縮共通フィールド）。**`AllFieldInfo` プロファイルではフィールド名がプロバイダごとの元のイベントフィールド名のままなので、単一のフィールド名では全イベントを網羅できない**: `"SubjectUserName"` / `"TargetUserName"`（Securityログのイベント）**と** `"User"` / `"ParentUser"`（Sysmonのイベント）の両方を集計する。`field_name` を空で呼ぶと利用可能なフィールド名一覧が返るため、まず空で呼んでどれが存在するか確認する
 
 **確定した結果はその場でステートに記録する**:
 
-- crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`record_ids` も必須**（裏付けイベントのRecordID、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。`rules` に引用したルールは重要度に関わらずトリアージ判定が必要（ゲート G8。未判定のまま引用すると警告が出る）:
+- crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`refs` も必須**（裏付けイベントへの修飾参照、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G6/G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。整合性ルール: (1) `rules` に引用したルールは重要度に関わらずトリアージ判定が必要で、**偽陽性判定のルールをfindingの証拠に引用すると G8 が FAIL する**、(2) `refs` の各イベントは `rules` に挙げたいずれかのルールが検出したものであること（G6）、(3) **`hosts` に挙げた各ホストには、そのホスト上のイベントへの ref が最低1件必要**（G9 — 証拠のないホスト帰属を防ぐ）:
 
 JSONはWriteツールでファイル（例: `$STATE_DIR/finding_batch.json`）に書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
 
 ```json
 [
  {"title": "[findingの短いタイトル]", "summary": "[何が起きたか]", "phase": "Execution",
-  "hosts": ["HOST-A"], "rules": ["[正確なルールタイトル]"], "record_ids": ["123"],
+  "hosts": ["HOST-A"], "rules": ["[正確なルールタイトル]"],
+  "refs": [{"record_id": "123", "computer": "HOST-A"}],
   "query": "SELECT ..."}
 ]
 ```
@@ -188,11 +194,12 @@ JSONはWriteツールでファイル（例: `$STATE_DIR/finding_batch.json`）�
 python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
 ```
 
-- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `record_ids` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル（例: `$STATE_DIR/ioc_batch.json`）経由で渡す:
+- 抽出したIOC → `state.py ioc --batch`。`type` と `value` は**必須**、`hosts` / `context` / `refs` は任意（type: process / cmdline / filepath / ip / user / hash / service / other）。同様にファイル（例: `$STATE_DIR/ioc_batch.json`）経由で渡す:
 
 ```json
 [
- {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[攻撃における役割]", "record_ids": ["123"]}
+ {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[攻撃における役割]",
+  "refs": [{"record_id": "123", "computer": "HOST-A"}]}
 ]
 ```
 
@@ -238,7 +245,7 @@ Step 3.5 で攻撃者のステージングディレクトリ（例: `C:\Users\Pu
 Step 3 の `summarize_by_time_window` で複数の活動期間クラスタ（例: 2023-03, 2023-04, 2023-11, 2024-09 のように不連続な活動群）が検出された場合、**全てのクラスタについて代表的なイベントを確認する**。具体的には各クラスタの時間範囲で以下のSQLを実行する:
 
 ```sql
-SELECT Timestamp, Computer, RuleTitle, Level, RecordID, Details
+SELECT Timestamp, Computer, Channel, RuleTitle, Level, RecordID, Details
 FROM logs WHERE Timestamp >= '[クラスタ開始]' AND Timestamp <= '[クラスタ終了]'
 AND Level IN ('high','crit')
 ORDER BY Timestamp LIMIT 20
@@ -283,7 +290,7 @@ Step 3.5〜5 で確認したDetailsフィールド内のHashes値（SHA256, SHA1
 - 攻撃ツール（PsExec, Mimikatz, BloodHound等）のハッシュ
 - 不審なDLLのハッシュ
 
-相関分析の結果とハッシュIOCもステートに記録する（`state.py finding` / `state.py ioc --type hash`）。出典イベントの `record_ids` を含めること。
+相関分析の結果とハッシュIOCもステートに記録する（`state.py finding` / `state.py ioc --type hash`）。出典イベントの `refs` を含めること。
 
 ### Step 6: 可視化グラフ生成
 
@@ -414,10 +421,11 @@ JSON入力の構造:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack判定ルール、G5 未解決のページネーション、G6 データセットに存在しない引用RecordID、G7 RecordIDを1件も引用していないattack判定ルール/finding、G8 findingが引用しているのにトリアージ未判定のルール。該当ステップに戻ってギャップを解消し、再実行する
+- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはexcerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト。該当ステップに戻ってギャップを解消し、再実行する
+- **G6 の曖昧性FAIL**: 「RecordID X is ambiguous」と出た場合、そのRecordIDは複数ホスト/チャネルの別イベントに使われている。`get_event_detail(record_id=...)` も候補一覧（status=ambiguous）を返すので、`computer`（必要なら `channel`）を指定して対象イベントを確定し、refs を修飾形式で記録し直す
 - **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告。ただし**1件もパースできなかった場合はウィンドウを手動追加するまでG3はハードFAIL**になる）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - レポート生成時もこのゲートが再実行される: `report.py` は `state_dir` を渡し忘れても出力ディレクトリ（`manifest.json` がある場所）から `$STATE_DIR` を自動検出するため、ゲートを暗黙にスキップできない
-- 不完全な調査のままの生成をユーザーが明示的に了承した場合に限り、Step 7-1 で `"force": true` を指定して先へ進んでよい（未解決ギャップはレポート付録に明記される）
+- 不完全な調査のままの生成をユーザーが明示的に了承した場合に限り、Step 7-1 で `"force": true` を指定して先へ進んでよい。**forceで生成されたレポートは通常レポートと区別される**: ファイル名に `_UNVERIFIED` サフィックスが付き、タイトルに【未検証】が付き、先頭にFAILしたゲート一覧の警告バナーが表示される。未解決ギャップはレポート付録にも明記される
 
 収集した全データを分析し、以下の出力フォーマットに従って**日本語の**インシデント・フォレンジックレポートを生成する。ステートファイルを情報源として使うこと: セクション9の偽陽性テーブルは `rule_triage.json`（verdict=false_positive）から、判定不能リストは verdict=indeterminate から生成し、IOCセクションは `iocs.json` と整合させる。
 
@@ -463,7 +471,7 @@ JSON入力の構造:
 - `content`: レポート本文全体。Markdown記法ベースの文字列を直接渡す
 - `output`: 最終出力のHTMLファイルパス
 - `charts`: Step 6で生成したチャートHTMLファイルのパス。本文中のチャートリンク `[...](xxx.html)` が自動的にiframe埋め込みに変換される。単一ホストのインシデントでチャートを生成しなかった場合は `lateral_movement` を省略可
-- `state_dir`: **必ず `$STATE_DIR` を渡す。** report.py はカバレッジゲートを再実行し、FAIL があればレポート生成を拒否する（終了コード3）。成功時は自動生成の「カバレッジと再現性」付録（データセットsha256、トリアージ集計、ゲート結果）をレポート末尾に追加する。`"force": true` は不完全な調査をユーザーが明示的に了承した場合のみ指定する
+- `state_dir`: **必ず `$STATE_DIR` を渡す。** report.py はカバレッジゲートを再実行し、FAIL があればレポート生成を拒否する（終了コード3）。成功時は自動生成の「カバレッジと再現性」付録（データセットsha256、トリアージ集計、ゲート結果）をレポート末尾に追加する。`"force": true` は不完全な調査をユーザーが明示的に了承した場合のみ指定する — その場合、出力は `[名前]_UNVERIFIED.html` になり警告バナー付きで生成される（通常レポートと同じ見た目にはならない）
 
 変換後、最終的な `.html` ファイルのパスをユーザーに通知する。
 
@@ -776,7 +784,7 @@ Step 3.5 の検証で偽陽性（または偽陽性の可能性が高い）と�
 レポート全体を通じて以下に留意する:
 
 - **ステートの逐次記録（最重要）**: トリアージ判定・finding・IOC・ホストカバレッジ・クラスタ判定は、**確定したその時点で**ステートファイルに記録する（最後にまとめて記録しない）。ステートファイルは調査の一次情報源であり、コンテキスト圧縮を越えて残り、再開を可能にし、カバレッジゲート（`state.py check`）が PASS するまでレポートは生成できない
-- **証跡RecordIDの引用（最重要）**: `attack` 判定のトリアージと全てのfindingには、裏付けイベントの `record_ids` を必ず含める（ゲート G7）。IOCにも可能な限り出典 `record_ids` を付ける。RecordIDは検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い
+- **証跡refsの引用（最重要）**: 全てのトリアージ評決（attack / false_positive / indeterminate）と全てのfindingには、裏付けイベントへの `refs`（`{"record_id": ..., "computer": ...}`、必要なら `channel` も）を必ず含める（ゲート G6/G7）。IOCにも可能な限り出典 `refs` を付ける。RecordIDと Computer は検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い。**RecordIDは全体で一意ではない**ため、`get_event_detail` が status=ambiguous（候補一覧）を返したら `computer`/`channel` を指定して確定させる
 - **ステート記録の時刻表記**: finding や triage の `summary` / `rationale` に時刻を書く場合は、タイムゾーンオフセット付き（例: `2023-10-10T14:11:45+09:00`）またはTZ注記付きで記録する。レポート本文の表記タイムゾーン（UTC）と元ログのタイムゾーンが異なっても、ステートとレポートを突合できるようにするため
 - **攻撃者ツールの特定**: Hayabusaのルール名には攻撃ツール名が含まれることが多い（例: "HackTool - [ツール名]", "[ツール名] Execution"）。ルール名のパターンから攻撃ツール/フレームワークを識別し、セクション2に反映する
 - **正規活動との区別**: 構成管理ツール（Packer, Ansible, SCCM等）やIT管理ツール由来の活動は攻撃と誤認しやすい。コンテキスト（実行パス、実行ユーザー、タイミング）から判断し、判断根拠をセクション9に記載する

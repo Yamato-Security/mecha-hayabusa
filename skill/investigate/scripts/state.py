@@ -12,10 +12,17 @@ State directory layout:
   manifest.json     dataset fingerprint (sha256, rows, columns) + strategy
   rule_triage.json  one entry per distinct RuleTitle, seeded from the CSV
   clusters.json     activity clusters derived from event timestamps
-  findings.json     confirmed attack findings with evidence RecordIDs
-  iocs.json         extracted IOCs with source RecordIDs
+  findings.json     confirmed attack findings with evidence refs
+  iocs.json         extracted IOCs with source refs
   hosts.json        per-host investigation coverage
   queries.jsonl     audit log of executed queries (query_hash, has_more)
+
+Evidence refs:
+  Windows EventRecordIDs are NOT globally unique — the same RecordID can
+  appear on several hosts/channels. Evidence is therefore cited as a
+  qualified ref {record_id, computer, channel} ("RID@Computer@Channel" in
+  compact string form; computer/channel may be omitted only while the
+  RecordID is unambiguous in the dataset — gate G6 enforces this).
 
 Commands (all stdlib, no external dependencies):
   init      create the state directory and seed it from the CSV
@@ -51,6 +58,19 @@ TRIAGE_VERDICTS = ("attack", "false_positive", "indeterminate")
 CLUSTER_VERDICTS = ("attack", "benign", "indeterminate")
 HOST_STATUSES = ("investigated", "reviewed", "not_applicable")
 DEFAULT_CLUSTER_GAP_DAYS = 7
+
+# Rationales that carry no information get rejected at record time: an
+# unauditable verdict ("reviewed") over thousands of events is exactly the
+# failure mode the evidence gates exist to prevent.
+STUB_RATIONALES = {
+    "reviewed", "checked", "check", "ok", "done", "verified", "confirmed",
+    "fp", "false positive", "benign", "normal",
+    "確認済み", "確認済", "済", "レビュー済み", "レビュー済", "問題なし", "正常",
+}
+# Rows kept in memory per cited RecordID while verifying evidence against the
+# CSV. The same event legitimately appears once per matching Sigma rule, and a
+# duplicated RecordID spans a handful of events; 200 rows is far above both.
+CITED_ROWS_CAP = 200
 
 MANIFEST = "manifest.json"
 RULE_TRIAGE = "rule_triage.json"
@@ -210,9 +230,14 @@ class DatasetFacts:
         self.ts_total = 0                                 # rows with a non-empty Timestamp
         self.ts_parsed = 0                                # rows whose Timestamp parsed
         self._dates_by_level: dict[str, set] = {}
+        # RecordID -> rows sharing it (only for cited IDs, capped): lets the
+        # gates resolve a ref to concrete rows and detect duplicated RecordIDs.
+        self.cited_rows: dict[str, list[dict]] = {}
+        self.cited_rows_truncated: set[str] = set()
 
 
-def scan_csv(csv_path: str) -> DatasetFacts:
+def scan_csv(csv_path: str, cited_ids: "set[str] | None" = None) -> DatasetFacts:
+    cited_ids = cited_ids or set()
     facts = DatasetFacts()
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -231,6 +256,17 @@ def scan_csv(csv_path: str) -> DatasetFacts:
                 facts.hosts[host][level] += 1
             if record_id:
                 facts.record_ids.add(record_id)
+                if record_id in cited_ids:
+                    rows = facts.cited_rows.setdefault(record_id, [])
+                    if len(rows) < CITED_ROWS_CAP:
+                        rows.append({
+                            "computer": host,
+                            "channel": (row.get("Channel") or "").strip(),
+                            "rule_title": title,
+                            "detail": (row.get("Details") or row.get("AllFieldInfo") or "").strip(),
+                        })
+                    else:
+                        facts.cited_rows_truncated.add(record_id)
             ts_raw = (row.get("Timestamp") or "").strip()
             if ts_raw:
                 facts.ts_total += 1
@@ -350,7 +386,7 @@ def cmd_init(args) -> None:
             "status": "pending",
             "verdict": None,
             "rationale": "",
-            "evidence": {"record_ids": [], "detail_excerpt": ""},
+            "evidence": {"refs": [], "record_ids": [], "detail_excerpt": ""},
             "verified_at": None,
         })
 
@@ -464,7 +500,9 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
     # recover instead of silently overwriting analyst-entered verdicts.
     manifest = _require_initialized(state_dir)
     gate_levels = set(manifest["strategy"]["levels_investigated"])
-    has_record_id_col = "RecordID" in manifest["dataset"].get("columns", [])
+    columns = manifest["dataset"].get("columns", [])
+    has_record_id_col = "RecordID" in columns
+    has_detail_col = ("Details" in columns) or ("AllFieldInfo" in columns)
     triage = _load(state_dir, RULE_TRIAGE)
     by_title = {rule["rule_title"]: rule for rule in triage["rules"]}
     for entry in entries:
@@ -479,20 +517,33 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
             _fail(f"verdict for {title!r} must be one of: {', '.join(TRIAGE_VERDICTS)}")
         if not rationale:
             _fail(f"rationale is required for {title!r} (record why, so the report and reviewers can re-evaluate)")
-        record_ids = _normalize_record_ids(entry.get("record_ids"))
-        if verdict == "attack" and has_record_id_col and not record_ids:
+        _require_substantive_rationale(rationale, f"rule {title!r}")
+        refs = _normalize_refs(entry)
+        if has_record_id_col and not refs:
             _fail(
-                f"record_ids is required for an 'attack' verdict on {title!r}: cite the"
-                " RecordID(s) of the event(s) you actually verified (gate G7). An attack"
-                " claim with no row-level evidence is not auditable."
+                f"refs (or record_ids) is required for a {verdict!r} verdict on {title!r}:"
+                " cite the event(s) you actually verified as"
+                ' {"record_id": ..., "computer": ..., "channel": ...} (gates G6/G7).'
+                " Every verdict — false_positive and indeterminate included — must be"
+                " auditable down to the row; RecordIDs duplicated across hosts need the"
+                " computer (and channel) qualifier."
+            )
+        excerpt = entry.get("excerpt")
+        excerpt_text = ("" if excerpt is None else str(excerpt)).strip()[:2000]
+        if verdict == "false_positive" and has_detail_col and not excerpt_text:
+            _fail(
+                f"excerpt is required for a 'false_positive' verdict on {title!r}: quote"
+                " the cited event's detail field VERBATIM (contiguous substring, no"
+                " ellipsis) showing why it is benign. Gate G6 verifies the quote against"
+                " the actual row, so a paraphrase will fail."
             )
         rule = by_title[title]
         rule["status"] = "verified"
         rule["verdict"] = verdict
         rule["rationale"] = rationale
-        rule["evidence"]["record_ids"] = record_ids
-        excerpt = entry.get("excerpt")
-        rule["evidence"]["detail_excerpt"] = ("" if excerpt is None else str(excerpt))[:2000]
+        rule["evidence"]["refs"] = refs
+        rule["evidence"]["record_ids"] = [r["record_id"] for r in refs]
+        rule["evidence"]["detail_excerpt"] = excerpt_text
         rule["verified_at"] = _now()
     _save(state_dir, RULE_TRIAGE, triage)
     pending_all = [rule for rule in triage["rules"] if rule["status"] == "pending"]
@@ -530,6 +581,88 @@ def _normalize_record_ids(value) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _normalize_refs(entry: dict) -> list[dict]:
+    """
+    Merge an entry's evidence references into qualified refs
+    [{record_id, computer, channel}], deduplicated.
+
+    Accepted inputs:
+      - entry["refs"]: list of {"record_id": ..., "computer": ..., "channel": ...}
+        dicts (computer/channel optional) or compact strings
+      - entry["record_ids"]: legacy bare IDs (comma string / list / scalar);
+        each item may also use the compact "RID@Computer" or
+        "RID@Computer@Channel" form
+
+    A bare RecordID is only a complete reference while that ID is unambiguous
+    in the dataset; gate G6 rejects bare refs to duplicated RecordIDs.
+    """
+    refs: list[dict] = []
+    seen: set = set()
+
+    def push(record_id, computer="", channel="") -> None:
+        record_id = str(record_id or "").strip()
+        computer = str(computer or "").strip()
+        channel = str(channel or "").strip()
+        if not record_id:
+            return
+        key = (record_id, computer, channel)
+        if key in seen:
+            return
+        seen.add(key)
+        refs.append({"record_id": record_id, "computer": computer, "channel": channel})
+
+    def push_item(item) -> None:
+        if isinstance(item, dict):
+            push(item.get("record_id") or item.get("rid"), item.get("computer"), item.get("channel"))
+            return
+        parts = str(item).split("@")
+        push(parts[0], parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
+
+    raw_refs = entry.get("refs")
+    if isinstance(raw_refs, dict):
+        raw_refs = [raw_refs]
+    if isinstance(raw_refs, (list, tuple)):
+        for item in raw_refs:
+            push_item(item)
+    elif raw_refs is not None:
+        push_item(raw_refs)
+    qualified_ids = {r["record_id"] for r in refs}
+    for rid in _normalize_record_ids(entry.get("record_ids")):
+        parts = rid.split("@")
+        # A bare ID duplicating an already-qualified ref adds nothing.
+        if len(parts) == 1 and parts[0] in qualified_ids:
+            continue
+        push_item(rid)
+    return refs
+
+
+def _ref_label(ref: dict) -> str:
+    label = ref["record_id"]
+    if ref.get("computer"):
+        label += f"@{ref['computer']}"
+        if ref.get("channel"):
+            label += f"@{ref['channel']}"
+    return label
+
+
+def _entry_refs(container: dict) -> list[dict]:
+    """Read stored evidence refs, falling back to legacy bare record_ids so
+    state written before qualified refs existed keeps being validated."""
+    if isinstance(container.get("refs"), list) and container["refs"]:
+        return _normalize_refs({"refs": container["refs"]})
+    return _normalize_refs({"record_ids": container.get("record_ids") or []})
+
+
+def _require_substantive_rationale(rationale: str, context: str) -> None:
+    normalized = " ".join(rationale.split()).lower()
+    if len(normalized) < 6 or normalized in STUB_RATIONALES:
+        _fail(
+            f"rationale for {context} is too thin ({rationale!r}): state what in the"
+            " event data justifies the verdict (fields, values, execution context),"
+            " so reviewers can re-evaluate it"
+        )
 
 
 def _normalize_hosts(value) -> list[str]:
@@ -601,12 +734,12 @@ def _apply_findings(state_dir: str, entries: list[dict]) -> None:
         summary = (entry.get("summary") or "").strip()
         if not title or not summary:
             _fail("each finding requires 'title' and 'summary'")
-        record_ids = _normalize_record_ids(entry.get("record_ids"))
-        if has_record_id_col and not record_ids:
+        refs = _normalize_refs(entry)
+        if has_record_id_col and not refs:
             _fail(
-                f"finding {title!r} requires record_ids: cite the RecordID(s) of the"
-                " supporting event(s) (gate G7), so every report claim can be traced"
-                " back to the data."
+                f"finding {title!r} requires refs (or record_ids): cite the supporting"
+                ' event(s) as {"record_id": ..., "computer": ..., "channel": ...}'
+                " (gate G7), so every report claim can be traced back to the data."
             )
         rule_titles = _resolve_rule_titles(entry.get("rules") or entry.get("rule_titles"), known_titles)
         unknown = [t for t in rule_titles if t not in known_titles]
@@ -630,7 +763,8 @@ def _apply_findings(state_dir: str, entries: list[dict]) -> None:
             "phase": (entry.get("phase") or "").strip(),
             "hosts": _normalize_hosts(entry.get("hosts")),
             "rule_titles": rule_titles,
-            "record_ids": record_ids,
+            "refs": refs,
+            "record_ids": [r["record_id"] for r in refs],
             "summary": summary,
             "query": (entry.get("query") or "").strip(),
             "created_at": _now(),
@@ -662,12 +796,14 @@ def _apply_iocs(state_dir: str, entries: list[dict]) -> None:
         value = (entry.get("value") or "").strip()
         if not ioc_type or not value:
             _fail("each IOC requires 'type' and 'value'")
+        refs = _normalize_refs(entry)
         iocs["iocs"].append({
             "type": ioc_type,
             "value": value,
             "hosts": _normalize_hosts(entry.get("hosts")),
             "context": (entry.get("context") or "").strip(),
-            "record_ids": _normalize_record_ids(entry.get("record_ids")),
+            "refs": refs,
+            "record_ids": [r["record_id"] for r in refs],
             "created_at": _now(),
         })
     _save(state_dir, IOCS, iocs)
@@ -830,6 +966,56 @@ def _load_queries(state_dir: str) -> tuple[list[dict], int]:
 
 # ---------- check / status / appendix ----------
 
+def _resolve_ref(facts: DatasetFacts, ref: dict, rule_titles=None):
+    """
+    Resolve a qualified evidence ref against the scanned dataset.
+
+    Returns (rows, gap): `rows` is the list of scanned rows the ref denotes
+    (narrowed to `rule_titles` when given) if it resolves to exactly one event,
+    otherwise None plus a human-readable gap message. A bare RecordID resolves
+    only while it is unambiguous — duplicated RecordIDs (same value on several
+    hosts/channels) must be qualified with computer (and channel).
+    """
+    rid = ref["record_id"]
+    rows = facts.cited_rows.get(rid)
+    if not rows:
+        return None, f"RecordID {rid}: not found in dataset"
+    if ref.get("computer"):
+        rows = [r for r in rows if r["computer"] == ref["computer"]]
+        if rows and ref.get("channel"):
+            rows = [r for r in rows if r["channel"] == ref["channel"]]
+        if not rows:
+            return None, f"ref {_ref_label(ref)}: no such event in dataset"
+        events = {(r["computer"], r["channel"]) for r in rows}
+        if len(events) > 1:
+            sample = ", ".join(sorted(ch or "?" for _, ch in events)[:4])
+            return None, (
+                f"ref {_ref_label(ref)} is still ambiguous across channels"
+                f" ({sample}) — add \"channel\" to the ref"
+            )
+    else:
+        events = {(r["computer"], r["channel"]) for r in rows}
+        if len(events) > 1:
+            sample = ", ".join(f"{c or '?'}/{ch or '?'}" for c, ch in sorted(events)[:4])
+            more = ", ..." if len(events) > 4 else ""
+            return None, (
+                f"RecordID {rid} is ambiguous: {len(events)} different events share it"
+                f" ({sample}{more}) — qualify the ref with computer (and channel)"
+            )
+    if rule_titles is not None:
+        wanted = {rule_titles} if isinstance(rule_titles, str) else set(rule_titles)
+        narrowed = [r for r in rows if r["rule_title"] in wanted]
+        if not narrowed:
+            got = ", ".join(sorted({r["rule_title"] or "(empty)" for r in rows})[:3])
+            want = ", ".join(sorted(wanted)[:3])
+            return None, (
+                f"ref {_ref_label(ref)}: the event exists but was not detected by the"
+                f" cited rule(s) [{want}] (its rows belong to: {got})"
+            )
+        rows = narrowed
+    return rows, None
+
+
 def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     manifest = _load(state_dir, MANIFEST)
     triage = _load(state_dir, RULE_TRIAGE)
@@ -838,6 +1024,19 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     iocs = _load(state_dir, IOCS)
     hosts = _load(state_dir, HOSTS)
     queries, corrupt_query_lines = _load_queries(state_dir)
+
+    # Qualified evidence refs cited anywhere in the state. The CSV scan keeps
+    # the concrete rows for exactly these IDs, so G6/G9 can resolve each ref to
+    # one event and verify what was claimed about it.
+    triage_refs = {rule["rule_title"]: _entry_refs(rule.get("evidence") or {}) for rule in triage["rules"]}
+    finding_refs = {f["id"]: _entry_refs(f) for f in findings["findings"]}
+    ioc_refs = [
+        (f"ioc {i.get('type', '?')}: {str(i.get('value', '?'))[:40]}", _entry_refs(i))
+        for i in iocs["iocs"]
+    ]
+    cited_ids = {ref["record_id"] for refs in triage_refs.values() for ref in refs}
+    cited_ids.update(ref["record_id"] for refs in finding_refs.values() for ref in refs)
+    cited_ids.update(ref["record_id"] for _, refs in ioc_refs for ref in refs)
 
     levels = manifest["strategy"]["levels_investigated"]
     csv_path = manifest["dataset"]["path"]
@@ -868,7 +1067,7 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                  "sha256 matches manifest" if matches else "CSV changed since init (sha256 mismatch)")
         else:
             gate("G0", "dataset integrity", True, "hash verification skipped")
-        facts = scan_csv(csv_path)
+        facts = scan_csv(csv_path, cited_ids=cited_ids)
 
     # G1: rule triage coverage at investigated levels
     gate_rules = [r for r in triage["rules"] if set(r["levels"]) & set(levels)]
@@ -954,56 +1153,115 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         detail += f" (warning: {corrupt_query_lines} unparseable line(s) in queries.jsonl ignored)"
     gate("G5", "no unresolved pagination", not gaps, detail, gaps)
 
-    # G6: cited RecordIDs exist in the dataset. Enforced whenever the RecordID
-    # column exists (even if every value is empty), so fabricated citations are
-    # caught instead of vacuously passing.
+    # G6: every cited evidence ref resolves to exactly one event in the
+    # dataset, that event was actually detected by the rule citing it, and a
+    # recorded detail excerpt is a verbatim quote of the cited row. Enforced
+    # whenever the RecordID column exists, so fabricated or ambiguous citations
+    # are caught instead of vacuously passing (RecordIDs are NOT globally
+    # unique: the same value can denote different events on different hosts).
+    finding_evidence_computers: dict[str, set] = {}
     if facts is None:
-        gate("G6", "evidence RecordIDs exist", True, "skipped (dataset unavailable)")
+        gate("G6", "evidence refs resolve in dataset", True, "skipped (dataset unavailable)")
     elif "RecordID" in manifest["dataset"]["columns"]:
-        cited = set()
-        for rule in triage["rules"]:
-            cited.update(rule["evidence"].get("record_ids") or [])
-        for finding in findings["findings"]:
-            cited.update(finding.get("record_ids") or [])
-        for ioc in iocs["iocs"]:
-            cited.update(ioc.get("record_ids") or [])
-        unknown = sorted(cited - facts.record_ids)
-        gate("G6", "evidence RecordIDs exist", not unknown,
-             f"{len(cited) - len(unknown)}/{len(cited)} cited RecordIDs found in dataset",
-             unknown[:50])
-    else:
-        gate("G6", "evidence RecordIDs exist", True, "skipped (no RecordID column)")
+        g6_gaps: list[str] = []
+        total_refs = 0
 
-    # G7: attack-verdict rules and findings must cite at least one RecordID.
-    # Complements G6 (cited IDs exist in the dataset): G6 alone passes vacuously
-    # when nothing is cited at all, which would let an entire attack narrative
-    # ship with no row-level evidence. Only enforced when the dataset has a
-    # RecordID column (checked from the manifest, so this works even when the
-    # CSV itself is unavailable).
+        def check_ref(owner: str, ref: dict, rule_titles=None):
+            nonlocal total_refs
+            total_refs += 1
+            rows, gap = _resolve_ref(facts, ref, rule_titles)
+            if gap is None:
+                return rows
+            if ref["record_id"] in facts.cited_rows_truncated:
+                # The row cap was hit for this RecordID, so a failed lookup may
+                # be a cap artifact: skip (surfaced as a warning in the detail).
+                return None
+            g6_gaps.append(f"{owner}: {gap}")
+            return None
+
+        for rule in triage["rules"]:
+            refs = triage_refs[rule["rule_title"]]
+            if not refs:
+                continue  # missing evidence is G7's finding, not G6's
+            resolved_rows: list[dict] = []
+            for ref in refs:
+                rows = check_ref(f"rule {rule['rule_title']}", ref, rule["rule_title"])
+                if rows:
+                    resolved_rows.extend(rows)
+            excerpt = " ".join((rule["evidence"].get("detail_excerpt") or "").split())
+            if excerpt and resolved_rows:
+                if not any(excerpt in " ".join(r["detail"].split()) for r in resolved_rows):
+                    g6_gaps.append(
+                        f"rule {rule['rule_title']}: detail_excerpt is not a verbatim"
+                        " substring of any cited event's detail field — quote the"
+                        " Details/AllFieldInfo content exactly (no paraphrase, no ellipsis)"
+                    )
+
+        for finding in findings["findings"]:
+            computers: set = set()
+            want_rules = set(finding.get("rule_titles") or []) or None
+            for ref in finding_refs[finding["id"]]:
+                rows = check_ref(f"finding {finding['id']} ({finding['title']})", ref, want_rules)
+                if rows:
+                    computers.update(r["computer"] for r in rows if r["computer"])
+            finding_evidence_computers[finding["id"]] = computers
+
+        for owner, refs in ioc_refs:
+            for ref in refs:
+                check_ref(owner, ref)
+
+        detail = f"{total_refs} evidence ref(s) checked, {len(g6_gaps)} problem(s)"
+        if facts.cited_rows_truncated:
+            detail += (
+                f" (warning: row cap hit for {len(facts.cited_rows_truncated)}"
+                " RecordID(s); their failed lookups were skipped)"
+            )
+        gate("G6", "evidence refs resolve in dataset", not g6_gaps, detail, g6_gaps[:50])
+    else:
+        gate("G6", "evidence refs resolve in dataset", True, "skipped (no RecordID column)")
+
+    # G7: every recorded verdict — attack, false_positive AND indeterminate —
+    # and every finding cites at least one evidence ref, and a false_positive
+    # verdict carries a verbatim detail excerpt. Complements G6 (cited refs
+    # resolve): G6 alone passes vacuously when nothing is cited at all, which
+    # would let mass exclusions ship with no auditable row-level evidence.
+    # Only enforced when the dataset has a RecordID column (checked from the
+    # manifest, so this works even when the CSV itself is unavailable).
     if "RecordID" in manifest["dataset"]["columns"]:
-        attack_rules_all = [r for r in triage["rules"] if r["verdict"] == "attack"]
-        no_evidence = [
-            f"rule: {r['rule_title']}" for r in attack_rules_all
-            if not r["evidence"].get("record_ids")
-        ]
+        dataset_columns = manifest["dataset"]["columns"]
+        has_detail_col = ("Details" in dataset_columns) or ("AllFieldInfo" in dataset_columns)
+        judged_rules = [r for r in triage["rules"] if r["verdict"]]
+        no_evidence = []
+        for r in judged_rules:
+            reasons = []
+            if not triage_refs[r["rule_title"]]:
+                reasons.append("no refs")
+            if (r["verdict"] == "false_positive" and has_detail_col
+                    and not (r["evidence"].get("detail_excerpt") or "").strip()):
+                reasons.append("false_positive without verbatim excerpt")
+            if reasons:
+                no_evidence.append(f"rule: {r['rule_title']} ({r['verdict']}: {', '.join(reasons)})")
         no_evidence += [
             f"finding: {f['id']} ({f['title']})" for f in findings["findings"]
-            if not f.get("record_ids")
+            if not finding_refs[f["id"]]
         ]
-        total = len(attack_rules_all) + len(findings["findings"])
-        gate("G7", "attack evidence cites RecordIDs", not no_evidence,
-             f"{total - len(no_evidence)}/{total} attack-verdict rules and findings cite RecordIDs",
+        total = len(judged_rules) + len(findings["findings"])
+        gate("G7", "verdicts cite row-level evidence", not no_evidence,
+             f"{total - len(no_evidence)}/{total} verdicts and findings cite evidence refs",
              no_evidence)
     else:
-        gate("G7", "attack evidence cites RecordIDs", True, "skipped (no RecordID column)")
+        gate("G7", "verdicts cite row-level evidence", True, "skipped (no RecordID column)")
 
     # G8: every rule cited by a finding has a triage verdict, regardless of
-    # level. Findings routinely cite info/low rules as supporting evidence
-    # (logons, ticket requests, auth failures); those sit outside G1's scope
-    # but must not enter the report narrative without the detail-field check.
+    # level, and that verdict is compatible with being attack evidence: a
+    # false_positive rule can never back a finding (re-triage it or drop the
+    # citation). Indeterminate rules may be cited as supporting context and are
+    # surfaced in the detail, not failed.
     triage_by_title = {r["rule_title"]: r for r in triage["rules"]}
     cited_pending = set()
     cited_unknown = set()
+    cited_fp = set()
+    cited_indeterminate = set()
     cited_total = set()
     for finding in findings["findings"]:
         for cited in finding.get("rule_titles") or []:
@@ -1013,10 +1271,50 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                 cited_unknown.add(f"{cited} (not a rule title seeded from the CSV)")
             elif rule["status"] == "pending":
                 cited_pending.add(cited)
-    g8_gaps = sorted(cited_pending) + sorted(cited_unknown)
-    gate("G8", "finding-cited rules triaged", not g8_gaps,
-         f"{len(cited_total) - len(g8_gaps)}/{len(cited_total)} rules cited by findings have a triage verdict",
-         g8_gaps)
+            elif rule["verdict"] == "false_positive":
+                cited_fp.add(
+                    f"{cited} (false_positive verdict cannot back a finding —"
+                    " re-triage the rule or drop the citation)"
+                )
+            elif rule["verdict"] == "indeterminate":
+                cited_indeterminate.add(cited)
+    g8_gaps = sorted(cited_pending) + sorted(cited_unknown) + sorted(cited_fp)
+    g8_detail = (
+        f"{len(cited_total) - len(g8_gaps)}/{len(cited_total)} rules cited by findings"
+        " have a compatible triage verdict"
+    )
+    if cited_indeterminate:
+        g8_detail += (
+            f" (note: {len(cited_indeterminate)} indeterminate rule(s) cited —"
+            " allowed as supporting context only)"
+        )
+    gate("G8", "finding-cited rules triaged", not g8_gaps, g8_detail, g8_gaps)
+
+    # G9: every host a finding names is backed by at least one cited event on
+    # that host. Prevents narrative host attribution the evidence rows do not
+    # support (e.g. citing HOST-A events for a claim about HOST-B). Uses the
+    # per-finding computers resolved in G6.
+    if facts is None:
+        gate("G9", "finding hosts backed by evidence", True, "skipped (dataset unavailable)")
+    elif "RecordID" in manifest["dataset"]["columns"] and "Computer" in manifest["dataset"]["columns"]:
+        g9_gaps = []
+        total_host_claims = 0
+        for finding in findings["findings"]:
+            evidence_computers = finding_evidence_computers.get(finding["id"], set())
+            for host in (finding.get("hosts") or []):
+                if not str(host).strip():
+                    continue
+                total_host_claims += 1
+                if host not in evidence_computers:
+                    g9_gaps.append(
+                        f"finding {finding['id']} ({finding['title']}): host {host} is not"
+                        " backed by any cited event — add a ref to an event on that host"
+                    )
+        gate("G9", "finding hosts backed by evidence", not g9_gaps,
+             f"{total_host_claims - len(g9_gaps)}/{total_host_claims} finding-host claims backed by cited events",
+             g9_gaps)
+    else:
+        gate("G9", "finding hosts backed by evidence", True, "skipped (no RecordID/Computer column)")
 
     return {
         "ok": all(g["status"] == "PASS" for g in gates),
@@ -1252,8 +1550,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rule")
     p.add_argument("--verdict", choices=TRIAGE_VERDICTS)
     p.add_argument("--rationale", default="")
-    p.add_argument("--record-ids", default="")
-    p.add_argument("--excerpt", default="")
+    p.add_argument("--record-ids", default="",
+                   help='comma-separated evidence refs: "RID", "RID@Computer" or'
+                        ' "RID@Computer@Channel" (qualify duplicated RecordIDs)')
+    p.add_argument("--excerpt", default="",
+                   help="verbatim quote of the cited event's detail field"
+                        " (required for false_positive; verified by gate G6)")
     p.set_defaults(func=cmd_triage)
 
     p = sub.add_parser("finding", help="record an attack finding (or --batch)")
@@ -1263,7 +1565,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--phase", default="")
     p.add_argument("--hosts", default="")
     p.add_argument("--rules", default="", help="comma-separated related rule titles")
-    p.add_argument("--record-ids", default="")
+    p.add_argument("--record-ids", default="",
+                   help='comma-separated evidence refs: "RID", "RID@Computer" or'
+                        ' "RID@Computer@Channel" (qualify duplicated RecordIDs)')
     p.add_argument("--summary", default="")
     p.add_argument("--query", default="")
     p.set_defaults(func=cmd_finding)

@@ -99,13 +99,13 @@ python3 "$STATE_PY" status --dir "$STATE_DIR"
 For **all distinct rule titles** detected in Step 3, retrieve representative event details using the following SQL:
 
 ```sql
-SELECT Timestamp, Computer, RuleTitle, Level, RecordID, Details
+SELECT Timestamp, Computer, Channel, RuleTitle, Level, RecordID, Details
 FROM logs WHERE RuleTitle = '[rule title]'
 ORDER BY Timestamp LIMIT 2
 ```
 
 - Replace `Details` with `AllFieldInfo` when `detail_source` is `AllFieldInfo`
-- Always include `RecordID` in the SELECT (you will need it for the verdict's `record_ids`, gate G7)
+- Always include `RecordID` and `Computer` (and `Channel` when possible) in the SELECT — you will need them for the verdict's evidence `refs` (gates G6/G7). **RecordIDs are NOT unique across hosts/channels** (the same RecordID can denote a different event on another host), so evidence is cited as the pair `record_id` + `computer` (plus `channel` when needed)
 
 When there are many rule titles (>10), parallelize/optimize using:
 - Combine multiple rule titles with `WHERE RuleTitle IN (...)`
@@ -119,8 +119,10 @@ After verifying each batch of rules, record the verdicts immediately (do not def
 
 ```json
 [
- {"rule_title": "[exact title]", "verdict": "attack", "rationale": "[why]", "record_ids": ["123"], "excerpt": "[key detail-field excerpt]"},
- {"rule_title": "[exact title]", "verdict": "false_positive", "rationale": "[why]"}
+ {"rule_title": "[exact title]", "verdict": "attack", "rationale": "[why]",
+  "refs": [{"record_id": "123", "computer": "HOST-A"}], "excerpt": "[verbatim detail-field quote]"},
+ {"rule_title": "[exact title]", "verdict": "false_positive", "rationale": "[positive evidence of benignity]",
+  "refs": [{"record_id": "456", "computer": "HOST-B"}], "excerpt": "[verbatim detail-field quote]"}
 ]
 ```
 
@@ -128,7 +130,10 @@ After verifying each batch of rules, record the verdicts immediately (do not def
 python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/triage_batch.json"
 ```
 
-- **An `attack` verdict requires `record_ids`** (RecordIDs of the representative events you actually verified, at least one) when the dataset has a RecordID column. The command rejects the entry otherwise, and gate G7 enforces it again at report time. Put the key detail-field content in `excerpt` so readers can re-evaluate the verdict
+- **Every verdict (`attack` / `false_positive` / `indeterminate`) requires `refs`** (references to the representative events you actually verified, at least one) when the dataset has a RecordID column. The command rejects the entry otherwise, and gates G6/G7 enforce it again at report time. A false-positive exclusion must be as auditable down to the row as an attack claim
+- **Record `refs` in the qualified form `{"record_id": ..., "computer": ..., "channel": ...}`** (`channel` only needed when RecordIDs collide within one host). The legacy `record_ids` key is still accepted and supports the compact `"123@HOST-A"` / `"123@HOST-A@Sysmon"` notation. **Citing a duplicated RecordID (same value on several hosts) without a computer makes G6 FAIL**
+- **`excerpt` must be a VERBATIM quote (copy & paste) of the detail field**: mandatory for `false_positive`. No paraphrase, summary, or ellipsis — G6 compares it against the actual cited row and fails on mismatch. Recommended for attack verdicts too, so readers can re-evaluate
+- **Write a substantive `rationale`**: stubs like "reviewed" are rejected at entry time. Reference the fields and values (process path, user, signer, etc.) that justify the verdict
 - **Do not mark `attack` on temporal correlation alone**: when the detail field carries no substantive evidence (command line, file path, target object, etc.) and the only basis is "it happened at an attack-chain moment", use `indeterminate` instead (e.g., a rundll32 launch with no CommandLine recorded, an NTLMv1 detection with an empty detail field). Discuss the possible connection in the report's phase analysis and Section 9 "Indeterminate Events"
 
 Rule titles must match the seeded titles exactly (copy from `status` output or the CSV). The command reports the remaining pending count. **This step is complete only when pending = 0** (enforced later by gate G1). Note that G1 only covers rules at the investigated levels, but **any rule cited by a finding needs a verdict regardless of level** (gate G8) — when you use info/low rules as evidence, triage them here too.
@@ -165,19 +170,20 @@ During Details verification, if the following attack infrastructure patterns are
 
 Call the following 4 **simultaneously**:
 
-1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` to get full details of all crit events (replace `Details` with `AllFieldInfo` when `detail_source` is `AllFieldInfo`). Expand to high if no crit events exist
+1. **`mcp__hayabusa__run_sql`** — `SELECT Timestamp, RuleTitle, Level, Computer, Channel, RecordID, Details FROM logs WHERE Level = 'crit' ORDER BY Timestamp` to get full details of all crit events (replace `Details` with `AllFieldInfo` when `detail_source` is `AllFieldInfo`). Expand to high if no crit events exist
 2. **`mcp__hayabusa__extract_iocs`** — with `level: ["high", "crit"]` to extract IOCs (processes, command lines, IPs, users, hashes, etc.)
 3. **`mcp__hayabusa__correlate_lateral_movement`** — with `time_window_minutes: 60`, `level: ["high", "crit"]` to detect inter-host lateral movement patterns. Empty results for single-host incidents are themselves evidence of no lateral movement
 4. **`mcp__hayabusa__parse_details_field`** — with `level: ["high", "crit"]`, `unique: true` to aggregate accounts involved in the attack. Identifying the attack principal is required for virtually all incidents. **`field_name` depends on detail_source**: on a `Details` profile use `field_name: "User"` (Hayabusa's abbreviated common field). On an **`AllFieldInfo` profile fields keep their original per-provider event names, so no single field covers all events**: aggregate `"SubjectUserName"` / `"TargetUserName"` (Security-log events) **and** `"User"` / `"ParentUser"` (Sysmon events). Calling with an empty `field_name` returns the list of available field names, so query that first to see which are present
 
 **Record results in state as they are confirmed**:
 
-- Attack activity confirmed from crit/high events → `state.py finding --batch`. `title` and `summary` are **required**, and so are **`record_ids`** (RecordIDs of the supporting events, at least one — rejected at entry time and enforced by gate G7 when the dataset has a RecordID column); include related `rules`, `hosts`, and the `query` used, so every report claim is traceable to data. Every rule cited in `rules` needs a triage verdict regardless of level (gate G8; citing an untriaged rule prints a warning). **Write the JSON to a file (e.g. `$STATE_DIR/finding_batch.json`) and redirect it in** (inline `echo` breaks on Windows paths):
+- Attack activity confirmed from crit/high events → `state.py finding --batch`. `title` and `summary` are **required**, and so are **`refs`** (qualified references to the supporting events, at least one — rejected at entry time and enforced by gates G6/G7 when the dataset has a RecordID column); include related `rules`, `hosts`, and the `query` used, so every report claim is traceable to data. Consistency rules: (1) every rule cited in `rules` needs a triage verdict regardless of level, and **citing a false_positive-verdict rule as finding evidence makes G8 FAIL**; (2) each event in `refs` must have been detected by one of the rules listed in `rules` (G6); (3) **every host listed in `hosts` needs at least one ref to an event on that host** (G9 — prevents host attribution without evidence). **Write the JSON to a file (e.g. `$STATE_DIR/finding_batch.json`) and redirect it in** (inline `echo` breaks on Windows paths):
 
 ```json
 [
  {"title": "[short finding title]", "summary": "[what happened]", "phase": "Execution",
-  "hosts": ["HOST-A"], "rules": ["[exact rule title]"], "record_ids": ["123"],
+  "hosts": ["HOST-A"], "rules": ["[exact rule title]"],
+  "refs": [{"record_id": "123", "computer": "HOST-A"}],
   "query": "SELECT ..."}
 ]
 ```
@@ -186,11 +192,12 @@ Call the following 4 **simultaneously**:
 python3 "$STATE_PY" finding --dir "$STATE_DIR" --batch < "$STATE_DIR/finding_batch.json"
 ```
 
-- Extracted IOCs → `state.py ioc --batch`. `type` and `value` are **required**; `hosts`, `context`, `record_ids` optional (types: process / cmdline / filepath / ip / user / hash / service / other). Likewise pass via a file (e.g. `$STATE_DIR/ioc_batch.json`):
+- Extracted IOCs → `state.py ioc --batch`. `type` and `value` are **required**; `hosts`, `context`, `refs` optional (types: process / cmdline / filepath / ip / user / hash / service / other). Likewise pass via a file (e.g. `$STATE_DIR/ioc_batch.json`):
 
 ```json
 [
- {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[role in the attack]", "record_ids": ["123"]}
+ {"type": "ip", "value": "10.0.0.5", "hosts": ["HOST-A"], "context": "[role in the attack]",
+  "refs": [{"record_id": "123", "computer": "HOST-A"}]}
 ]
 ```
 
@@ -236,7 +243,7 @@ If attacker staging directories (e.g., `C:\Users\Public\Music\`) or suspicious p
 If `summarize_by_time_window` in Step 3 detects multiple discontinuous activity clusters (e.g., 2023-03, 2023-04, 2023-11, 2024-09), **verify representative events for all clusters**. Specifically, execute the following SQL for each cluster's time range:
 
 ```sql
-SELECT Timestamp, Computer, RuleTitle, Level, RecordID, Details
+SELECT Timestamp, Computer, Channel, RuleTitle, Level, RecordID, Details
 FROM logs WHERE Timestamp >= '[cluster start]' AND Timestamp <= '[cluster end]'
 AND Level IN ('high','crit')
 ORDER BY Timestamp LIMIT 20
@@ -281,7 +288,7 @@ Record Hashes values (SHA256, SHA1, MD5) from Details fields confirmed in Steps 
 - Hashes of attack tools (PsExec, Mimikatz, BloodHound, etc.)
 - Hashes of suspicious DLLs
 
-Record correlation results and hash IOCs in state as well (`state.py finding` / `state.py ioc --type hash`), including the `record_ids` of the source events.
+Record correlation results and hash IOCs in state as well (`state.py finding` / `state.py ioc --type hash`), including the `refs` of the source events.
 
 ### Step 6: Visualization Chart Generation
 
@@ -412,10 +419,11 @@ Run the coverage check and make it PASS before assembling the report:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack-verdict rules not referenced by any finding, G5 unresolved pagination, G6 cited RecordIDs absent from the dataset, G7 attack-verdict rules/findings citing no RecordIDs, G8 finding-cited rules without a triage verdict. Go back to the corresponding step, close the gaps, and re-run
+- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs, or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event. Go back to the corresponding step, close the gaps, and re-run
+- **G6 ambiguity FAIL**: "RecordID X is ambiguous" means that RecordID denotes different events on several hosts/channels. `get_event_detail(record_id=...)` returns the candidate list too (status=ambiguous); pass `computer` (and `channel` if needed) to pin the event, then re-record the refs in qualified form
 - **G3 timestamp warning**: if the G3 detail warns that some rows have unparseable Timestamps, they were excluded from the auto-derived clusters (this is a visible warning, not a failure; when NO timestamps parsed at all, G3 hard-fails until windows are added). If you know a distinct activity wave was missed, add it manually and judge it: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - Report generation also re-runs this gate: `report.py` auto-detects `$STATE_DIR` from the output directory (where `manifest.json` sits) even if you forget to pass `state_dir`, so the gate cannot be silently skipped
-- Only if the user explicitly accepts an incomplete investigation may you proceed with `"force": true` in Step 7-1 (the unresolved gaps are then printed in the report appendix)
+- Only if the user explicitly accepts an incomplete investigation may you proceed with `"force": true` in Step 7-1. **A forced report is made visibly distinct from a certified one**: the filename gets an `_UNVERIFIED` suffix, the title gets an `[UNVERIFIED]` prefix, and a warning banner listing the failing gates is placed at the top. The unresolved gaps are also printed in the report appendix
 
 Analyze all collected data and generate an **English** incident forensic report following the output format below. Use the state files as the source of truth: Section 9's false positive table comes from `rule_triage.json` (verdict=false_positive), the indeterminate list from verdict=indeterminate, and the IOC section should be consistent with `iocs.json`.
 
@@ -461,7 +469,7 @@ JSON input structure:
 - `content`: The complete report body as a markdown-style string
 - `output`: Final HTML output file path
 - `charts`: Paths to chart HTML files generated in Step 6. Chart links `[...](xxx.html)` in the report body are automatically converted to iframe embeds. Omit `lateral_movement` if no chart was generated (single-host incident)
-- `state_dir`: **Always pass `$STATE_DIR`.** report.py re-runs the coverage gates and refuses to generate (exit code 3) if any gate fails; on success it appends an auto-generated "Coverage & Reproducibility" appendix (dataset sha256, triage summary, gate results) to the report. Add `"force": true` only with explicit user approval for an incomplete investigation
+- `state_dir`: **Always pass `$STATE_DIR`.** report.py re-runs the coverage gates and refuses to generate (exit code 3) if any gate fails; on success it appends an auto-generated "Coverage & Reproducibility" appendix (dataset sha256, triage summary, gate results) to the report. Add `"force": true` only with explicit user approval for an incomplete investigation — the output then becomes `[name]_UNVERIFIED.html` with a warning banner (it will not look like a certified report)
 
 After conversion, notify the user of the final `.html` file path.
 
@@ -774,7 +782,7 @@ Metadata collection procedure:
 Observe the following throughout the entire report:
 
 - **Continuous state recording (critical)**: Record triage verdicts, findings, IOCs, host coverage, and cluster verdicts into the state files **at the moment they are established**, not in a batch at the end. The state files are the investigation's source of truth: they survive context compaction, enable resuming, and the report cannot be generated until the coverage gates (`state.py check`) pass
-- **Evidence RecordIDs (critical)**: every `attack`-verdict triage entry and every finding must cite the `record_ids` of its supporting events (gate G7); attach source `record_ids` to IOCs too whenever possible. Note RecordIDs down at verification time, from the SQL / `get_event_detail` results in front of you — hunting for them afterwards is expensive
+- **Evidence refs (critical)**: every triage verdict (attack / false_positive / indeterminate) and every finding must cite `refs` to its supporting events (`{"record_id": ..., "computer": ...}`, plus `channel` when needed — gates G6/G7); attach source `refs` to IOCs too whenever possible. Note RecordID and Computer down at verification time, from the SQL / `get_event_detail` results in front of you — hunting for them afterwards is expensive. **RecordIDs are not globally unique**: when `get_event_detail` returns status=ambiguous (candidate list), pass `computer`/`channel` to pin the event
 - **Timestamps in state entries**: when writing times into a finding's or verdict's `summary` / `rationale`, include the timezone offset (e.g., `2023-10-10T14:11:45+09:00`) or an explicit TZ note, so state entries can be reconciled with the report body even when the report uses a different display timezone (UTC) than the source logs
 - **Identifying attacker tools**: Hayabusa rule names often contain attack tool names (e.g., "HackTool - [tool name]", "[tool name] Execution"). Identify attack tools/frameworks from rule name patterns and reflect in Section 2
 - **Distinguishing from legitimate activity**: Activity from configuration management tools (Packer, Ansible, SCCM, etc.) and IT management tools can be mistaken for attacks. Judge based on context (execution path, executing user, timing) and document rationale in Section 9

@@ -358,9 +358,91 @@ def render_report(template, *, title, body_html, nav_items_html):
 
 APPENDIX_LANG = "en"
 
+# A forced report whose gates did not pass must be impossible to mistake for a
+# certified one: distinct filename suffix, [UNVERIFIED] title and a top banner
+# listing exactly which gates failed.
+UNVERIFIED_SUFFIX = "_UNVERIFIED"
+
+UNVERIFIED_LABELS = {
+    "en": {
+        "title_prefix": "[UNVERIFIED] ",
+        "heading": "UNVERIFIED REPORT",
+        "gates_failed": (
+            'This report was generated with "force": true while {n} coverage'
+            " gate(s) were FAILING. The findings and coverage claims below are"
+            " NOT certified by the investigation state."
+        ),
+        "state_unreadable": (
+            'This report was generated with "force": true while the'
+            " investigation state could not be checked ({detail})."
+            " Coverage gates were NOT run."
+        ),
+        "instruction": (
+            "Resolve the gaps and regenerate without force to obtain a"
+            " certified report."
+        ),
+    },
+    "ja": {
+        "title_prefix": "【未検証】",
+        "heading": "未検証レポート (UNVERIFIED)",
+        "gates_failed": (
+            "このレポートは {n} 件のカバレッジゲートが FAIL のまま"
+            ' "force": true で生成されました。以下の調査結果とカバレッジは'
+            "調査ステートによって証明されていません。"
+        ),
+        "state_unreadable": (
+            "このレポートは調査ステートを検査できない状態（{detail}）で"
+            ' "force": true により生成されました。カバレッジゲートは実行されていません。'
+        ),
+        "instruction": (
+            "ギャップを解消し、force なしで再生成すると検証済みレポートになります。"
+        ),
+    },
+}
+
+
+def _unverified_output_path(path):
+    root, ext = os.path.splitext(path)
+    return root + UNVERIFIED_SUFFIX + ext
+
+
+def _unverified_banner_html(unverified):
+    labels = UNVERIFIED_LABELS.get(APPENDIX_LANG, UNVERIFIED_LABELS["en"])
+    if unverified["reason"] == "gates_failed":
+        lead = labels["gates_failed"].format(n=len(unverified["failed"]))
+        items = "".join(
+            f"<li><strong>{html_mod.escape(gate_id)} {html_mod.escape(name)}</strong>: "
+            f"{html_mod.escape(detail)}</li>"
+            for gate_id, name, detail in unverified["failed"]
+        )
+        list_html = f'<ul style="margin:8px 0 0 20px;">{items}</ul>'
+    else:
+        lead = labels["state_unreadable"].format(
+            detail=html_mod.escape(str(unverified.get("detail", "")))
+        )
+        list_html = ""
+    return (
+        '<div class="unverified-banner" style="background:#7f1d1d;color:#fff;'
+        'border:2px solid #ef4444;border-radius:8px;padding:16px 20px;margin:0 0 24px 0;">'
+        f'<div style="font-size:1.2em;font-weight:bold;letter-spacing:0.05em;">'
+        f'&#9888; {html_mod.escape(labels["heading"])}</div>'
+        f'<p style="margin:8px 0 0 0;">{lead}</p>'
+        f"{list_html}"
+        f'<p style="margin:8px 0 0 0;">{html_mod.escape(labels["instruction"])}</p>'
+        "</div>"
+    )
+
 
 def _run_coverage_gate(state_dir, force):
-    """Run state.py coverage gates; exit unless they PASS (or force). Returns appendix md."""
+    """Run state.py coverage gates; exit unless they PASS (or force).
+
+    Returns (appendix_md, unverified): unverified is None when every gate
+    passed, otherwise a dict describing why the report is not certified —
+    {"reason": "gates_failed", "failed": [(id, name, detail), ...]} or
+    {"reason": "state_unreadable", "detail": ...}. A non-None unverified is
+    only reachable with force (a non-forced failure exits with code 3), and
+    obliges the caller to emit an UNVERIFIED report.
+    """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     try:
         import state as investigation_state
@@ -368,10 +450,10 @@ def _run_coverage_gate(state_dir, force):
         if force:
             print(
                 "warning: state.py not found next to report.py;"
-                " generating the report without the coverage appendix",
+                " generating an UNVERIFIED report without the coverage appendix",
                 file=sys.stderr,
             )
-            return ""
+            return "", {"reason": "state_unreadable", "detail": "state.py not found next to report.py"}
         print(
             "state.py not found next to report.py - report generation refused."
             ' Reinstall/update the skill scripts, or pass "force": true.',
@@ -381,14 +463,15 @@ def _run_coverage_gate(state_dir, force):
 
     def _unreadable(detail):
         # A missing/corrupt/wrong-shaped state must not crash report.py: force
-        # generates the report without the appendix, otherwise refuse cleanly.
+        # generates an UNVERIFIED report without the appendix, otherwise refuse
+        # cleanly.
         if force:
             print(
                 f"warning: coverage state unreadable ({detail});"
-                " generating the report without the coverage appendix",
+                " generating an UNVERIFIED report without the coverage appendix",
                 file=sys.stderr,
             )
-            return ""
+            return "", {"reason": "state_unreadable", "detail": detail}
         print(
             f"Coverage state could not be checked ({detail}) - report generation refused."
             ' Fix the state directory or pass "force": true.',
@@ -396,7 +479,7 @@ def _run_coverage_gate(state_dir, force):
         )
         sys.exit(3)
 
-    # Strict re-check: the coverage appendix certifies host/RecordID coverage
+    # Strict re-check: the coverage appendix certifies host/evidence coverage
     # against the dataset, so the CSV must be present (a missing CSV fails G0 and
     # the report is refused unless forced). A present CSV is re-hashed to catch
     # tampering between Step 7-0 and report time.
@@ -407,29 +490,39 @@ def _run_coverage_gate(state_dir, force):
     except Exception as exc:
         return _unreadable(f"{type(exc).__name__}: {exc}")
 
-    if not result["ok"] and not force:
-        print("Coverage gates FAILED - report generation refused.", file=sys.stderr)
-        for g in result["gates"]:
-            if g["status"] == "FAIL":
-                print(f"  [{g['id']}] {g['name']}: {g['detail']}", file=sys.stderr)
-                for gap in g["gaps"][:10]:
-                    print(f"      - {gap}", file=sys.stderr)
-        print(
-            "Resolve the gaps (state.py status / triage / host / cluster ...) "
-            'or pass "force": true to generate anyway.',
-            file=sys.stderr,
-        )
-        sys.exit(3)
+    unverified = None
+    if not result["ok"]:
+        if not force:
+            print("Coverage gates FAILED - report generation refused.", file=sys.stderr)
+            for g in result["gates"]:
+                if g["status"] == "FAIL":
+                    print(f"  [{g['id']}] {g['name']}: {g['detail']}", file=sys.stderr)
+                    for gap in g["gaps"][:10]:
+                        print(f"      - {gap}", file=sys.stderr)
+            print(
+                "Resolve the gaps (state.py status / triage / host / cluster ...) "
+                'or pass "force": true to generate anyway.',
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        unverified = {
+            "reason": "gates_failed",
+            "failed": [
+                (g["id"], g["name"], g["detail"])
+                for g in result["gates"] if g["status"] == "FAIL"
+            ],
+        }
 
     # The appendix dereferences manifest fields run_check does not, so guard it
     # with the same fall-back rather than letting a malformed manifest crash.
     # _load/_fail inside appendix_markdown raise SystemExit, so catch that too.
     try:
-        return investigation_state.appendix_markdown(state_dir, lang=APPENDIX_LANG, result=result)
+        appendix = investigation_state.appendix_markdown(state_dir, lang=APPENDIX_LANG, result=result)
     except SystemExit as exc:
         return _unreadable(f"appendix build failed: state.py exited {exc.code}")
     except Exception as exc:
         return _unreadable(f"appendix build failed: {type(exc).__name__}: {exc}")
+    return appendix, unverified
 
 
 def _looks_like_state_manifest(path):
@@ -509,13 +602,25 @@ def main():
             )
 
     md_text = data["content"]
+    unverified = None
     if state_dir:
-        appendix_md = _run_coverage_gate(state_dir, force)
+        appendix_md, unverified = _run_coverage_gate(state_dir, force)
         if appendix_md:
             md_text = md_text.rstrip() + "\n\n---\n\n" + appendix_md + "\n"
     body_html, nav_items_html, extracted_title = md_to_html(md_text, chart_files)
 
     title = given_title or extracted_title or "Incident Report"
+
+    if unverified is not None:
+        labels = UNVERIFIED_LABELS.get(APPENDIX_LANG, UNVERIFIED_LABELS["en"])
+        output_path = _unverified_output_path(output_path)
+        title = labels["title_prefix"] + title
+        body_html = _unverified_banner_html(unverified) + body_html
+        print(
+            "warning: coverage gates did not certify this investigation -"
+            f" writing an UNVERIFIED report to {output_path}",
+            file=sys.stderr,
+        )
 
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
     html = render_report(
