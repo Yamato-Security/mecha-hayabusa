@@ -165,17 +165,33 @@ class DeterminismTests(unittest.TestCase):
         self.orig_db_path = server.DB_PATH
         self.orig_repo = server.repo
         self.orig_cache = server._LOG_COLUMNS_CACHE
+        self.orig_roots = server.DATASET_ROOTS
 
         server.DB_PATH = self.db_path
         server.repo = server.DuckDBRepository(self.db_path)
         server._LOG_COLUMNS_CACHE = None
+        server.DATASET_ROOTS = [pathlib.Path(self.tmp.name).resolve()]
         server.switch_dataset(target=str(self.csv_path))
 
     def tearDown(self) -> None:
         server.DB_PATH = self.orig_db_path
         server.repo = self.orig_repo
         server._LOG_COLUMNS_CACHE = self.orig_cache
+        server.DATASET_ROOTS = self.orig_roots
         self.tmp.cleanup()
+
+    def test_run_sql_unknown_column_error_names_the_column(self) -> None:
+        # A binder error (typo'd / non-existent column) must surface DuckDB's
+        # own message, not masquerade as the logs-table policy violation.
+        with self.assertRaises(ValueError) as ctx:
+            server.run_sql(
+                sql='SELECT "NoSuchColumn" FROM logs GROUP BY "NoSuchColumn"',
+                page_size=2,
+                page_offset=0,
+            )
+        message = str(ctx.exception)
+        self.assertIn("NoSuchColumn", message)
+        self.assertNotIn("reference the logs table", message)
 
     def test_run_sql_requires_order_by_for_offset(self) -> None:
         with self.assertRaises(ValueError):
@@ -453,16 +469,19 @@ class AllFieldInfoProfileTests(unittest.TestCase):
         self.orig_db_path = server.DB_PATH
         self.orig_repo = server.repo
         self.orig_cache = server._LOG_COLUMNS_CACHE
+        self.orig_roots = server.DATASET_ROOTS
 
         server.DB_PATH = self.db_path
         server.repo = server.DuckDBRepository(self.db_path)
         server._LOG_COLUMNS_CACHE = None
+        server.DATASET_ROOTS = [pathlib.Path(self.tmp.name).resolve()]
         server.switch_dataset(target=str(self.csv_path))
 
     def tearDown(self) -> None:
         server.DB_PATH = self.orig_db_path
         server.repo = self.orig_repo
         server._LOG_COLUMNS_CACHE = self.orig_cache
+        server.DATASET_ROOTS = self.orig_roots
         self.tmp.cleanup()
 
     def test_parse_details_field_default_raises_with_guidance(self) -> None:

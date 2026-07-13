@@ -298,6 +298,7 @@ def build_nodes_and_links(movements):
             delta = m.get("delta_minutes", 0)
             time_part = ""
             if st:
+                # Parse HH:MM from ISO timestamp
                 t_match = st[11:16] if len(st) >= 16 else ""
                 if t_match:
                     time_part = f"{t_match} (+{delta}min)"

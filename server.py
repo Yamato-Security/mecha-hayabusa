@@ -15,6 +15,53 @@ from mcp.server.fastmcp import FastMCP
 DB_PATH = pathlib.Path("hayabusa.duckdb")
 app = FastMCP("Hayabusa MCP")
 
+# Directories the server may read CSV datasets from. Defaults to the working
+# directory at startup; extend with --dataset-root. This is defense-in-depth
+# against log-embedded instructions steering the server at arbitrary files —
+# not a sandbox for the MCP client itself, which has its own file access.
+DATASET_ROOTS: list[pathlib.Path] = [pathlib.Path.cwd().resolve()]
+
+# Control characters and Unicode bidi/format overrides that can reorder or
+# hide log-embedded text when displayed. Escaped to \xNN / \uNNNN on display
+# so evidence shows exactly which codepoints are present.
+_DISPLAY_ESCAPE_PATTERN = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"   # C0 controls (except \\t \\n \\r)
+    "\u200e\u200f"                        # LRM / RLM
+    "\u202a-\u202e"                       # LRE / RLE / PDF / LRO / RLO
+    "\u2066-\u2069]"                      # LRI / RLI / FSI / PDI
+)
+
+
+def _escape_untrusted_display(value: str) -> str:
+    """Make control and bidi-override characters visible without dropping
+    information (log values are untrusted, attacker-influenced data)."""
+    def repl(match: "re.Match[str]") -> str:
+        codepoint = ord(match.group(0))
+        return f"\\x{codepoint:02x}" if codepoint < 0x100 else f"\\u{codepoint:04x}"
+    return _DISPLAY_ESCAPE_PATTERN.sub(repl, value)
+
+
+def _is_within_dataset_roots(path: pathlib.Path) -> bool:
+    for root in DATASET_ROOTS:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _ensure_within_dataset_roots(path: pathlib.Path) -> pathlib.Path:
+    """Reject a (resolved) path outside every allowed dataset root."""
+    if _is_within_dataset_roots(path):
+        return path
+    roots_label = ", ".join(str(root) for root in DATASET_ROOTS)
+    raise ValueError(
+        f"Path is outside the allowed dataset root(s): {path}."
+        f" Allowed roots: {roots_label}."
+        " Start the server with --dataset-root DIR to permit other directories."
+    )
+
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 RUN_SQL_MAX_ROWS = 500
@@ -382,7 +429,19 @@ def _query_with_pagination(
     """
     paging_params: list[object] = list(params or [])
     paging_params.extend([page_size, page_offset])
-    return repo.query_dataframe(paging_sql, paging_params), total_count
+    page_df = repo.query_dataframe(paging_sql, paging_params)
+    # Stamp a page-independent query identity for the G5 pagination audit trail
+    # (state.py log-query): the hash covers the logical SQL and its parameters
+    # but NOT page_size/page_offset, so every page of the same logical query
+    # reports the same query_hash and a fully paginated query can be re-logged
+    # with has_more cleared. _attach_pagination_metadata surfaces it.
+    page_df.attrs["hayabusa_query_meta"] = {
+        "query_hash": _query_hash(
+            normalized_sql + "|" + json.dumps(list(params or []), ensure_ascii=False, default=str)
+        ),
+        "dataset_version": _dataset_version(),
+    }
+    return page_df, total_count
 
 
 def _attach_pagination_metadata(
@@ -403,6 +462,12 @@ def _attach_pagination_metadata(
         has_more = (page_offset + returned_count) < total_count
         next_offset = (page_offset + returned_count) if has_more else None
 
+    # Merge the query identity stamped by _query_with_pagination (df.attrs) with
+    # any caller-provided extra_meta; explicit extra_meta wins (run_sql supplies
+    # its own query_hash, which must keep pairing with query_hash_hint).
+    stamped_meta = getattr(df, "attrs", {}).get("hayabusa_query_meta") or {}
+    merged_meta = {**stamped_meta, **(extra_meta or {})}
+
     if df.empty:
         row: dict[str, object] = {
             "status": status,
@@ -413,8 +478,8 @@ def _attach_pagination_metadata(
             "page_size": page_size,
             "page_offset": page_offset,
         }
-        if extra_meta:
-            row.update(extra_meta)
+        if merged_meta:
+            row.update(merged_meta)
         return pd.DataFrame([row])
 
     out = df.copy()
@@ -425,8 +490,8 @@ def _attach_pagination_metadata(
     out["next_offset"] = next_offset
     out["page_size"] = page_size
     out["page_offset"] = page_offset
-    if extra_meta:
-        for key, value in extra_meta.items():
+    if merged_meta:
+        for key, value in merged_meta.items():
             out[key] = value
     return out
 
@@ -505,7 +570,11 @@ def _validate_select_on_logs_only(sql: str) -> str:
     try:
         plan_nodes = repo.explain_json(normalized_sql)
     except duckdb.Error as exc:
-        raise ValueError("run_sql can only execute SELECT statements that reference the logs table.") from exc
+        # Surface the planner's own message (e.g. Binder Error: column not
+        # found, with its "Did you mean ...?" candidates). Reporting every
+        # planning failure as a table-policy violation sends the analyst off
+        # rewriting a query whose only problem is a typo'd column name.
+        raise ValueError(f"SQL could not be planned: {exc}") from exc
 
     scanned_tables, scanned_functions = _collect_plan_sources(plan_nodes)
 
@@ -545,7 +614,11 @@ def _search_csv_files(base_dir: pathlib.Path, recursive: bool, name_filter: str 
             continue
         if name_filter_lower and name_filter_lower not in path.name.lower():
             continue
-        files.append(path.resolve())
+        resolved = path.resolve()
+        # Drop symlinks whose target escapes the allowed dataset roots.
+        if not _is_within_dataset_roots(resolved):
+            continue
+        files.append(resolved)
 
     return sorted(files, key=lambda p: str(p).lower())
 
@@ -560,11 +633,14 @@ def _resolve_dataset_target(target: str, search_root: str = ".", recursive: bool
         resolved = explicit.resolve()
         if resolved.suffix.lower() != ".csv":
             raise ValueError(f"Please specify a CSV file: {resolved}")
-        return resolved
+        # Containment happens after resolve(), so ../ traversal and symlinks
+        # pointing outside the allowed roots are both rejected.
+        return _ensure_within_dataset_roots(resolved)
 
     root = pathlib.Path(search_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"Invalid search_root: {root}")
+    _ensure_within_dataset_roots(root)
 
     target_lower = target_text.lower()
     matches: list[pathlib.Path] = []
@@ -598,7 +674,7 @@ def _resolve_dataset_target(target: str, search_root: str = ".", recursive: bool
             f"Please specify a more specific path. Candidates: {candidates}"
         )
 
-    return matches[0]
+    return _ensure_within_dataset_roots(matches[0])
 
 
 # ──────────────────────────────────────────
@@ -645,6 +721,7 @@ def list_datasets(
     root = pathlib.Path(search_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"Invalid search_root: {root}")
+    _ensure_within_dataset_roots(root)
 
     files = _search_csv_files(root, recursive=recursive, name_filter=name_filter)
     paged_files = files[page_offset : page_offset + page_size]
@@ -1037,16 +1114,35 @@ def run_sql(
     ))
 
 
+# Rows fetched per RecordID to detect duplicated IDs. One event yields one row
+# per matching Sigma rule, and a duplicated RecordID spans a handful of events;
+# 200 rows is far above both.
+EVENT_DETAIL_SCAN_LIMIT = 200
+
+
 @app.tool()
 def get_event_detail(
     record_id: str = "",
+    computer: str = "",
+    channel: str = "",
+    rule_title: str = "",
     sql_filter: str = "",
 ):
     """
     Expands all fields of a single event in Field/Value format and returns them.
 
+    RecordIDs are NOT globally unique: the same value can denote different
+    events on different hosts/channels. When record_id alone matches multiple
+    events, this returns status="ambiguous" with one candidate row per event —
+    call again with computer (and channel) to select one.
+
     Parameters:
-        record_id (str): Specify by RecordID (mutually exclusive)
+        record_id (str): Specify by RecordID (mutually exclusive with sql_filter)
+        computer (str): Narrow record_id to this exact Computer value
+        channel (str): Narrow record_id further to this exact Channel value
+        rule_title (str): When several rules matched the same event, return that
+                          rule's row (exact match). Otherwise the first row is
+                          returned and _MatchedRuleTitles lists the others
         sql_filter (str): Specify by SQL condition equivalent to WHERE clause (mutually exclusive).
                           Example: "Level = 'crit'" -> SELECT * FROM logs WHERE Level = 'crit' LIMIT 1
     """
@@ -1056,11 +1152,67 @@ def get_event_detail(
         raise ValueError("record_id and sql_filter cannot be specified at the same time. Please specify one or the other.")
     if not record_id.strip() and not sql_filter.strip():
         raise ValueError("Please specify either record_id or sql_filter.")
+    if sql_filter.strip() and (computer.strip() or channel.strip() or rule_title.strip()):
+        raise ValueError(
+            "computer/channel/rule_title can only be combined with record_id."
+            " Put the condition inside sql_filter instead."
+        )
 
     if record_id.strip():
         _ensure_columns_exist(["RecordID"], context="get_event_detail")
-        fetch_sql = f'SELECT * FROM logs WHERE "RecordID" = ? LIMIT 1'
-        row_df = repo.query_dataframe(fetch_sql, [record_id.strip()])
+        columns = _get_logs_columns()
+        conditions = ['"RecordID" = ?']
+        params: list[object] = [record_id.strip()]
+        for column_name, value in (("Computer", computer), ("Channel", channel), ("RuleTitle", rule_title)):
+            if value.strip():
+                _ensure_columns_exist([column_name], context="get_event_detail")
+                conditions.append(f'{_quote_identifier(column_name)} = ?')
+                params.append(value.strip())
+        order_parts = [
+            f'{_quote_identifier(c)} ASC'
+            for c in ("Computer", "Channel", "RuleTitle", "Timestamp")
+            if c in columns
+        ]
+        order_expr = f" ORDER BY {', '.join(order_parts)}" if order_parts else ""
+        fetch_sql = (
+            f'SELECT * FROM logs WHERE {" AND ".join(conditions)}'
+            f'{order_expr} LIMIT {EVENT_DETAIL_SCAN_LIMIT}'
+        )
+        row_df = repo.query_dataframe(fetch_sql, params)
+
+        event_cols = [c for c in ("Computer", "Channel") if c in row_df.columns]
+        if not row_df.empty and event_cols:
+            events = row_df[event_cols].drop_duplicates()
+            if len(events) > 1:
+                # The ref is ambiguous: report one candidate per event instead
+                # of silently returning an arbitrary first match.
+                candidates: list[dict[str, object]] = []
+                for _, event_row in events.iterrows():
+                    mask = pd.Series(True, index=row_df.index)
+                    for c in event_cols:
+                        mask &= row_df[c] == event_row[c]
+                    sub = row_df[mask]
+                    cand: dict[str, object] = {"RecordID": record_id.strip()}
+                    for c in event_cols:
+                        cand[c] = str(event_row[c])
+                    if "Timestamp" in sub.columns:
+                        cand["Timestamp"] = str(sub.iloc[0]["Timestamp"])
+                    if "RuleTitle" in sub.columns:
+                        titles = sorted({str(v) for v in sub["RuleTitle"].tolist()})
+                        cand["RuleTitles"] = ", ".join(titles[:5]) + (" ..." if len(titles) > 5 else "")
+                    cand["MatchedRows"] = int(len(sub))
+                    candidates.append(cand)
+                return _WideDisplayDataFrame(_attach_pagination_metadata(
+                    pd.DataFrame(candidates),
+                    total_count=len(candidates),
+                    page_size=len(candidates),
+                    page_offset=0,
+                    status="ambiguous",
+                    message=(
+                        f"RecordID {record_id.strip()} matches {len(candidates)} different events."
+                        " Call get_event_detail again with computer= (and channel=) to select one."
+                    ),
+                ))
     else:
         full_sql = f"SELECT * FROM logs WHERE {sql_filter.strip()} LIMIT 1"
         _validate_select_on_logs_only(full_sql)
@@ -1079,9 +1231,21 @@ def get_event_detail(
     row = row_df.iloc[0]
     result_rows: list[dict[str, str]] = []
 
+    # One event detected by several rules: surface the alternatives instead of
+    # hiding them (each row is one rule's view of the same event).
+    if len(row_df) > 1 and "RuleTitle" in row_df.columns:
+        titles = sorted({str(v) for v in row_df["RuleTitle"].tolist()})
+        result_rows.append({"Field": "_MatchedRows", "Value": str(len(row_df))})
+        result_rows.append({
+            "Field": "_MatchedRuleTitles",
+            "Value": ", ".join(titles) + " (pass rule_title= to select another row)",
+        })
+
     for col in row_df.columns:
         val = row[col]
-        str_val = "" if pd.isna(val) else str(val)
+        # Log values are untrusted: make control/bidi characters visible so
+        # display-order tricks (e.g. RLO filename spoofing) cannot hide content.
+        str_val = "" if pd.isna(val) else _escape_untrusted_display(str(val))
 
         if col in ("Details", "ExtraFieldInfo", "AllFieldInfo") and str_val:
             prefix = {"Details": "Details", "ExtraFieldInfo": "Extra", "AllFieldInfo": "AllField"}[col]
@@ -2236,7 +2400,9 @@ def decode_powershell_commands(
                 "RuleTitle": str(row.get("RuleTitle", "")),
                 "Level": str(row.get("Level", "")),
                 "EncodedCommand": encoded_short,
-                "DecodedCommand": decoded,
+                # Decoded payloads are attacker-controlled bytes: keep control
+                # and bidi characters visible instead of rendering them.
+                "DecodedCommand": _escape_untrusted_display(decoded),
             })
 
     if not decoded_rows:
@@ -2249,6 +2415,9 @@ def decode_powershell_commands(
     all_df = pd.DataFrame(decoded_rows)
     total = len(all_df)
     paged = all_df.iloc[page_offset : page_offset + page_size].reset_index(drop=True)
+    # The decoded frame is rebuilt from scratch, so carry over the query
+    # identity stamped on the raw query result (G5 audit trail).
+    paged.attrs = dict(raw_df.attrs)
 
     if paged.empty:
         return _WideDisplayDataFrame(_attach_pagination_metadata(
@@ -2408,7 +2577,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable JSON response mode",
     )
+    parser.add_argument(
+        "--dataset-root",
+        action="append",
+        default=None,
+        metavar="DIR",
+        help="Directory the server may read CSV datasets from (repeatable)."
+             " Defaults to the current working directory. Paths outside every"
+             " root — including symlink targets — are rejected.",
+    )
     args = parser.parse_args()
+    if args.dataset_root:
+        roots = []
+        for raw in args.dataset_root:
+            root = pathlib.Path(raw).expanduser().resolve()
+            if not root.is_dir():
+                parser.error(f"--dataset-root is not a directory: {root}")
+            roots.append(root)
+        DATASET_ROOTS = roots
     transport = "streamable-http" if args.transport == "http" else args.transport
     status = repo.get_dataset_status()
 
@@ -2429,6 +2615,7 @@ if __name__ == "__main__":
         print(f"Current dataset: {status.get('dataset_path', '')}")
     else:
         print("No dataset loaded. Please load a CSV using the switch_dataset tool.")
+    print("Dataset root(s): " + ", ".join(str(root) for root in DATASET_ROOTS))
 
     try:
         app.run(transport=transport)
