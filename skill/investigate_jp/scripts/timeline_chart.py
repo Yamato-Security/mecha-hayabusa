@@ -12,12 +12,12 @@ Input: JSON from stdin with the following structure:
     {"name": "Phase 1: Initial Access", "start": "2024-09-12T08:00:00", "end": "2024-09-12T09:00:00"},
     ...
   ],
-  "title": "Incident Timeline",
+  "title": "インシデントタイムライン",
   "output": "/path/to/output.html"
 }
 
 - "phases" is optional. If provided, a phase ribbon is drawn above the chart.
-- "title" is optional (default: "Incident Timeline").
+- "title" is optional (default: "インシデントタイムライン").
 - "output" is required.
 """
 
@@ -156,7 +156,7 @@ def main():
     data = json.load(sys.stdin)
     events = data["events"]
     phases = data.get("phases", [])
-    title = data.get("title", "Incident Timeline")
+    title = data.get("title", "インシデントタイムライン")
     output_path = data["output"]
 
     if not output_path.lower().endswith(".html"):

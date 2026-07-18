@@ -24,8 +24,12 @@ EN_SCRIPTS = REPO_ROOT / "skill" / "investigate" / "scripts"
 PAIRED_SCRIPTS: dict[str, dict[str, str]] = {
     "state.py": {},
     "report.py": {'APPENDIX_LANG = "ja"': 'APPENDIX_LANG = "en"'},
-    "timeline_chart.py": {},
-    "mitre_flow.py": {},
+    "timeline_chart.py": {
+        "インシデントタイムライン": "Incident Timeline",
+    },
+    "mitre_flow.py": {
+        "攻撃フロー (MITRE ATT&CK)": "Attack Flow (MITRE ATT&CK)",
+    },
     "lateral_movement_chart.py": {
         "横展開分析 (Lateral Movement)": "Lateral Movement Analysis",
     },

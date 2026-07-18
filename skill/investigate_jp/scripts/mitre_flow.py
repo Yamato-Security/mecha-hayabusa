@@ -15,11 +15,11 @@ Input: JSON from stdin with the following structure:
     },
     ...
   ],
-  "title": "Attack Flow (MITRE ATT&CK)",
+  "title": "攻撃フロー (MITRE ATT&CK)",
   "output": "/path/to/output.html"
 }
 
-- "title" is optional (default: "Attack Flow (MITRE ATT&CK)").
+- "title" is optional (default: "攻撃フロー (MITRE ATT&CK)").
 - "output" is required.
 """
 
@@ -239,7 +239,7 @@ def render_html(template, *, title, nodes_json, links_json, echarts_js):
 def main():
     data = json.load(sys.stdin)
     tactics = data["tactics"]
-    title = data.get("title", "Attack Flow (MITRE ATT&CK)")
+    title = data.get("title", "攻撃フロー (MITRE ATT&CK)")
     output_path = data["output"]
 
     if not output_path.lower().endswith(".html"):
