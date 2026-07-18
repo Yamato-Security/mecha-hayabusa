@@ -221,8 +221,14 @@ def build_nodes_and_links(tactics):
 
 
 def _safe_js_json(s):
-    """Escape sequences that could break out of a <script> block."""
-    return s.replace("</", r"<\/")
+    """Escape sequences that could break out of a <script> block, plus the
+    JS line terminators U+2028/U+2029 which are not valid inside a JS string
+    literal and could otherwise break the injected JSON data island."""
+    return (
+        s.replace("</", r"<\/")
+        .replace("\u2028", r"\u2028")
+        .replace("\u2029", r"\u2029")
+    )
 
 
 def render_html(template, *, title, nodes_json, links_json, echarts_js):

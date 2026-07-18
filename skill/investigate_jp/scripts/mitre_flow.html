@@ -24,6 +24,19 @@
   var NODES = {{NODES_JSON}};
   var LINKS = {{LINKS_JSON}};
 
+  /* Node/tactic values come from untrusted log data (rule titles, hosts,
+     technique text). ECharts renders a tooltip formatter's string return as
+     HTML, so every interpolated value must be HTML-escaped to prevent
+     DOM-based injection. */
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   /* ---- tooltip formatter ---- */
   function tooltipFormatter(params) {
     if (!params.data) return '';
@@ -31,14 +44,14 @@
     if (params.data.tacticInfo) {
       var t = params.data.tacticInfo;
       var html = '<div style="max-width:420px;word-wrap:break-word;">'
-        + '<b style="font-size:14px;">' + t.name + '</b> <span style="color:#888;">(' + t.id + ')</span><br/>';
-      if (t.event_count) html += '<span style="color:#666;">Events:</span> ' + t.event_count + '<br/>';
-      if (t.time_range) html += '<span style="color:#666;">Time:</span> ' + t.time_range + '<br/>';
-      if (t.hosts && t.hosts.length) html += '<span style="color:#666;">Hosts:</span> ' + t.hosts.join(', ') + '<br/>';
+        + '<b style="font-size:14px;">' + escapeHtml(t.name) + '</b> <span style="color:#888;">(' + escapeHtml(t.id) + ')</span><br/>';
+      if (t.event_count) html += '<span style="color:#666;">Events:</span> ' + escapeHtml(t.event_count) + '<br/>';
+      if (t.time_range) html += '<span style="color:#666;">Time:</span> ' + escapeHtml(t.time_range) + '<br/>';
+      if (t.hosts && t.hosts.length) html += '<span style="color:#666;">Hosts:</span> ' + escapeHtml(t.hosts.join(', ')) + '<br/>';
       if (t.techniques && t.techniques.length) {
         html += '<span style="color:#666;">Techniques:</span><br/>';
         t.techniques.forEach(function(tech) {
-          html += '&nbsp;&nbsp;• ' + tech + '<br/>';
+          html += '&nbsp;&nbsp;• ' + escapeHtml(tech) + '<br/>';
         });
       }
       html += '</div>';
@@ -46,7 +59,7 @@
     }
     // Technique node
     if (params.dataType === 'node') {
-      return '<b>' + params.data.name + '</b>';
+      return '<b>' + escapeHtml(params.data.name) + '</b>';
     }
     return '';
   }

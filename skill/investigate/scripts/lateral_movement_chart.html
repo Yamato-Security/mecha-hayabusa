@@ -52,6 +52,15 @@
   };
 
   /* ---- tooltip formatter ---- */
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   function tooltipFormatter(params) {
     if (!params.data) return '';
 
@@ -59,14 +68,14 @@
     if (params.dataType === 'node') {
       var d = params.data;
       var html = '<div style="max-width:400px;word-wrap:break-word;">'
-        + '<b style="font-size:14px;">' + d.name + '</b><br/>';
+        + '<b style="font-size:14px;">' + escapeHtml(d.name) + '</b><br/>';
       if (d.hostInfo) {
         var h = d.hostInfo;
-        html += '<span style="color:#666;">Events:</span> ' + h.event_count + '<br/>';
-        html += '<span style="color:#666;">As source:</span> ' + h.as_source + '<br/>';
-        html += '<span style="color:#666;">As target:</span> ' + h.as_target + '<br/>';
+        html += '<span style="color:#666;">Events:</span> ' + escapeHtml(h.event_count) + '<br/>';
+        html += '<span style="color:#666;">As source:</span> ' + escapeHtml(h.as_source) + '<br/>';
+        html += '<span style="color:#666;">As target:</span> ' + escapeHtml(h.as_target) + '<br/>';
         if (h.levels && h.levels.length) {
-          html += '<span style="color:#666;">Severity:</span> ' + h.levels.join(', ') + '<br/>';
+          html += '<span style="color:#666;">Severity:</span> ' + escapeHtml(h.levels.join(', ')) + '<br/>';
         }
       }
       html += '</div>';
@@ -81,19 +90,19 @@
       var sc = LEVEL_COLORS[m.source_level] || '#666';
       var tc = LEVEL_COLORS[m.target_level] || '#666';
       var html = '<div style="max-width:450px;word-wrap:break-word;">'
-        + '<b>' + m.source_host + ' &rarr; ' + m.target_host + '</b><br/>'
+        + '<b>' + escapeHtml(m.source_host) + ' &rarr; ' + escapeHtml(m.target_host) + '</b><br/>'
         + '<hr style="border:none;border-top:1px solid #eee;margin:4px 0;"/>'
         + '<span style="color:#666;">Source event:</span> '
-        + '<b style="color:' + sc + '">[' + m.source_level.toUpperCase() + ']</b> '
-        + m.source_event + '<br/>'
-        + '<span style="color:#666;">Source time:</span> ' + m.source_time + '<br/>'
+        + '<b style="color:' + sc + '">[' + escapeHtml(m.source_level.toUpperCase()) + ']</b> '
+        + escapeHtml(m.source_event) + '<br/>'
+        + '<span style="color:#666;">Source time:</span> ' + escapeHtml(m.source_time) + '<br/>'
         + '<hr style="border:none;border-top:1px solid #eee;margin:4px 0;"/>'
         + '<span style="color:#666;">Target event:</span> '
-        + '<b style="color:' + tc + '">[' + m.target_level.toUpperCase() + ']</b> '
-        + m.target_event + '<br/>'
-        + '<span style="color:#666;">Target time:</span> ' + m.target_time + '<br/>'
+        + '<b style="color:' + tc + '">[' + escapeHtml(m.target_level.toUpperCase()) + ']</b> '
+        + escapeHtml(m.target_event) + '<br/>'
+        + '<span style="color:#666;">Target time:</span> ' + escapeHtml(m.target_time) + '<br/>'
         + '<hr style="border:none;border-top:1px solid #eee;margin:4px 0;"/>'
-        + '<span style="color:#666;">Delta:</span> ' + m.delta_minutes + ' min'
+        + '<span style="color:#666;">Delta:</span> ' + escapeHtml(m.delta_minutes) + ' min'
         + '</div>';
       return html;
     }

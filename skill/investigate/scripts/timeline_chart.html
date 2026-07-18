@@ -184,17 +184,26 @@
   }
 
   /* ---- tooltip formatter ---- */
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   function tooltipFormatter(params) {
     if (!params.data || !params.data.event) return '';
     var e = params.data.event;
     var lc = { crit:'#DC143C', high:'#FF8C00', med:'#FFD700', low:'#4682B4', info:'#A9A9A9' };
     var c = lc[e.level] || '#666';
     return '<div style="max-width:400px;word-wrap:break-word;">'
-      + '<b style="color:' + c + '">[' + e.level.toUpperCase() + ']</b> '
-      + '<b>' + (e.rule || '') + '</b><br/>'
-      + '<span style="color:#666">Host:</span> ' + e.host + '<br/>'
-      + '<span style="color:#666">Time:</span> ' + e.timestamp + '<br/>'
-      + (e.mitre ? '<span style="color:#666">MITRE:</span> ' + e.mitre + '<br/>' : '')
+      + '<b style="color:' + c + '">[' + escapeHtml(e.level.toUpperCase()) + ']</b> '
+      + '<b>' + escapeHtml(e.rule || '') + '</b><br/>'
+      + '<span style="color:#666">Host:</span> ' + escapeHtml(e.host) + '<br/>'
+      + '<span style="color:#666">Time:</span> ' + escapeHtml(e.timestamp) + '<br/>'
+      + (e.mitre ? '<span style="color:#666">MITRE:</span> ' + escapeHtml(e.mitre) + '<br/>' : '')
       + '</div>';
   }
 
