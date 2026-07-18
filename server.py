@@ -2586,7 +2586,20 @@ if __name__ == "__main__":
              " Defaults to the current working directory. Paths outside every"
              " root — including symlink targets — are rejected.",
     )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        metavar="FILE",
+        help="Path to the DuckDB working database (default: ./hayabusa.duckdb in"
+             " the current working directory). A server instance holds one loaded"
+             " dataset in a single 'logs' table and is designed for one"
+             " analyst/client at a time; run separate instances with distinct"
+             " --db-path files rather than pointing several clients at one server.",
+    )
     args = parser.parse_args()
+    if args.db_path:
+        DB_PATH = pathlib.Path(args.db_path).expanduser().resolve()
+        repo.db_path = DB_PATH
     if args.dataset_root:
         roots = []
         for raw in args.dataset_root:
@@ -2615,6 +2628,7 @@ if __name__ == "__main__":
         print(f"Current dataset: {status.get('dataset_path', '')}")
     else:
         print("No dataset loaded. Please load a CSV using the switch_dataset tool.")
+    print(f"Database: {repo.db_path}")
     print("Dataset root(s): " + ", ".join(str(root) for root in DATASET_ROOTS))
 
     try:
