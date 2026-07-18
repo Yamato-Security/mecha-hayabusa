@@ -39,6 +39,24 @@ Endpoint:
 http://127.0.0.1:9999/mcp
 ```
 
+By default the server may only read CSV files under the directory it was started in. To allow other locations, pass one or more `--dataset-root` options (repeatable); paths outside every allowed root — including symlink targets — are rejected:
+
+```bash
+uv run server.py --transport http --port 9999 --dataset-root /path/to/logs
+```
+
+## Install the investigate Skill
+
+The `/investigate` skill used by the prompt below ships in this repository under `skill/`. Copy both the English and Japanese skill directories into your Claude skills directory so Claude Code can find them:
+
+```bash
+mkdir -p ~/.claude/skills
+cp -r skill/investigate ~/.claude/skills/
+cp -r skill/investigate_jp ~/.claude/skills/
+```
+
+The skill's helper scripts (`state.py`, `report.py`, and the chart generators) are then available at `~/.claude/skills/investigate/scripts/`, which is where the skill expects them.
+
 ## How to add to Claude
 
 ```bash
