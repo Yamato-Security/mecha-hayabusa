@@ -2314,6 +2314,12 @@ _ENCODED_PS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Upper bound on candidate rows scanned for encoded-PowerShell decoding. The
+# candidate set is already narrowed by the -enc LIKE predicates, so this is a
+# generous ceiling; when the true match count exceeds it the response reports
+# status="partial" rather than silently truncating.
+MAX_DECODE_SCAN_ROWS = 5000
+
 
 @app.tool()
 def decode_powershell_commands(
@@ -2374,8 +2380,10 @@ def decode_powershell_commands(
     """
 
     raw_df, total_count = _query_with_pagination(
-        query, params, page_size=page_size * 2, page_offset=0, include_total=True
+        query, params, page_size=MAX_DECODE_SCAN_ROWS, page_offset=0, include_total=True
     )
+    scan_truncated = total_count is not None and total_count > MAX_DECODE_SCAN_ROWS
+    source_event_count = int(total_count) if total_count is not None else len(raw_df)
 
     if total_count == 0 or raw_df.empty:
         return _WideDisplayDataFrame(_attach_pagination_metadata(
@@ -2419,16 +2427,32 @@ def decode_powershell_commands(
     # identity stamped on the raw query result (G5 audit trail).
     paged.attrs = dict(raw_df.attrs)
 
+    # source_event_count is the true number of matching source events (which can
+    # differ from the decoded-row count, since one event may hold several encoded
+    # blobs). When the match count exceeds the scan cap, say so explicitly instead
+    # of reporting the capped window as if it were complete.
+    decode_meta = {"source_event_count": source_event_count}
+    status, message = "ok", ""
+    if scan_truncated:
+        status = "partial"
+        message = (
+            f"Scan capped at {MAX_DECODE_SCAN_ROWS} of {source_event_count} matching"
+            " events; narrow with level/rule_title/detail_source to decode the rest."
+        )
+
     if paged.empty:
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=total,
             page_size=page_size, page_offset=page_offset,
             status="no_data", message="No data on the specified page",
+            extra_meta=decode_meta,
         ))
 
     return _WideDisplayDataFrame(_attach_pagination_metadata(
         paged, total_count=total,
         page_size=page_size, page_offset=page_offset,
+        status=status, message=message,
+        extra_meta=decode_meta,
     ))
 
 

@@ -354,6 +354,15 @@ class DeterminismTests(unittest.TestCase):
         decoded_values = df["DecodedCommand"].tolist()
         self.assertTrue(any("test" in str(v) for v in decoded_values))
 
+    def test_decode_powershell_commands_reports_source_event_count(self) -> None:
+        # The decoder now surfaces the true number of matching source events
+        # (source_event_count) and reports status="partial" only when the scan
+        # cap is exceeded, so a complete scan is never silently truncated.
+        df = server.decode_powershell_commands()
+        self.assertIn("source_event_count", df.columns)
+        self.assertGreaterEqual(int(df.iloc[0]["source_event_count"]), 1)
+        self.assertEqual(df.iloc[0]["status"], "ok")
+
     # P6: correlate_lateral_movement
     def test_correlate_lateral_movement(self) -> None:
         df = server.correlate_lateral_movement(time_window_minutes=5)
