@@ -236,8 +236,21 @@ def render_html(template, *, title, nodes_json, links_json, echarts_js):
     return html
 
 
+def _fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
 def main():
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        _fail(f"input is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        _fail("input must be a JSON object")
+    for key in ("tactics", "output"):
+        if key not in data:
+            _fail(f"missing required key: {key!r}")
     tactics = data["tactics"]
     title = data.get("title", "Attack Flow (MITRE ATT&CK)")
     output_path = data["output"]

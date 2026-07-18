@@ -357,8 +357,21 @@ def render_html(template, *, title, nodes_json, links_json, echarts_js):
     return html
 
 
+def _fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
 def main():
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        _fail(f"input is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        _fail("input must be a JSON object")
+    for key in ("movements", "output"):
+        if key not in data:
+            _fail(f"missing required key: {key!r}")
     movements = data["movements"]
     title = data.get("title", "Lateral Movement Analysis")
     output_path = data["output"]

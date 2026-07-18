@@ -152,8 +152,21 @@ def render_html(template, *, title, all_events_json, phases_json, segments_json,
     return html
 
 
+def _fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
 def main():
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        _fail(f"input is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        _fail("input must be a JSON object")
+    for key in ("events", "output"):
+        if key not in data:
+            _fail(f"missing required key: {key!r}")
     events = data["events"]
     phases = data.get("phases", [])
     title = data.get("title", "Incident Timeline")
