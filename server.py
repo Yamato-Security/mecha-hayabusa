@@ -496,6 +496,42 @@ def _attach_pagination_metadata(
     return out
 
 
+def _finalize_page(
+    df: pd.DataFrame,
+    *,
+    total_count: int | None,
+    page_size: int,
+    page_offset: int,
+    empty_message: str,
+    page_message: str = "No data on the specified page",
+    extra_meta: dict[str, object] | None = None,
+    wrap=None,
+) -> pd.DataFrame:
+    """Uniform end-of-query response shape shared by the paginated tools:
+    an empty frame with `empty_message` when the query matched nothing,
+    an empty frame with `page_message` when the requested page is past the
+    data, otherwise the paginated rows — each stamped with pagination
+    metadata. `wrap` optionally post-processes the frame (e.g. to
+    `_WideDisplayDataFrame`)."""
+    apply_wrap = wrap or (lambda d: d)
+    if total_count == 0:
+        return apply_wrap(_attach_pagination_metadata(
+            pd.DataFrame(), total_count=total_count, page_size=page_size,
+            page_offset=page_offset, status="no_data", message=empty_message,
+            extra_meta=extra_meta,
+        ))
+    if df.empty:
+        return apply_wrap(_attach_pagination_metadata(
+            pd.DataFrame(), total_count=total_count, page_size=page_size,
+            page_offset=page_offset, status="no_data", message=page_message,
+            extra_meta=extra_meta,
+        ))
+    return apply_wrap(_attach_pagination_metadata(
+        df, total_count=total_count, page_size=page_size, page_offset=page_offset,
+        extra_meta=extra_meta,
+    ))
+
+
 def _has_order_by_clause(sql: str) -> bool:
     normalized = re.sub(r"\s+", " ", sql).strip().lower()
     return " order by " in f" {normalized} "
@@ -1527,29 +1563,12 @@ def analyze_mitre_tactics(
     """
 
     result_df, total_count = _query_with_pagination(query, params, page_size=page_size, page_offset=page_offset)
-    if total_count == 0:
-        return _attach_pagination_metadata(
-            pd.DataFrame(),
-            total_count=total_count,
-            page_size=page_size,
-            page_offset=page_offset,
-            status="no_data",
-            message="No matching tactics found",
-        )
-    if result_df.empty:
-        return _attach_pagination_metadata(
-            pd.DataFrame(),
-            total_count=total_count,
-            page_size=page_size,
-            page_offset=page_offset,
-            status="no_data",
-            message="No data on the specified page",
-        )
-    return _attach_pagination_metadata(
+    return _finalize_page(
         result_df,
         total_count=total_count,
         page_size=page_size,
         page_offset=page_offset,
+        empty_message="No matching tactics found",
     )
 
 
@@ -1621,29 +1640,12 @@ def summarize_events(
         paged_params.append(top_n)
 
     result_df, total_count = _query_with_pagination(query, paged_params, page_size=page_size, page_offset=page_offset)
-    if total_count == 0:
-        return _attach_pagination_metadata(
-            pd.DataFrame(),
-            total_count=total_count,
-            page_size=page_size,
-            page_offset=page_offset,
-            status="no_data",
-            message="No events matched the specified condition",
-        )
-    if result_df.empty:
-        return _attach_pagination_metadata(
-            pd.DataFrame(),
-            total_count=total_count,
-            page_size=page_size,
-            page_offset=page_offset,
-            status="no_data",
-            message="No data on the specified page",
-        )
-    return _attach_pagination_metadata(
+    return _finalize_page(
         result_df,
         total_count=total_count,
         page_size=page_size,
         page_offset=page_offset,
+        empty_message="No events matched the specified condition",
     )
 
 
@@ -1713,29 +1715,12 @@ def summarize_by_time_window(
     """
 
     result_df, total_count = _query_with_pagination(query, params, page_size=page_size, page_offset=page_offset)
-    if total_count == 0:
-        return _attach_pagination_metadata(
-            pd.DataFrame(),
-            total_count=0,
-            page_size=page_size,
-            page_offset=page_offset,
-            status="no_data",
-            message="No events matched the specified condition",
-        )
-    if result_df.empty:
-        return _attach_pagination_metadata(
-            pd.DataFrame(),
-            total_count=total_count,
-            page_size=page_size,
-            page_offset=page_offset,
-            status="no_data",
-            message="No data on the specified page",
-        )
-    return _attach_pagination_metadata(
+    return _finalize_page(
         result_df,
         total_count=total_count,
         page_size=page_size,
         page_offset=page_offset,
+        empty_message="No events matched the specified condition",
     )
 
 
@@ -2291,21 +2276,12 @@ def extract_iocs(
         query, params, page_size=page_size, page_offset=page_offset
     )
 
-    if total_count == 0:
-        return _attach_pagination_metadata(
-            pd.DataFrame(), total_count=0,
-            page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No IOCs found",
-        )
-    if result_df.empty:
-        return _attach_pagination_metadata(
-            pd.DataFrame(), total_count=total_count,
-            page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No data on the specified page",
-        )
-    return _attach_pagination_metadata(
-        result_df, total_count=total_count,
-        page_size=page_size, page_offset=page_offset,
+    return _finalize_page(
+        result_df,
+        total_count=total_count,
+        page_size=page_size,
+        page_offset=page_offset,
+        empty_message="No IOCs found",
     )
 
 
@@ -2530,22 +2506,12 @@ def correlate_lateral_movement(
         query, params, page_size=page_size, page_offset=page_offset
     )
 
-    if total_count == 0:
-        return _attach_pagination_metadata(
-            pd.DataFrame(), total_count=0,
-            page_size=page_size, page_offset=page_offset,
-            status="no_data",
-            message="No lateral movement patterns detected",
-        )
-    if result_df.empty:
-        return _attach_pagination_metadata(
-            pd.DataFrame(), total_count=total_count,
-            page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No data on the specified page",
-        )
-    return _attach_pagination_metadata(
-        result_df, total_count=total_count,
-        page_size=page_size, page_offset=page_offset,
+    return _finalize_page(
+        result_df,
+        total_count=total_count,
+        page_size=page_size,
+        page_offset=page_offset,
+        empty_message="No lateral movement patterns detected",
     )
 
 
