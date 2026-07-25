@@ -299,7 +299,21 @@ def main():
     for key in ("tactics", "output"):
         if key not in data:
             _fail(f"missing required key: {key!r}")
-    tactics = _require_list(data, "tactics")
+    tactics = data["tactics"]
+    title = data.get("title", "Attack Flow (MITRE ATT&CK)")
+    output_path = data["output"]
+
+    if not output_path.lower().endswith(".html"):
+        print(f"Output path must end with .html, got: {output_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Validated here rather than beside the assignment so this block stays
+    # clear of the localized title default the JP tree overrides.
+    if not isinstance(tactics, list):
+        _fail(f"'tactics' must be a list, got {type(tactics).__name__}")
+    if not tactics:
+        print("No tactics to plot", file=sys.stderr)
+        sys.exit(1)
     for index, tac in enumerate(tactics):
         _item_dict(tac, index, "tactics")
         # Normalised in place, not just checked: an explicit null passes
@@ -316,16 +330,6 @@ def main():
             tac["event_count"] = 0
         elif isinstance(count, bool) or not isinstance(count, (int, float)):
             _fail(f"tactics[{index}].event_count must be a number, got {type(count).__name__}")
-    title = data.get("title", "Attack Flow (MITRE ATT&CK)")
-    output_path = data["output"]
-
-    if not output_path.lower().endswith(".html"):
-        print(f"Output path must end with .html, got: {output_path}", file=sys.stderr)
-        sys.exit(1)
-
-    if not tactics:
-        print("No tactics to plot", file=sys.stderr)
-        sys.exit(1)
 
     nodes, links = build_nodes_and_links(tactics)
     nodes_json = json.dumps(nodes, ensure_ascii=False)

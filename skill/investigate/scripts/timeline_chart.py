@@ -215,7 +215,7 @@ def main():
     for key in ("events", "output"):
         if key not in data:
             _fail(f"missing required key: {key!r}")
-    events = _require_list(data, "events")
+    events = data["events"]
     phases = data.get("phases", [])
     title = data.get("title", "Incident Timeline")
     output_path = data["output"]
@@ -224,6 +224,10 @@ def main():
         print(f"Output path must end with .html, got: {output_path}", file=sys.stderr)
         sys.exit(1)
 
+    # Validated here rather than beside the assignment so this block stays
+    # clear of the localized title default the JP tree overrides.
+    if not isinstance(events, list):
+        _fail(f"'events' must be a list, got {type(events).__name__}")
     if not events:
         print("No events to plot", file=sys.stderr)
         sys.exit(1)
