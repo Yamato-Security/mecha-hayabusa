@@ -39,13 +39,13 @@ CSV_HEADER = [
 ]
 
 HOSTS = ["DC01", "WS01", "WS02", "FS01"]
-# 4,000 correlatable events spread over 30 minutes. Inside a 60-minute window
-# they all fall in one bucket (~12M candidate pairs, above the limit); inside a
-# 1-minute window they spread over 30 buckets (~0.4M, comfortably below it).
+# 6,000 correlatable events spread over 30 minutes. At a 60-minute window the
+# estimate is ~20M candidate pairs, above the limit; at a 1-minute window the
+# quarter-window grid spreads them far enough to fall to ~1M, well below it.
 # That gap is what makes the window-sensitivity test meaningful.
 DENSE_ROWS = [
     [
-        f"2024-06-01 00:{(i * 30) // 4000:02d}:{i % 60:02d}.000 +00:00",
+        f"2024-06-01 00:{(i * 30) // 6000:02d}:{i % 60:02d}.000 +00:00",
         "Remote Logon",
         "high",
         HOSTS[i % len(HOSTS)],
@@ -57,7 +57,7 @@ DENSE_ROWS = [
         f"TgtUser: user{i % 20}",
         "",
     ]
-    for i in range(4000)
+    for i in range(6000)
 ]
 
 # A handful of events on a distinct rule and host pair, used to prove that a
@@ -188,6 +188,63 @@ class CorrelationGuardTests(unittest.TestCase):
         estimate = self._estimate(time_window_minutes=5)
         actual = self._call(time_window_minutes=5)["total_count"]
         self.assertGreaterEqual(estimate, actual)
+
+    def test_cluster_just_outside_the_window_is_not_charged(self) -> None:
+        """Two clusters that cannot pair must not be refused.
+
+        Charging a whole adjacent bucket counted every cross-bucket pair even
+        when the two clusters were nearly two windows apart, so a query with
+        zero possible matches was refused — and at the minimum window with
+        exact host filters, none of the remedies the refusal suggests could
+        help.
+        """
+        rows = []
+        for i in range(3200):
+            rows.append(self._row("2024-07-01 00:00:00.000 +00:00", "SOURCE", i))
+            rows.append(self._row("2024-07-01 00:01:59.000 +00:00", "TARGET", 10000 + i))
+        self._reload_with(rows)
+
+        result = self._call(
+            time_window_minutes=1, source_host="SOURCE", target_host="TARGET", level="high"
+        )
+        self.assertNotEqual(result["status"], "too_broad")
+        self.assertEqual(result["total_count"], 0)
+
+    def test_a_shorter_window_never_turns_a_served_call_into_a_refusal(self) -> None:
+        """The estimate must not jump when the bucket grid realigns.
+
+        With clusters six minutes apart, a five-minute window was served while
+        a *four*-minute window refused, because the shorter grid happened to
+        put the two clusters in adjacent buckets. "Try a shorter window" has to
+        be safe advice.
+        """
+        rows = []
+        for i in range(3200):
+            rows.append(self._row("2024-07-01 00:04:06.000 +00:00", "SOURCE", i))
+            rows.append(self._row("2024-07-01 00:10:06.000 +00:00", "TARGET", 10000 + i))
+        self._reload_with(rows)
+
+        for window in (5, 4, 3, 2, 1):
+            result = self._call(
+                time_window_minutes=window, source_host="SOURCE", target_host="TARGET", level="high"
+            )
+            self.assertNotEqual(
+                result["status"], "too_broad", f"refused at time_window_minutes={window}"
+            )
+
+    def _row(self, timestamp: str, computer: str, record_id: int) -> list[str]:
+        return [
+            timestamp, "Remote Logon", "high", computer, "Sec", "4624",
+            "LatMov", "T1021", str(record_id), "TgtUser: svc", "",
+        ]
+
+    def _reload_with(self, rows: list[list[str]]) -> None:
+        with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(CSV_HEADER)
+            writer.writerows(rows)
+        server._LOG_COLUMNS_CACHE = None
+        server.switch_dataset(target=str(self.csv_path))
 
     # ── serving ────────────────────────────────────────────────────────────
     def test_narrowing_by_host_correlates_normally(self) -> None:

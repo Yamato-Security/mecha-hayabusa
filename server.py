@@ -71,6 +71,10 @@ MAX_PAGE_SIZE = 1000
 # 10M keeps the worst accepted case within a few seconds while still refusing
 # the runs that would hang an interactive session.
 MAX_CORRELATION_CANDIDATE_PAIRS = 10_000_000
+# Buckets per window used by that estimate. Higher is tighter and costs a few
+# more bucket rows to join; 4 is enough to stop a cluster just outside the
+# window from being charged as if it were inside one.
+CORRELATION_ESTIMATE_SUB_BUCKETS = 4
 RUN_SQL_MAX_ROWS = 500
 DATASET_LIST_MAX_ROWS = 500
 SUMMARY_FIELD_CANDIDATES = ("RuleTitle", "Computer", "Level", "EventID", "Channel", "Provider")
@@ -2528,10 +2532,23 @@ def correlate_lateral_movement(
     # 133k-match / 0.13s query as if it were a 9M-pair one and made the
     # "shorten time_window_minutes" advice in the refusal impossible to act on.
     window_seconds = time_window_minutes * 60
+    # Bucket at a fraction of the window rather than at the window itself. With
+    # bucket width w, a pair separated by at most `window` spans at most
+    # ceil(window / w) buckets, so charging buckets i..i+SUB is still an upper
+    # bound — but a quarter-window grid charges far less slop than a
+    # whole-window one. Charging the entire adjacent bucket rejected joins with
+    # no possible matches at all: 3,200 events at 00:00:00 against 3,200 at
+    # 00:01:59 with a 1-minute window is 0 real pairs, and was refused at
+    # 10,240,000. It also made the estimate jump with grid alignment, so a
+    # *shorter* window could flip a served call to refused.
+    sub_buckets = CORRELATION_ESTIMATE_SUB_BUCKETS
+    bucket_seconds = max(1, -(-window_seconds // sub_buckets))
     bucket_expr = (
         f"CAST(FLOOR(EPOCH(TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}'))"
-        f" / {window_seconds}) AS BIGINT)"
+        f" / {bucket_seconds}) AS BIGINT)"
     )
+    # The join is over bucket rows (distinct buckets x hosts), not event rows,
+    # so the range condition here is cheap however large the dataset is.
     estimate = repo.query_dataframe(
         f"""
         WITH a_bucket_host AS (
@@ -2550,18 +2567,17 @@ def correlate_lateral_movement(
             COALESCE((SELECT SUM(n) FROM a_bucket), 0) AS side_a,
             COALESCE((SELECT SUM(n) FROM b_bucket), 0) AS side_b,
             COALESCE((
-                SELECT SUM(a_bucket.n * (COALESCE(same.n, 0) + COALESCE(nxt.n, 0)))
-                FROM a_bucket
-                LEFT JOIN b_bucket AS same ON same.bucket = a_bucket.bucket
-                LEFT JOIN b_bucket AS nxt ON nxt.bucket = a_bucket.bucket + 1
+                SELECT SUM(a.n * b.n)
+                FROM a_bucket AS a
+                JOIN b_bucket AS b
+                  ON b.bucket BETWEEN a.bucket AND a.bucket + {sub_buckets}
             ), 0)
             - COALESCE((
-                SELECT SUM(a_bucket_host.n * (COALESCE(same.n, 0) + COALESCE(nxt.n, 0)))
-                FROM a_bucket_host
-                LEFT JOIN b_bucket_host AS same
-                       ON same.bucket = a_bucket_host.bucket AND same.host = a_bucket_host.host
-                LEFT JOIN b_bucket_host AS nxt
-                       ON nxt.bucket = a_bucket_host.bucket + 1 AND nxt.host = a_bucket_host.host
+                SELECT SUM(a.n * b.n)
+                FROM a_bucket_host AS a
+                JOIN b_bucket_host AS b
+                  ON b.host = a.host
+                 AND b.bucket BETWEEN a.bucket AND a.bucket + {sub_buckets}
             ), 0) AS candidate_pairs
         """,
         params,
