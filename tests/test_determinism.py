@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import pathlib
 import tempfile
@@ -362,6 +363,58 @@ class DeterminismTests(unittest.TestCase):
         self.assertIn("source_event_count", df.columns)
         self.assertGreaterEqual(int(df.iloc[0]["source_event_count"]), 1)
         self.assertEqual(df.iloc[0]["status"], "ok")
+
+    def test_capped_scan_that_decodes_nothing_still_reports_partial(self) -> None:
+        """A truncated scan must never be reported as "nothing to find".
+
+        The SQL pre-filter is broader than the Python matcher — it cannot
+        require a Base64-shaped operand — so the scan window can fill with rows
+        that match "-enc " and decode to nothing while a real payload sits just
+        beyond the cap. Reporting that as no_data/total_count=0 is the same
+        evidence loss this tool's cap exists to prevent, and it reads as a
+        cleared hypothesis rather than a truncated search.
+        """
+        rows = [
+            # Admitted by the pre-filter, rejected by the matcher (operand too
+            # short to be Base64) — these fill the scan window.
+            self._ps_row("2024-02-01 00:00:01.000 +00:00", "PC1", "900", "powershell -enc x"),
+            self._ps_row("2024-02-01 00:00:02.000 +00:00", "PC2", "901", "powershell -enc y"),
+            # The real payload, one row past the cap.
+            self._ps_row(
+                "2024-02-01 00:00:03.000 +00:00", "PC3", "902",
+                "powershell -enc " + base64.b64encode("whoami".encode("utf-16-le")).decode(),
+            ),
+        ]
+        self._reload_with(rows)
+
+        original_cap = server.MAX_DECODE_SCAN_ROWS
+        server.MAX_DECODE_SCAN_ROWS = 2
+        try:
+            result = server.decode_powershell_commands(page_size=10).to_dict("records")[0]
+        finally:
+            server.MAX_DECODE_SCAN_ROWS = original_cap
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["source_event_count"], 3)
+        self.assertIn("capped", result["message"].lower())
+
+    def _ps_row(self, timestamp: str, computer: str, record_id: str, cmdline: str) -> list[str]:
+        row = dict(zip(CSV_HEADER, [""] * len(CSV_HEADER)))
+        row.update({
+            "Timestamp": timestamp, "RuleTitle": "PowerShell Execution", "Level": "high",
+            "Computer": computer, "Channel": "PowerShell", "EventID": "4104",
+            "MitreTactics": "Exec", "MitreTags": "T1059", "RecordID": record_id,
+            "Details": f"Cmdline: {cmdline}", "RuleFile": "ps.yml", "EvtxFile": "a.evtx",
+        })
+        return [row[column] for column in CSV_HEADER]
+
+    def _reload_with(self, rows: list[list[str]]) -> None:
+        with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(CSV_HEADER)
+            writer.writerows(rows)
+        server._LOG_COLUMNS_CACHE = None
+        server.switch_dataset(target=str(self.csv_path))
 
     # P6: correlate_lateral_movement
     def test_correlate_lateral_movement(self) -> None:

@@ -2385,11 +2385,30 @@ def decode_powershell_commands(
     scan_truncated = total_count is not None and total_count > MAX_DECODE_SCAN_ROWS
     source_event_count = int(total_count) if total_count is not None else len(raw_df)
 
+    # Built before any early return. Deriving the status further down meant a
+    # capped scan that decoded to nothing fell out through a "no_data" branch
+    # that dropped both the partial status and source_event_count — reporting
+    # "no commands matched" for a scan that never reached the matching rows.
+    # That is the same evidence loss this change exists to remove, moved from
+    # the pagination window into the decode window, and it reads as a cleared
+    # hypothesis rather than a truncated search.
+    decode_meta: dict[str, object] = {"source_event_count": source_event_count}
+    truncated_status = "partial" if scan_truncated else "no_data"
+    truncated_note = (
+        f" Scan capped at {MAX_DECODE_SCAN_ROWS} of {source_event_count} matching"
+        " events, so encoded commands beyond the cap were not examined; narrow with"
+        " level/rule_title/detail_source to reach them."
+        if scan_truncated
+        else ""
+    )
+
     if total_count == 0 or raw_df.empty:
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No Base64-encoded PowerShell commands found",
+            status=truncated_status,
+            message="No Base64-encoded PowerShell commands found." + truncated_note,
+            extra_meta=decode_meta,
         ))
 
     decoded_rows: list[dict[str, str]] = []
@@ -2417,7 +2436,9 @@ def decode_powershell_commands(
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No commands matching the Base64 pattern were found",
+            status=truncated_status,
+            message="No commands matching the Base64 pattern were found." + truncated_note,
+            extra_meta=decode_meta,
         ))
 
     all_df = pd.DataFrame(decoded_rows)
@@ -2431,7 +2452,6 @@ def decode_powershell_commands(
     # differ from the decoded-row count, since one event may hold several encoded
     # blobs). When the match count exceeds the scan cap, say so explicitly instead
     # of reporting the capped window as if it were complete.
-    decode_meta = {"source_event_count": source_event_count}
     status, message = "ok", ""
     if scan_truncated:
         status = "partial"
