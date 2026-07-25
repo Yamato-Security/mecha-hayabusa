@@ -46,6 +46,13 @@ ACCEPTED = [
     ("HOST-ENCODEDC", f"Cmdline: powershell.exe -encodedc {PAYLOAD}"),
     ("HOST-SLASH", f"Cmdline: powershell.exe /enc {PAYLOAD}"),
     ("HOST-MIXEDCASE", f"Cmdline: powershell.exe -EnCoDeDcOmMaNd {PAYLOAD}"),
+    # PowerShell's parser tests the switch prefix with CharExtensions.IsDash,
+    # which accepts three Unicode dashes as well as the ASCII hyphen. These are
+    # what a command line becomes after a round trip through a word processor
+    # or a chat client, and they still execute.
+    ("HOST-ENDASH", f"Cmdline: powershell.exe \u2013ec {PAYLOAD}"),
+    ("HOST-EMDASH", f"Cmdline: powershell.exe \u2014enc {PAYLOAD}"),
+    ("HOST-HORIZBAR", f"Cmdline: powershell.exe \u2015EncodedCommand {PAYLOAD}"),
 ]
 
 # Switches that start the same way but mean something else. Decoding these
@@ -157,6 +164,12 @@ class EncodedPowerShellTests(unittest.TestCase):
                 ).iloc[0]["hit"],
                 f"SQL pre-filter false positive: {details}",
             )
+
+    def test_switch_prefix_covers_the_unicode_dashes(self) -> None:
+        # A narrower class than PowerShell's own IsDash is a detection bypass,
+        # not a style question.
+        for char in ("-", "/", "\u2013", "\u2014", "\u2015"):
+            self.assertIn(char, server._SWITCH_PREFIX_CHARS)
 
     def test_flag_set_covers_prefixes_and_documented_abbreviations(self) -> None:
         flags = set(server._ENCODED_PS_FLAGS)

@@ -2323,16 +2323,26 @@ _ENCODED_PS_FLAGS = sorted(
 )
 _ENCODED_PS_FLAG_ALT = "|".join(_ENCODED_PS_FLAGS)
 
+# Characters PowerShell accepts in front of a startup switch. Its parser tests
+# the first character with CharExtensions.IsDash before it compares the switch
+# name, and IsDash covers three Unicode dashes besides the ASCII hyphen; "/" is
+# accepted too. Em and en dashes are what a command becomes after a round trip
+# through a word processor, a PDF or a rich-text chat client — which is how a
+# fair number of malicious commands reach a victim — and PowerShell runs them,
+# so anything narrower than this is a bypass rather than a nicety.
+_SWITCH_PREFIX_CHARS = "-/\u2013\u2014\u2015"
+_SWITCH_PREFIX_CLASS = f"[{_SWITCH_PREFIX_CHARS}]"
+
 # Requiring whitespace and a Base64-shaped operand after the switch is what
 # keeps unrelated flags out: "-ExecutionPolicy Bypass" and "-Encoding UTF8"
 # both fail, because neither "executionpolicy" nor "encoding" is one of the
 # accepted spellings followed by a separator.
 _ENCODED_PS_PATTERN = re.compile(
-    rf"[-/](?:{_ENCODED_PS_FLAG_ALT})\s+([A-Za-z0-9+/=]{{4,}})",
+    rf"{_SWITCH_PREFIX_CLASS}(?:{_ENCODED_PS_FLAG_ALT})\s+([A-Za-z0-9+/=]{{4,}})",
     re.IGNORECASE,
 )
 # DuckDB (RE2) form of the same switch match, used to pre-filter candidate rows.
-_ENCODED_PS_SQL_REGEX = rf"[-/](?:{_ENCODED_PS_FLAG_ALT})\s"
+_ENCODED_PS_SQL_REGEX = rf"{_SWITCH_PREFIX_CLASS}(?:{_ENCODED_PS_FLAG_ALT})\s"
 
 
 @app.tool()
