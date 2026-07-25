@@ -2461,10 +2461,15 @@ def decode_powershell_commands(
         )
 
     if paged.empty:
+        # A page past the decoded rows during a capped scan is still a capped
+        # scan: source_event_count already says more events matched than were
+        # examined, so reporting a bare "no data on this page" here would
+        # contradict it. no_data is reserved for a complete scan.
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=total,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No data on the specified page",
+            status=truncated_status,
+            message="No data on the specified page." + truncated_note,
             extra_meta=decode_meta,
         ))
 

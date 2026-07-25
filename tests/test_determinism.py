@@ -398,6 +398,35 @@ class DeterminismTests(unittest.TestCase):
         self.assertEqual(result["source_event_count"], 3)
         self.assertIn("capped", result["message"].lower())
 
+    def test_page_past_a_capped_scan_still_reports_partial(self) -> None:
+        """A page beyond the decoded rows of a capped scan is still capped.
+
+        source_event_count already says more events matched than were
+        examined, so a bare "no data on this page" here contradicts the same
+        response. no_data belongs to a complete scan only.
+        """
+        payload = base64.b64encode("whoami".encode("utf-16-le")).decode()
+        self._reload_with([
+            self._ps_row(
+                f"2024-02-01 00:00:0{i}.000 +00:00", f"PC{i}", str(910 + i),
+                f"powershell -enc {payload}",
+            )
+            for i in range(3)
+        ])
+
+        original_cap = server.MAX_DECODE_SCAN_ROWS
+        server.MAX_DECODE_SCAN_ROWS = 2
+        try:
+            in_range = server.decode_powershell_commands(page_size=2, page_offset=0).to_dict("records")[0]
+            past_end = server.decode_powershell_commands(page_size=2, page_offset=2).to_dict("records")[0]
+        finally:
+            server.MAX_DECODE_SCAN_ROWS = original_cap
+
+        self.assertEqual(in_range["status"], "partial")
+        self.assertEqual(past_end["status"], "partial")
+        self.assertEqual(past_end["source_event_count"], 3)
+        self.assertIn("capped", past_end["message"].lower())
+
     def _ps_row(self, timestamp: str, computer: str, record_id: str, cmdline: str) -> list[str]:
         row = dict(zip(CSV_HEADER, [""] * len(CSV_HEADER)))
         row.update({
