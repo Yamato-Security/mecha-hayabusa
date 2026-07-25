@@ -2309,10 +2309,30 @@ def extract_iocs(
     )
 
 
+# Spellings of PowerShell's -EncodedCommand switch that actually execute.
+# about_PowerShell_exe documents -e and -ec as its abbreviations, and the
+# native argument parser additionally accepts ordinary prefixes (-en, -enco,
+# -encod, ...). Windows PowerShell also takes / in place of -. Generated once
+# so the SQL pre-filter and the Python matcher cannot drift apart: a spelling
+# the pre-filter does not fetch can never be decoded, however good the regex.
+_ENCODED_PS_FLAG_WORD = "encodedcommand"
+_ENCODED_PS_FLAGS = sorted(
+    {_ENCODED_PS_FLAG_WORD[:length] for length in range(1, len(_ENCODED_PS_FLAG_WORD) + 1)} | {"ec"},
+    key=len,
+    reverse=True,  # longest first, so the alternation prefers the fullest match
+)
+_ENCODED_PS_FLAG_ALT = "|".join(_ENCODED_PS_FLAGS)
+
+# Requiring whitespace and a Base64-shaped operand after the switch is what
+# keeps unrelated flags out: "-ExecutionPolicy Bypass" and "-Encoding UTF8"
+# both fail, because neither "executionpolicy" nor "encoding" is one of the
+# accepted spellings followed by a separator.
 _ENCODED_PS_PATTERN = re.compile(
-    r"-(encodedcommand|enc|e)\s+([A-Za-z0-9+/=]{4,})",
+    rf"[-/](?:{_ENCODED_PS_FLAG_ALT})\s+([A-Za-z0-9+/=]{{4,}})",
     re.IGNORECASE,
 )
+# DuckDB (RE2) form of the same switch match, used to pre-filter candidate rows.
+_ENCODED_PS_SQL_REGEX = rf"[-/](?:{_ENCODED_PS_FLAG_ALT})\s"
 
 
 @app.tool()
@@ -2346,6 +2366,9 @@ def decode_powershell_commands(
 
     extra_filter, params = _build_details_conditions(rule_title, level)
     and_clause = f"AND {extra_filter}" if extra_filter else ""
+    # The switch pattern is bound ahead of the caller's filters, matching the
+    # order its placeholder appears in the statement below.
+    params = [_ENCODED_PS_SQL_REGEX, *params]
 
     columns = _get_logs_columns()
     has_extra = detail_column == "Details" and "ExtraFieldInfo" in columns
@@ -2362,11 +2385,7 @@ def decode_powershell_commands(
             "Timestamp", "Computer", "RuleTitle", "Level",
             {combined_expr} AS _combined
         FROM logs
-        WHERE (
-            LOWER({combined_expr}) LIKE '%%-enc %%'
-            OR LOWER({combined_expr}) LIKE '%%-encodedcommand %%'
-            OR LOWER({combined_expr}) LIKE '%%-e %%'
-        )
+        WHERE regexp_matches(LOWER({combined_expr}), ?)
         {and_clause}
         ORDER BY
             TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
@@ -2387,8 +2406,7 @@ def decode_powershell_commands(
     decoded_rows: list[dict[str, str]] = []
     for _, row in raw_df.iterrows():
         combined = str(row.get("_combined", ""))
-        matches = _ENCODED_PS_PATTERN.findall(combined)
-        for _, b64_value in matches:
+        for b64_value in _ENCODED_PS_PATTERN.findall(combined):
             try:
                 decoded = base64.b64decode(b64_value).decode("utf-16-le", errors="replace")
             except Exception:
