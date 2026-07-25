@@ -64,6 +64,12 @@ def _ensure_within_dataset_roots(path: pathlib.Path) -> pathlib.Path:
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
+# Upper bound on candidate pairs correlate_lateral_movement will join. The two
+# sides are counted first and refused if their product exceeds this, because
+# total_count enumerates every pair: on the machine this was tuned against,
+# ~5M candidate pairs is a few seconds, while an unfiltered 12k-event dataset
+# reaches ~36M and takes ~24s for a single 10-row page.
+MAX_CORRELATION_SEARCH_SPACE = 5_000_000
 RUN_SQL_MAX_ROWS = 500
 DATASET_LIST_MAX_ROWS = 500
 SUMMARY_FIELD_CANDIDATES = ("RuleTitle", "Computer", "Level", "EventID", "Channel", "Provider")
@@ -2491,6 +2497,44 @@ def correlate_lateral_movement(
 
     where_a = f"WHERE {' AND '.join(conditions_a)}" if conditions_a else ""
     where_b = f"WHERE {' AND '.join(conditions_b)}" if conditions_b else ""
+
+    # Guard the self-join before running it. total_count is COUNT(*) over the
+    # joined pairs, so the cost of one page is driven by the pair count, not by
+    # page_size: 12,000 events across 4 hosts in a one-hour window already
+    # yields ~36M pairs and ~24s for a 10-row page, and pair count grows with
+    # the square of the events in the window. Refusing with the real numbers
+    # keeps the answer complete within whatever scope the analyst picks, which
+    # a silent partial scan would not.
+    side_counts = repo.query_dataframe(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM logs {where_a}) AS side_a,
+            (SELECT COUNT(*) FROM logs {where_b}) AS side_b
+        """,
+        params,
+    )
+    count_a = int(side_counts.iloc[0]["side_a"])
+    count_b = int(side_counts.iloc[0]["side_b"])
+    search_space = count_a * count_b
+    if search_space > MAX_CORRELATION_SEARCH_SPACE:
+        return _attach_pagination_metadata(
+            pd.DataFrame(), total_count=0,
+            page_size=page_size, page_offset=page_offset,
+            status="too_broad",
+            message=(
+                f"Correlation search space is too large: {count_a:,} source x {count_b:,} target"
+                f" events = {search_space:,} candidate pairs (limit"
+                f" {MAX_CORRELATION_SEARCH_SPACE:,}). Narrow the scope and retry —"
+                " a shorter time_window_minutes, a level filter, or source_host/target_host"
+                " all reduce it. No events were correlated."
+            ),
+            extra_meta={
+                "source_event_count": count_a,
+                "target_event_count": count_b,
+                "candidate_pairs": search_space,
+                "max_candidate_pairs": MAX_CORRELATION_SEARCH_SPACE,
+            },
+        )
 
     query = f"""
         WITH parsed_a AS (
