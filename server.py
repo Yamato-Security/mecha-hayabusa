@@ -1408,22 +1408,23 @@ def search_all_fields(
             hit_labels.append(f"CASE WHEN {cond} THEN '{label}' ELSE NULL END")
         hit_columns_expr = f', CONCAT_WS(\', \', {", ".join(hit_labels)}) AS "HitColumns"'
 
-    order_parts: list[str] = []
+    # Numeric/parsed expressions sort first so RecordID 2 precedes RecordID 10,
+    # then every projected column follows to make the ordering total for the
+    # output. Ordering only by the identity-ish columns left rows that differ
+    # solely in a projected detail column free to swap between pages.
+    leading: list[str] = []
     if "Timestamp" in existing_columns:
-        order_parts.append(f'TRY_STRPTIME("Timestamp", \'{TIMESTAMP_FORMAT}\') ASC NULLS LAST')
-        order_parts.append('"Timestamp" ASC')
+        leading.append(f'TRY_STRPTIME("Timestamp", \'{TIMESTAMP_FORMAT}\') ASC NULLS LAST')
     if "RecordID" in existing_columns:
-        order_parts.append('TRY_CAST("RecordID" AS BIGINT) ASC NULLS LAST')
-        order_parts.append('"RecordID" ASC')
-    if "Computer" in existing_columns:
-        order_parts.append('"Computer" ASC')
-    if "RuleTitle" in existing_columns:
-        order_parts.append('"RuleTitle" ASC')
+        leading.append('TRY_CAST("RecordID" AS BIGINT) ASC NULLS LAST')
     if "EventID" in existing_columns:
-        order_parts.append('TRY_CAST("EventID" AS BIGINT) ASC NULLS LAST')
-        order_parts.append('"EventID" ASC')
+        leading.append('TRY_CAST("EventID" AS BIGINT) ASC NULLS LAST')
+    order_parts = _total_order_terms(select_columns, leading=leading)
+    if include_hit_columns:
+        # HitColumns is projected, so it has to participate in the ordering too.
+        order_parts.append('"HitColumns" ASC')
     if not order_parts:
-        order_parts.extend(f'{_quote_identifier(col)} ASC' for col in target_columns[:3])
+        order_parts = _total_order_terms(target_columns)
     order_expr = f"ORDER BY {', '.join(order_parts)}"
 
     query_sql = f"""

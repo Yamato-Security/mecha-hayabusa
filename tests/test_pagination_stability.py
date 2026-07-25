@@ -75,6 +75,26 @@ CSV_ROWS += [
     for rule, level in (("Gamma", "low"), ("Delta", "med"))
 ]
 
+# 100 rows sharing Timestamp, RecordID, Computer, RuleTitle and EventID and
+# differing only in Details — the shape that ties every identity-ish ordering
+# column while the projection still distinguishes the rows.
+CSV_ROWS += [
+    [
+        "2024-03-03 00:00:00.000 +00:00",
+        "SameRule",
+        "high",
+        "HOST-TIE",
+        "Sec",
+        "4688",
+        "Exec",
+        "T1059",
+        "777",
+        f"Cmdline: tie-{i:03d}.exe",
+        "",
+    ]
+    for i in range(100)
+]
+
 # A second rule whose events share one timestamp per host pair, so the
 # lateral-movement join produces ties on (a.ts, b.ts).
 CSV_ROWS += [
@@ -284,6 +304,23 @@ class PaginationStabilityTests(unittest.TestCase):
             "Value",
             page_size=1,
         )
+
+    # ── search_all_fields ──────────────────────────────────────────────────
+    def test_search_all_fields_pages_reconstruct_whole(self) -> None:
+        """Rows tied on every identity column must still page deterministically.
+
+        search_all_fields ordered only by Timestamp/RecordID/Computer/
+        RuleTitle/EventID while projecting the detail columns as well, so rows
+        differing solely in Details were free to swap between pages.
+        """
+        self._assert_pages_reconstruct_whole(
+            lambda **kw: server.search_all_fields(query="tie-", **kw),
+            "Details",
+            page_size=10,
+        )
+
+    def test_search_all_fields_order_is_repeatable(self) -> None:
+        self._assert_repeatable(lambda **kw: server.search_all_fields(query="tie-", **kw), "Details")
 
     # ── the helper itself ──────────────────────────────────────────────────
     def test_total_order_terms_covers_projection_and_dedups(self) -> None:
