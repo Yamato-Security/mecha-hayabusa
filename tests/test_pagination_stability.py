@@ -53,6 +53,28 @@ CSV_ROWS = [
     for i in range(40)
 ]
 
+# One event detected by TWO rules, repeated. Hayabusa writes a row per
+# (event x matching rule), so these pairs share Timestamp, Computer, Channel
+# AND RecordID and differ only in RuleTitle/Level/Details — the case an
+# event-identity tie-breaker cannot separate. See tests/test_event_identity.py.
+CSV_ROWS += [
+    [
+        f"2024-03-02 00:{i:02d}:00.000 +00:00",
+        rule,
+        level,
+        "HOST-DUP",
+        "Sec",
+        "4624",
+        "",
+        "",
+        str(5000 + i),
+        f"TgtUser: svc ¦ Extra: {rule.lower()}",
+        "",
+    ]
+    for i in range(8)
+    for rule, level in (("Gamma", "low"), ("Delta", "med"))
+]
+
 # A second rule whose events share one timestamp per host pair, so the
 # lateral-movement join produces ties on (a.ts, b.ts).
 CSV_ROWS += [
@@ -190,7 +212,13 @@ class PaginationStabilityTests(unittest.TestCase):
         self._assert_pages_reconstruct_whole(
             lambda **kw: server.parse_details_field(field_name="TgtUser", unique=False, **kw),
             "Timestamp",
+            "Computer",
+            # RuleTitle is required in the key: without it, one duplicated
+            # Gamma row and one lost Delta row cancel out and the assertion
+            # passes over a broken ordering.
+            "RuleTitle",
             "Value",
+            page_size=3,
         )
 
     def test_parse_details_field_event_mode_keeps_its_columns(self) -> None:
@@ -232,17 +260,43 @@ class PaginationStabilityTests(unittest.TestCase):
                 parts = [part.strip() for part in str(value).split(",")]
                 self.assertEqual(parts, sorted(parts), f"{column} not deterministically ordered: {value}")
 
+    # ── duplicate-rule rows (the event-vs-row identity trap) ───────────────
+    def test_host_timeline_pages_survive_duplicate_rule_rows(self) -> None:
+        """Two detections of ONE event must not swap places between pages.
+
+        They share Timestamp, Computer, Channel and RecordID, so an ordering
+        built from the event identity ties for them. page_size=1 makes every
+        page boundary land between two tied rows.
+        """
+        self._assert_pages_reconstruct_whole(
+            lambda **kw: server.analyze_host_timeline(host_contains="HOST-DUP", **kw),
+            "Timestamp",
+            "RuleTitle",
+            "Level",
+            page_size=1,
+        )
+
+    def test_parse_details_pages_survive_duplicate_rule_rows(self) -> None:
+        self._assert_pages_reconstruct_whole(
+            lambda **kw: server.parse_details_field(field_name="TgtUser", unique=False, **kw),
+            "Timestamp",
+            "RuleTitle",
+            "Value",
+            page_size=1,
+        )
+
     # ── the helper itself ──────────────────────────────────────────────────
-    def test_identity_order_terms_only_uses_present_columns(self) -> None:
+    def test_total_order_terms_covers_projection_and_dedups(self) -> None:
         self.assertEqual(
-            server._identity_order_terms({"Computer", "RecordID"}),
-            ['"Computer" ASC', '"RecordID" ASC'],
+            server._total_order_terms(["Timestamp", "RuleTitle"]),
+            ['"Timestamp" ASC', '"RuleTitle" ASC'],
         )
-        self.assertEqual(server._identity_order_terms(set()), [])
+        # A column repeated in the projection must not be ordered by twice.
         self.assertEqual(
-            server._identity_order_terms({"Channel"}, alias="a"),
-            ['a."Channel" ASC'],
+            server._total_order_terms(["Level", "Level"], leading=["parsed ASC"]),
+            ["parsed ASC", '"Level" ASC'],
         )
+        self.assertEqual(server._total_order_terms([]), [])
 
 
 if __name__ == "__main__":

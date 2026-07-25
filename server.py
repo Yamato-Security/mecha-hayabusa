@@ -345,24 +345,34 @@ def _quote_identifier(name: str) -> str:
     return f'"{stripped}"'
 
 
-def _identity_order_terms(columns: set[str], *, alias: str = "") -> list[str]:
-    """Trailing ORDER BY terms that make a row-level ordering total.
+def _total_order_terms(projected: Sequence[str], *, leading: Sequence[str] = ()) -> list[str]:
+    """ORDER BY terms that make a row-level ordering total for its output.
 
     A Windows Timestamp is not unique — a burst of events shares one value — so
     ordering by time alone leaves the engine free to interleave those rows
     differently on every execution. Because pagination is LIMIT/OFFSET over that
     order, an unstable ordering silently returns some rows on two pages and
-    others on none. Appending the event identity the evidence gate already uses
-    (record_id@computer@channel) makes the ordering total.
+    others on none.
 
-    Returns only the columns the dataset actually has, in identity order.
+    The tie-breakers have to be the query's own projected columns, not an event
+    identity: Hayabusa writes one row per (event x matching rule), so
+    record_id@computer@channel — the identity the evidence gate resolves refs
+    with — denotes the *event* and still ties for two detections of one event by
+    different rules (see the Gamma/Delta fixture in tests/test_event_identity.py).
+    Ordering by every projected column is total with respect to the output:
+    rows equal in all of them are interchangeable, so no pagination ambiguity
+    remains.
+
+    `leading` carries expressions that must sort first (a parsed timestamp).
     """
-    prefix = f"{alias}." if alias else ""
-    return [
-        f"{prefix}{_quote_identifier(column)} ASC"
-        for column in ("Computer", "Channel", "RecordID")
-        if column in columns
-    ]
+    seen: set[str] = set()
+    terms = list(leading)
+    for column in projected:
+        if column in seen:
+            continue
+        seen.add(column)
+        terms.append(f"{_quote_identifier(column)} ASC")
+    return terms
 
 
 def _get_logs_columns() -> set[str]:
@@ -2014,11 +2024,10 @@ def analyze_host_timeline(
     ]
     select_expr = ", ".join(_quote_identifier(c) for c in select_cols)
 
-    host_order_terms = [
-        f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST",
-        '"Timestamp" ASC',
-        *_identity_order_terms(columns),
-    ]
+    host_order_terms = _total_order_terms(
+        select_cols,
+        leading=[f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"],
+    )
     query = f"""
         SELECT {select_expr}
         FROM logs
@@ -2147,32 +2156,26 @@ def parse_details_field(
             ]
             context_select = (", ".join(context_cols) + ",") if context_cols else ""
 
-            # Identity columns are carried into the CTE purely so the outer
-            # ORDER BY can be total; they stay out of the projection so the
-            # tool's output shape is unchanged.
-            identity_terms = _identity_order_terms(columns)
-            identity_only = [
-                _quote_identifier(c)
-                for c in ("Channel", "RecordID")
-                if c in columns and _quote_identifier(c) not in context_cols
-            ]
-            identity_select = (", ".join(identity_only) + ",") if identity_only else ""
-
-            order_terms: list[str] = []
-            if "Timestamp" in columns:
-                order_terms.append(
-                    f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"
-                )
-                order_terms.append('"Timestamp" ASC')
-            order_terms.extend(identity_terms)
-            order_terms.append('"Value" ASC')
+            # Ordering by every projected column — the context columns plus the
+            # extracted Value — is what makes this total. RuleTitle in
+            # particular is load-bearing: one event detected by two rules
+            # yields two rows that can extract the same Value and are otherwise
+            # identical.
+            leading = (
+                [f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"]
+                if "Timestamp" in columns
+                else []
+            )
+            order_terms = _total_order_terms(
+                [c for c in ("Timestamp", "Computer", "RuleTitle", "Level") if c in columns],
+                leading=leading,
+            ) + ['"Value" ASC']
             order_clause = "ORDER BY " + ", ".join(order_terms)
 
             query = f"""
                 WITH split AS (
                     SELECT
                         {context_select}
-                        {identity_select}
                         unnest(string_split(
                             COALESCE({detail_quoted}, ''), {sep_literal}
                         )) AS kv_pair
@@ -2396,11 +2399,12 @@ def decode_powershell_commands(
 
     # The scan window is taken from the head of this ordering, so an unstable
     # order would change *which* events get decoded, not just their order.
-    decode_order_terms = [
-        f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST",
-        '"Timestamp" ASC',
-        *_identity_order_terms(columns),
-    ]
+    # _combined is included because two detections of one event by different
+    # rules differ only there once the projected columns are exhausted.
+    decode_order_terms = _total_order_terms(
+        ["Timestamp", "Computer", "RuleTitle", "Level"],
+        leading=[f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"],
+    ) + ["_combined ASC"]
 
     query = f"""
         SELECT
