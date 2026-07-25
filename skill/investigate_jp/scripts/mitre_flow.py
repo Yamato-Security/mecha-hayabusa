@@ -241,6 +241,54 @@ def _fail(message):
     sys.exit(2)
 
 
+def _require_list(data, key):
+    """The collection itself must be a list before anything indexes into it."""
+    value = data[key]
+    if not isinstance(value, list):
+        _fail(f"{key!r} must be a list, got {type(value).__name__}")
+    return value
+
+
+def _item_dict(item, index, collection):
+    if not isinstance(item, dict):
+        _fail(f"{collection}[{index}] must be an object, got {type(item).__name__}")
+    return item
+
+
+def _require_str(item, key, index, collection):
+    _item_dict(item, index, collection)
+    if key not in item:
+        _fail(f"{collection}[{index}] is missing required key: {key!r}")
+    value = item[key]
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str(item, key, index, collection, default=""):
+    value = item.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str_list(item, key, index, collection):
+    value = item.get(key, [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _fail(f"{collection}[{index}].{key} must be a list, got {type(value).__name__}")
+    for position, entry in enumerate(value):
+        if not isinstance(entry, str):
+            _fail(
+                f"{collection}[{index}].{key}[{position}] must be a string,"
+                f" got {type(entry).__name__}"
+            )
+    return value
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -251,7 +299,23 @@ def main():
     for key in ("tactics", "output"):
         if key not in data:
             _fail(f"missing required key: {key!r}")
-    tactics = data["tactics"]
+    tactics = _require_list(data, "tactics")
+    for index, tac in enumerate(tactics):
+        _item_dict(tac, index, "tactics")
+        # Normalised in place, not just checked: an explicit null passes
+        # validation but would still reach the builder as None through
+        # tac.get(key, default), because the key exists.
+        for text_key in ("id", "name", "time_range"):
+            if text_key in tac:
+                tac[text_key] = _optional_str(tac, text_key, index, "tactics")
+        for list_key in ("techniques", "hosts"):
+            if list_key in tac:
+                tac[list_key] = _optional_str_list(tac, list_key, index, "tactics")
+        count = tac.get("event_count", 0)
+        if count is None:
+            tac["event_count"] = 0
+        elif isinstance(count, bool) or not isinstance(count, (int, float)):
+            _fail(f"tactics[{index}].event_count must be a number, got {type(count).__name__}")
     title = data.get("title", "Attack Flow (MITRE ATT&CK)")
     output_path = data["output"]
 

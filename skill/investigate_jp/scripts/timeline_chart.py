@@ -157,6 +157,54 @@ def _fail(message):
     sys.exit(2)
 
 
+def _require_list(data, key):
+    """The collection itself must be a list before anything indexes into it."""
+    value = data[key]
+    if not isinstance(value, list):
+        _fail(f"{key!r} must be a list, got {type(value).__name__}")
+    return value
+
+
+def _item_dict(item, index, collection):
+    if not isinstance(item, dict):
+        _fail(f"{collection}[{index}] must be an object, got {type(item).__name__}")
+    return item
+
+
+def _require_str(item, key, index, collection):
+    _item_dict(item, index, collection)
+    if key not in item:
+        _fail(f"{collection}[{index}] is missing required key: {key!r}")
+    value = item[key]
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str(item, key, index, collection, default=""):
+    value = item.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str_list(item, key, index, collection):
+    value = item.get(key, [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _fail(f"{collection}[{index}].{key} must be a list, got {type(value).__name__}")
+    for position, entry in enumerate(value):
+        if not isinstance(entry, str):
+            _fail(
+                f"{collection}[{index}].{key}[{position}] must be a string,"
+                f" got {type(entry).__name__}"
+            )
+    return value
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -167,7 +215,7 @@ def main():
     for key in ("events", "output"):
         if key not in data:
             _fail(f"missing required key: {key!r}")
-    events = data["events"]
+    events = _require_list(data, "events")
     phases = data.get("phases", [])
     title = data.get("title", "Incident Timeline")
     output_path = data["output"]
@@ -182,14 +230,18 @@ def main():
 
     # Parse events
     parsed = []
-    for ev in events:
-        ts = parse_ts(ev["timestamp"])
+    for index, ev in enumerate(events):
+        timestamp = _require_str(ev, "timestamp", index, "events")
+        try:
+            ts = parse_ts(timestamp)
+        except (TypeError, ValueError) as exc:
+            _fail(f"events[{index}].timestamp is not a valid timestamp: {timestamp!r} ({exc})")
         parsed.append({
             "ts": ts,
-            "host": ev["host"],
-            "rule": ev.get("rule", ""),
-            "level": ev.get("level", "info").lower(),
-            "mitre": ev.get("mitre", ""),
+            "host": _require_str(ev, "host", index, "events"),
+            "rule": _optional_str(ev, "rule", index, "events"),
+            "level": (_optional_str(ev, "level", index, "events", "info") or "info").lower(),
+            "mitre": _optional_str(ev, "mitre", index, "events"),
         })
     parsed.sort(key=lambda x: x["ts"])
 

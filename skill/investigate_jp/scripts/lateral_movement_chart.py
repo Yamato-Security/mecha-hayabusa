@@ -362,6 +362,54 @@ def _fail(message):
     sys.exit(2)
 
 
+def _require_list(data, key):
+    """The collection itself must be a list before anything indexes into it."""
+    value = data[key]
+    if not isinstance(value, list):
+        _fail(f"{key!r} must be a list, got {type(value).__name__}")
+    return value
+
+
+def _item_dict(item, index, collection):
+    if not isinstance(item, dict):
+        _fail(f"{collection}[{index}] must be an object, got {type(item).__name__}")
+    return item
+
+
+def _require_str(item, key, index, collection):
+    _item_dict(item, index, collection)
+    if key not in item:
+        _fail(f"{collection}[{index}] is missing required key: {key!r}")
+    value = item[key]
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str(item, key, index, collection, default=""):
+    value = item.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str_list(item, key, index, collection):
+    value = item.get(key, [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _fail(f"{collection}[{index}].{key} must be a list, got {type(value).__name__}")
+    for position, entry in enumerate(value):
+        if not isinstance(entry, str):
+            _fail(
+                f"{collection}[{index}].{key}[{position}] must be a string,"
+                f" got {type(entry).__name__}"
+            )
+    return value
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -372,7 +420,16 @@ def main():
     for key in ("movements", "output"):
         if key not in data:
             _fail(f"missing required key: {key!r}")
-    movements = data["movements"]
+    movements = _require_list(data, "movements")
+    for index, mv in enumerate(movements):
+        _require_str(mv, "source_host", index, "movements")
+        _require_str(mv, "target_host", index, "movements")
+        for optional in ("source_time", "target_time", "source_level", "target_level",
+                         "source_event", "target_event"):
+            if optional in mv:
+                # Normalised in place: the key exists, so mv.get(key, default)
+                # would hand None to the builder rather than the default.
+                mv[optional] = _optional_str(mv, optional, index, "movements")
     title = data.get("title", "横展開分析 (Lateral Movement)")
     output_path = data["output"]
 
