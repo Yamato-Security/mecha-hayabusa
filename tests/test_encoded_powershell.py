@@ -53,6 +53,12 @@ ACCEPTED = [
     ("HOST-ENDASH", f"Cmdline: powershell.exe \u2013ec {PAYLOAD}"),
     ("HOST-EMDASH", f"Cmdline: powershell.exe \u2014enc {PAYLOAD}"),
     ("HOST-HORIZBAR", f"Cmdline: powershell.exe \u2015EncodedCommand {PAYLOAD}"),
+    # GetSwitchKey removes a second prefix character when it is the same dash,
+    # so a doubled identical dash is a real switch.
+    ("HOST-DBLHYPHEN", f"Cmdline: powershell.exe --enc {PAYLOAD}"),
+    ("HOST-DBLENDASH", f"Cmdline: powershell.exe \u2013\u2013enc {PAYLOAD}"),
+    ("HOST-DBLEMDASH", f"Cmdline: powershell.exe \u2014\u2014enc {PAYLOAD}"),
+    ("HOST-DBLHORIZBAR", f"Cmdline: powershell.exe \u2015\u2015enc {PAYLOAD}"),
 ]
 
 # Switches that start the same way but mean something else. Decoding these
@@ -62,6 +68,14 @@ REJECTED = [
     ("HOST-ENCODING", "Cmdline: powershell.exe -Encoding UTF8 -Path C:\\tmp"),
     ("HOST-NOPROFILE", "Cmdline: powershell.exe -NoProfile -Command Get-Date"),
     ("HOST-NETUSE", "Cmdline: net use \\\\server\\share /user:admin Passw0rd"),
+    # Prefix runs PowerShell does NOT accept: "/" is never doubled, a second
+    # dash counts only when identical, and three is never a prefix. Decoding
+    # these would present a payload from a command line that would not have
+    # run — fabricated evidence, which is worse than a miss.
+    ("HOST-DBLSLASH", f"Cmdline: powershell.exe //enc {PAYLOAD}"),
+    ("HOST-MIXEDDASH", f"Cmdline: powershell.exe -\u2013enc {PAYLOAD}"),
+    ("HOST-MIXEDDASH2", f"Cmdline: powershell.exe \u2014\u2015enc {PAYLOAD}"),
+    ("HOST-TRIPLEDASH", f"Cmdline: powershell.exe \u2014\u2014\u2014enc {PAYLOAD}"),
 ]
 
 
@@ -170,6 +184,15 @@ class EncodedPowerShellTests(unittest.TestCase):
         # not a style question.
         for char in ("-", "/", "\u2013", "\u2014", "\u2015"):
             self.assertIn(char, server._SWITCH_PREFIX_CHARS)
+
+    def test_matching_never_starts_inside_a_prefix_run(self) -> None:
+        # The failure mode of a one-character prefix class: unanchored, it just
+        # restarts at the last character of an invalid run.
+        for run in ("//", "-\u2013", "\u2014\u2015", "\u2014\u2014\u2014"):
+            self.assertIsNone(
+                server._ENCODED_PS_PATTERN.search(f"powershell.exe {run}enc {PAYLOAD}"),
+                f"matched inside an invalid prefix run: {run!r}",
+            )
 
     def test_flag_set_covers_prefixes_and_documented_abbreviations(self) -> None:
         flags = set(server._ENCODED_PS_FLAGS)

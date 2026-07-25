@@ -2323,26 +2323,43 @@ _ENCODED_PS_FLAGS = sorted(
 )
 _ENCODED_PS_FLAG_ALT = "|".join(_ENCODED_PS_FLAGS)
 
-# Characters PowerShell accepts in front of a startup switch. Its parser tests
-# the first character with CharExtensions.IsDash before it compares the switch
-# name, and IsDash covers three Unicode dashes besides the ASCII hyphen; "/" is
-# accepted too. Em and en dashes are what a command becomes after a round trip
-# through a word processor, a PDF or a rich-text chat client — which is how a
-# fair number of malicious commands reach a victim — and PowerShell runs them,
-# so anything narrower than this is a bypass rather than a nicety.
-_SWITCH_PREFIX_CHARS = "-/\u2013\u2014\u2015"
-_SWITCH_PREFIX_CLASS = f"[{_SWITCH_PREFIX_CHARS}]"
+# The prefix token PowerShell accepts in front of a startup switch.
+#
+# GetSwitchKey removes one prefix character, and removes a second only when it
+# is the *same* dash; "/" is never doubled. So the accepted tokens are exactly:
+# a single "/", one dash, or two identical dashes. IsDash covers three Unicode
+# dashes besides the ASCII hyphen — em and en dashes are what a command becomes
+# after a round trip through a word processor or a rich-text chat client, and
+# PowerShell still runs them, so leaving them out is a bypass.
+#
+# Modelling the whole token matters in both directions. A bare one-character
+# class is too narrow (it misses "--enc") and simultaneously too broad: being
+# unanchored, it simply restarts at the last character of an invalid run, so
+# "//enc", "-–enc" and "———enc" all matched even though PowerShell does not
+# treat them as switches. For a tool that presents decoded output as evidence,
+# inventing a payload from a command line that would not have run is the worse
+# of the two errors.
+_SWITCH_DASH_CHARS = "-\u2013\u2014\u2015"
+_SWITCH_PREFIX_CHARS = "/" + _SWITCH_DASH_CHARS
+# One "/" or one-or-two of the SAME dash. Spelled out per dash rather than with
+# a backreference because the pre-filter runs on DuckDB's RE2, which has none.
+_SWITCH_PREFIX_TOKEN = "|".join(["/"] + [f"{re.escape(d)}{{1,2}}" for d in _SWITCH_DASH_CHARS])
+# Python can assert "not preceded by another prefix character" directly; RE2
+# cannot, so it consumes a non-prefix character (or start-of-string) instead.
+# Both refuse to begin matching inside a longer prefix run.
+_SWITCH_PREFIX_PY = f"(?<![{re.escape(_SWITCH_PREFIX_CHARS)}])(?:{_SWITCH_PREFIX_TOKEN})"
+_SWITCH_PREFIX_SQL = f"(?:^|[^{re.escape(_SWITCH_PREFIX_CHARS)}])(?:{_SWITCH_PREFIX_TOKEN})"
 
 # Requiring whitespace and a Base64-shaped operand after the switch is what
 # keeps unrelated flags out: "-ExecutionPolicy Bypass" and "-Encoding UTF8"
 # both fail, because neither "executionpolicy" nor "encoding" is one of the
 # accepted spellings followed by a separator.
 _ENCODED_PS_PATTERN = re.compile(
-    rf"{_SWITCH_PREFIX_CLASS}(?:{_ENCODED_PS_FLAG_ALT})\s+([A-Za-z0-9+/=]{{4,}})",
+    rf"{_SWITCH_PREFIX_PY}(?:{_ENCODED_PS_FLAG_ALT})\s+([A-Za-z0-9+/=]{{4,}})",
     re.IGNORECASE,
 )
 # DuckDB (RE2) form of the same switch match, used to pre-filter candidate rows.
-_ENCODED_PS_SQL_REGEX = rf"{_SWITCH_PREFIX_CLASS}(?:{_ENCODED_PS_FLAG_ALT})\s"
+_ENCODED_PS_SQL_REGEX = rf"{_SWITCH_PREFIX_SQL}(?:{_ENCODED_PS_FLAG_ALT})\s"
 
 
 @app.tool()
