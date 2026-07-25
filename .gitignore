@@ -1,3 +1,7 @@
 
 # MkDocs documentation site build output
 /website/site/
+
+# Investigation scratch area used by the /investigate skill (datasets, batch
+# JSON payloads, draft reports) — may hold customer log data, never commit it.
+/work/
