@@ -10,6 +10,7 @@ These exercise the real CLI, since that is where the behaviour lives.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -88,6 +89,58 @@ class CliDbPathTests(unittest.TestCase):
         combined = result.stdout + result.stderr
         self.assertIn("--db-path directory does not exist", combined)
         self.assertIn(str(self.dir / "nope"), combined)
+
+    def test_startup_does_not_create_the_database(self) -> None:
+        """The writability probe must not bring the database into existence.
+
+        DuckDBRepository.is_initialised() is `db_path.exists()`, so creating an
+        empty file here would make an unloaded server report itself as
+        initialised — trading a clear "no dataset loaded" for a confusing
+        failure on the first query.
+        """
+        target = self.dir / "created.duckdb"
+        _run_until_banner(
+            ["--transport", "stdio", "--db-path", str(target)], cwd=str(self.dir)
+        )
+        self.assertFalse(target.exists(), "startup must not create the database file")
+        leftovers = [p.name for p in self.dir.iterdir() if p.name.startswith(".hayabusa-mcp-")]
+        self.assertFalse(leftovers, f"probe file was left behind: {leftovers}")
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX-specific")
+    def test_unwritable_parent_fails_at_startup(self) -> None:
+        # Probing by writing answers for the user the process actually runs as,
+        # so root legitimately passes here — mode-bit inspection would not.
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions, so there is nothing to catch")
+        readonly = self.dir / "readonly"
+        readonly.mkdir(mode=0o500)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-u", SERVER, "--db-path", str(readonly / "x.duckdb")],
+                cwd=str(self.dir), stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=BANNER_TIMEOUT,
+            )
+        finally:
+            readonly.chmod(0o700)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("directory is not writable", result.stdout + result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX-specific")
+    def test_unwritable_existing_database_fails_at_startup(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions, so there is nothing to catch")
+        existing = self.dir / "readonly.duckdb"
+        existing.touch(mode=0o400)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-u", SERVER, "--db-path", str(existing)],
+                cwd=str(self.dir), stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=BANNER_TIMEOUT,
+            )
+        finally:
+            existing.chmod(0o600)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not writable", result.stdout + result.stderr)
 
     def test_directory_given_as_db_path_fails_at_startup(self) -> None:
         result = subprocess.run(

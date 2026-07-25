@@ -4,8 +4,10 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import pathlib
 import re
+import tempfile
 from typing import Sequence
 
 import duckdb
@@ -2615,8 +2617,31 @@ if __name__ == "__main__":
             f"--db-path directory does not exist: {DB_PATH.parent}"
             f" (for {DB_PATH}). Create it first, or choose another path."
         )
-    if DB_PATH.exists() and not DB_PATH.is_file():
-        parser.error(f"--db-path is not a file: {DB_PATH}")
+    if DB_PATH.exists():
+        if not DB_PATH.is_file():
+            parser.error(f"--db-path is not a file: {DB_PATH}")
+        if not os.access(DB_PATH, os.W_OK):
+            parser.error(
+                f"--db-path exists but is not writable: {DB_PATH}."
+                " The ingester needs write access to load a dataset."
+            )
+    else:
+        # Probe by actually creating a file, not by reading permission bits.
+        # A real write is what the server will do, so it accounts for ACLs,
+        # read-only mounts and a full filesystem — and it answers for the user
+        # the process is actually running as, which mode-bit inspection does
+        # not. The probe file is created next to the database and removed
+        # immediately; the database itself is deliberately NOT created, since
+        # DuckDBRepository.is_initialised() is `db_path.exists()` and an empty
+        # file would make an unloaded server report itself as initialised.
+        try:
+            with tempfile.NamedTemporaryFile(dir=DB_PATH.parent, prefix=".hayabusa-mcp-"):
+                pass
+        except OSError as exc:
+            parser.error(
+                f"--db-path directory is not writable: {DB_PATH.parent}"
+                f" (for {DB_PATH}): {exc.strerror or exc}"
+            )
     repo.db_path = DB_PATH
     if args.dataset_root:
         roots = []
