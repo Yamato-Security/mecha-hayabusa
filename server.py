@@ -345,6 +345,26 @@ def _quote_identifier(name: str) -> str:
     return f'"{stripped}"'
 
 
+def _identity_order_terms(columns: set[str], *, alias: str = "") -> list[str]:
+    """Trailing ORDER BY terms that make a row-level ordering total.
+
+    A Windows Timestamp is not unique — a burst of events shares one value — so
+    ordering by time alone leaves the engine free to interleave those rows
+    differently on every execution. Because pagination is LIMIT/OFFSET over that
+    order, an unstable ordering silently returns some rows on two pages and
+    others on none. Appending the event identity the evidence gate already uses
+    (record_id@computer@channel) makes the ordering total.
+
+    Returns only the columns the dataset actually has, in identity order.
+    """
+    prefix = f"{alias}." if alias else ""
+    return [
+        f"{prefix}{_quote_identifier(column)} ASC"
+        for column in ("Computer", "Channel", "RecordID")
+        if column in columns
+    ]
+
+
 def _get_logs_columns() -> set[str]:
     global _LOG_COLUMNS_CACHE
     if _LOG_COLUMNS_CACHE is None:
@@ -494,26 +514,6 @@ def _attach_pagination_metadata(
         for key, value in merged_meta.items():
             out[key] = value
     return out
-
-
-def _identity_order_terms(columns: set[str], *, alias: str = "") -> list[str]:
-    """Trailing ORDER BY terms that make a row-level ordering total.
-
-    A Windows Timestamp is not unique — a burst of events shares one value — so
-    ordering by time alone leaves the engine free to interleave those rows
-    differently on every execution. Because pagination is LIMIT/OFFSET over that
-    order, an unstable ordering silently returns some rows on two pages and
-    others on none. Appending the event identity the evidence gate already uses
-    (record_id@computer@channel) makes the ordering total.
-
-    Returns only the columns the dataset actually has, in identity order.
-    """
-    prefix = f"{alias}." if alias else ""
-    return [
-        f"{prefix}{_quote_identifier(column)} ASC"
-        for column in ("Computer", "Channel", "RecordID")
-        if column in columns
-    ]
 
 
 def _has_order_by_clause(sql: str) -> bool:
