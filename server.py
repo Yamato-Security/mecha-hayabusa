@@ -2597,9 +2597,27 @@ if __name__ == "__main__":
              " --db-path files rather than pointing several clients at one server.",
     )
     args = parser.parse_args()
-    if args.db_path:
-        DB_PATH = pathlib.Path(args.db_path).expanduser().resolve()
-        repo.db_path = DB_PATH
+    # Resolve the working database unconditionally, not just when --db-path is
+    # given. Leaving the default as the relative "hayabusa.duckdb" meant the
+    # startup banner printed exactly the CWD-relative path this option exists
+    # to disambiguate, so the line looked like it answered "which database am I
+    # using" while still leaving it open. Validating here also moves the
+    # failure for an unusable path to startup: .resolve() does not require the
+    # path to exist, so a missing parent directory previously let the server
+    # start and surfaced later as a DuckDB error from the first dataset load,
+    # well away from the argument that caused it.
+    DB_PATH = pathlib.Path(args.db_path or DB_PATH).expanduser().resolve()
+    # The parent is required rather than created: this codebase does not create
+    # filesystem state from a path argument (see the --dataset-root rules), and
+    # a typo'd directory should be reported, not silently made.
+    if not DB_PATH.parent.is_dir():
+        parser.error(
+            f"--db-path directory does not exist: {DB_PATH.parent}"
+            f" (for {DB_PATH}). Create it first, or choose another path."
+        )
+    if DB_PATH.exists() and not DB_PATH.is_file():
+        parser.error(f"--db-path is not a file: {DB_PATH}")
+    repo.db_path = DB_PATH
     if args.dataset_root:
         roots = []
         for raw in args.dataset_root:
