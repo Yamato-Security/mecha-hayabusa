@@ -496,6 +496,26 @@ def _attach_pagination_metadata(
     return out
 
 
+def _identity_order_terms(columns: set[str], *, alias: str = "") -> list[str]:
+    """Trailing ORDER BY terms that make a row-level ordering total.
+
+    A Windows Timestamp is not unique — a burst of events shares one value — so
+    ordering by time alone leaves the engine free to interleave those rows
+    differently on every execution. Because pagination is LIMIT/OFFSET over that
+    order, an unstable ordering silently returns some rows on two pages and
+    others on none. Appending the event identity the evidence gate already uses
+    (record_id@computer@channel) makes the ordering total.
+
+    Returns only the columns the dataset actually has, in identity order.
+    """
+    prefix = f"{alias}." if alias else ""
+    return [
+        f"{prefix}{_quote_identifier(column)} ASC"
+        for column in ("Computer", "Channel", "RecordID")
+        if column in columns
+    ]
+
+
 def _has_order_by_clause(sql: str) -> bool:
     normalized = re.sub(r"\s+", " ", sql).strip().lower()
     return " order by " in f" {normalized} "
@@ -1807,8 +1827,8 @@ def analyze_rule_titles(
             COUNT(*) AS "event_count",
             MIN("Timestamp") AS "first_seen",
             MAX("Timestamp") AS "last_seen",
-            STRING_AGG(DISTINCT "Level", ', ') AS "severity",
-            STRING_AGG(DISTINCT "Computer", ', ') AS "detected_hosts"
+            STRING_AGG(DISTINCT "Level", ', ' ORDER BY "Level") AS "severity",
+            STRING_AGG(DISTINCT "Computer", ', ' ORDER BY "Computer") AS "detected_hosts"
         FROM logs
         {where_clause}
         GROUP BY "RuleTitle"
@@ -1994,13 +2014,16 @@ def analyze_host_timeline(
     ]
     select_expr = ", ".join(_quote_identifier(c) for c in select_cols)
 
+    host_order_terms = [
+        f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST",
+        '"Timestamp" ASC',
+        *_identity_order_terms(columns),
+    ]
     query = f"""
         SELECT {select_expr}
         FROM logs
         {where_clause}
-        ORDER BY
-            TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
-            "Timestamp" ASC
+        ORDER BY {", ".join(host_order_terms)}
     """
 
     result_df, total_count = _query_with_pagination(
@@ -2085,7 +2108,7 @@ def parse_details_field(
             WHERE position(': ' IN trim(kv_pair)) > 0
             AND length(trim(split_part(trim(kv_pair), ': ', 1))) > 0
             GROUP BY "FieldName"
-            ORDER BY "Count" DESC
+            ORDER BY "Count" DESC, "FieldName" ASC
         """
     else:
         validated_name = _validate_detail_field_name(field_name)
@@ -2106,13 +2129,13 @@ def parse_details_field(
                 )
                 SELECT
                     trim(substr(trim(kv_pair), {fn_len + 3})) AS "Value",
-                    STRING_AGG(DISTINCT "Computer", ', ') AS "Hosts",
+                    STRING_AGG(DISTINCT "Computer", ', ' ORDER BY "Computer") AS "Hosts",
                     COUNT(*) AS "Count"
                 FROM split
                 WHERE starts_with(trim(kv_pair), '{validated_name}: ')
                 AND length(trim(substr(trim(kv_pair), {fn_len + 3}))) > 0
                 GROUP BY "Value"
-                ORDER BY "Count" DESC
+                ORDER BY "Count" DESC, "Value" ASC
             """
         else:
             # Mode 3: Extract values with event context
@@ -2124,18 +2147,32 @@ def parse_details_field(
             ]
             context_select = (", ".join(context_cols) + ",") if context_cols else ""
 
-            order_clause = ""
+            # Identity columns are carried into the CTE purely so the outer
+            # ORDER BY can be total; they stay out of the projection so the
+            # tool's output shape is unchanged.
+            identity_terms = _identity_order_terms(columns)
+            identity_only = [
+                _quote_identifier(c)
+                for c in ("Channel", "RecordID")
+                if c in columns and _quote_identifier(c) not in context_cols
+            ]
+            identity_select = (", ".join(identity_only) + ",") if identity_only else ""
+
+            order_terms: list[str] = []
             if "Timestamp" in columns:
-                order_clause = f"""
-                    ORDER BY
-                        TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
-                        "Timestamp" ASC
-                """
+                order_terms.append(
+                    f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"
+                )
+                order_terms.append('"Timestamp" ASC')
+            order_terms.extend(identity_terms)
+            order_terms.append('"Value" ASC')
+            order_clause = "ORDER BY " + ", ".join(order_terms)
 
             query = f"""
                 WITH split AS (
                     SELECT
                         {context_select}
+                        {identity_select}
                         unnest(string_split(
                             COALESCE({detail_quoted}, ''), {sep_literal}
                         )) AS kv_pair
@@ -2277,14 +2314,14 @@ def extract_iocs(
             {case_expr} AS "Type",
             fkey AS "FieldName",
             fvalue AS "Value",
-            STRING_AGG(DISTINCT "Computer", ', ') AS "Hosts",
+            STRING_AGG(DISTINCT "Computer", ', ' ORDER BY "Computer") AS "Hosts",
             COUNT(*) AS "Count"
         FROM parsed
         WHERE fkey IN ({field_in_list})
         AND fvalue NOT IN ('', '-', 'N/A')
         AND length(fvalue) > 0
         GROUP BY "Type", fkey, fvalue
-        ORDER BY "Count" DESC
+        ORDER BY "Count" DESC, "Type" ASC, "FieldName" ASC, "Value" ASC
     """
 
     result_df, total_count = _query_with_pagination(
@@ -2357,6 +2394,14 @@ def decode_powershell_commands(
     else:
         combined_expr = f"COALESCE({detail_quoted}, '')"
 
+    # The scan window is taken from the head of this ordering, so an unstable
+    # order would change *which* events get decoded, not just their order.
+    decode_order_terms = [
+        f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST",
+        '"Timestamp" ASC',
+        *_identity_order_terms(columns),
+    ]
+
     query = f"""
         SELECT
             "Timestamp", "Computer", "RuleTitle", "Level",
@@ -2368,9 +2413,7 @@ def decode_powershell_commands(
             OR LOWER({combined_expr}) LIKE '%%-e %%'
         )
         {and_clause}
-        ORDER BY
-            TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
-            "Timestamp" ASC
+        ORDER BY {", ".join(decode_order_terms)}
     """
 
     raw_df, total_count = _query_with_pagination(
@@ -2523,7 +2566,11 @@ def correlate_lateral_movement(
           AND a.ts IS NOT NULL
           AND b.ts IS NOT NULL
           AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '{time_window_minutes} minutes'
-        ORDER BY a.ts ASC, b.ts ASC
+        ORDER BY
+            a.ts ASC, b.ts ASC,
+            a."Computer" ASC, b."Computer" ASC,
+            a."RuleTitle" ASC, b."RuleTitle" ASC,
+            a."Level" ASC, b."Level" ASC
     """
 
     result_df, total_count = _query_with_pagination(
