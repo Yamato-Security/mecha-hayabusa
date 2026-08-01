@@ -5,3 +5,7 @@
 
 # MkDocs documentation site build output
 /website/site/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
