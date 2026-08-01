@@ -347,6 +347,36 @@ def _quote_identifier(name: str) -> str:
     return f'"{stripped}"'
 
 
+def _total_order_terms(projected: Sequence[str], *, leading: Sequence[str] = ()) -> list[str]:
+    """ORDER BY terms that make a row-level ordering total for its output.
+
+    A Windows Timestamp is not unique — a burst of events shares one value — so
+    ordering by time alone leaves the engine free to interleave those rows
+    differently on every execution. Because pagination is LIMIT/OFFSET over that
+    order, an unstable ordering silently returns some rows on two pages and
+    others on none.
+
+    The tie-breakers have to be the query's own projected columns, not an event
+    identity: Hayabusa writes one row per (event x matching rule), so
+    record_id@computer@channel — the identity the evidence gate resolves refs
+    with — denotes the *event* and still ties for two detections of one event by
+    different rules (see the Gamma/Delta fixture in tests/test_event_identity.py).
+    Ordering by every projected column is total with respect to the output:
+    rows equal in all of them are interchangeable, so no pagination ambiguity
+    remains.
+
+    `leading` carries expressions that must sort first (a parsed timestamp).
+    """
+    seen: set[str] = set()
+    terms = list(leading)
+    for column in projected:
+        if column in seen:
+            continue
+        seen.add(column)
+        terms.append(f"{_quote_identifier(column)} ASC")
+    return terms
+
+
 def _get_logs_columns() -> set[str]:
     global _LOG_COLUMNS_CACHE
     if _LOG_COLUMNS_CACHE is None:
@@ -1416,22 +1446,23 @@ def search_all_fields(
             hit_labels.append(f"CASE WHEN {cond} THEN '{label}' ELSE NULL END")
         hit_columns_expr = f', CONCAT_WS(\', \', {", ".join(hit_labels)}) AS "HitColumns"'
 
-    order_parts: list[str] = []
+    # Numeric/parsed expressions sort first so RecordID 2 precedes RecordID 10,
+    # then every projected column follows to make the ordering total for the
+    # output. Ordering only by the identity-ish columns left rows that differ
+    # solely in a projected detail column free to swap between pages.
+    leading: list[str] = []
     if "Timestamp" in existing_columns:
-        order_parts.append(f'TRY_STRPTIME("Timestamp", \'{TIMESTAMP_FORMAT}\') ASC NULLS LAST')
-        order_parts.append('"Timestamp" ASC')
+        leading.append(f'TRY_STRPTIME("Timestamp", \'{TIMESTAMP_FORMAT}\') ASC NULLS LAST')
     if "RecordID" in existing_columns:
-        order_parts.append('TRY_CAST("RecordID" AS BIGINT) ASC NULLS LAST')
-        order_parts.append('"RecordID" ASC')
-    if "Computer" in existing_columns:
-        order_parts.append('"Computer" ASC')
-    if "RuleTitle" in existing_columns:
-        order_parts.append('"RuleTitle" ASC')
+        leading.append('TRY_CAST("RecordID" AS BIGINT) ASC NULLS LAST')
     if "EventID" in existing_columns:
-        order_parts.append('TRY_CAST("EventID" AS BIGINT) ASC NULLS LAST')
-        order_parts.append('"EventID" ASC')
+        leading.append('TRY_CAST("EventID" AS BIGINT) ASC NULLS LAST')
+    order_parts = _total_order_terms(select_columns, leading=leading)
+    if include_hit_columns:
+        # HitColumns is projected, so it has to participate in the ordering too.
+        order_parts.append('"HitColumns" ASC')
     if not order_parts:
-        order_parts.extend(f'{_quote_identifier(col)} ASC' for col in target_columns[:3])
+        order_parts = _total_order_terms(target_columns)
     order_expr = f"ORDER BY {', '.join(order_parts)}"
 
     query_sql = f"""
@@ -1794,8 +1825,8 @@ def analyze_rule_titles(
             COUNT(*) AS "event_count",
             MIN("Timestamp") AS "first_seen",
             MAX("Timestamp") AS "last_seen",
-            STRING_AGG(DISTINCT "Level", ', ') AS "severity",
-            STRING_AGG(DISTINCT "Computer", ', ') AS "detected_hosts"
+            STRING_AGG(DISTINCT "Level", ', ' ORDER BY "Level") AS "severity",
+            STRING_AGG(DISTINCT "Computer", ', ' ORDER BY "Computer") AS "detected_hosts"
         FROM logs
         {where_clause}
         GROUP BY "RuleTitle"
@@ -1981,13 +2012,15 @@ def analyze_host_timeline(
     ]
     select_expr = ", ".join(_quote_identifier(c) for c in select_cols)
 
+    host_order_terms = _total_order_terms(
+        select_cols,
+        leading=[f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"],
+    )
     query = f"""
         SELECT {select_expr}
         FROM logs
         {where_clause}
-        ORDER BY
-            TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
-            "Timestamp" ASC
+        ORDER BY {", ".join(host_order_terms)}
     """
 
     result_df, total_count = _query_with_pagination(
@@ -2072,7 +2105,7 @@ def parse_details_field(
             WHERE position(': ' IN trim(kv_pair)) > 0
             AND length(trim(split_part(trim(kv_pair), ': ', 1))) > 0
             GROUP BY "FieldName"
-            ORDER BY "Count" DESC
+            ORDER BY "Count" DESC, "FieldName" ASC
         """
     else:
         validated_name = _validate_detail_field_name(field_name)
@@ -2093,13 +2126,13 @@ def parse_details_field(
                 )
                 SELECT
                     trim(substr(trim(kv_pair), {fn_len + 3})) AS "Value",
-                    STRING_AGG(DISTINCT "Computer", ', ') AS "Hosts",
+                    STRING_AGG(DISTINCT "Computer", ', ' ORDER BY "Computer") AS "Hosts",
                     COUNT(*) AS "Count"
                 FROM split
                 WHERE starts_with(trim(kv_pair), '{validated_name}: ')
                 AND length(trim(substr(trim(kv_pair), {fn_len + 3}))) > 0
                 GROUP BY "Value"
-                ORDER BY "Count" DESC
+                ORDER BY "Count" DESC, "Value" ASC
             """
         else:
             # Mode 3: Extract values with event context
@@ -2111,13 +2144,21 @@ def parse_details_field(
             ]
             context_select = (", ".join(context_cols) + ",") if context_cols else ""
 
-            order_clause = ""
-            if "Timestamp" in columns:
-                order_clause = f"""
-                    ORDER BY
-                        TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
-                        "Timestamp" ASC
-                """
+            # Ordering by every projected column — the context columns plus the
+            # extracted Value — is what makes this total. RuleTitle in
+            # particular is load-bearing: one event detected by two rules
+            # yields two rows that can extract the same Value and are otherwise
+            # identical.
+            leading = (
+                [f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"]
+                if "Timestamp" in columns
+                else []
+            )
+            order_terms = _total_order_terms(
+                [c for c in ("Timestamp", "Computer", "RuleTitle", "Level") if c in columns],
+                leading=leading,
+            ) + ['"Value" ASC']
+            order_clause = "ORDER BY " + ", ".join(order_terms)
 
             query = f"""
                 WITH split AS (
@@ -2264,14 +2305,14 @@ def extract_iocs(
             {case_expr} AS "Type",
             fkey AS "FieldName",
             fvalue AS "Value",
-            STRING_AGG(DISTINCT "Computer", ', ') AS "Hosts",
+            STRING_AGG(DISTINCT "Computer", ', ' ORDER BY "Computer") AS "Hosts",
             COUNT(*) AS "Count"
         FROM parsed
         WHERE fkey IN ({field_in_list})
         AND fvalue NOT IN ('', '-', 'N/A')
         AND length(fvalue) > 0
         GROUP BY "Type", fkey, fvalue
-        ORDER BY "Count" DESC
+        ORDER BY "Count" DESC, "Type" ASC, "FieldName" ASC, "Value" ASC
     """
 
     result_df, total_count = _query_with_pagination(
@@ -2391,6 +2432,15 @@ def decode_powershell_commands(
     else:
         combined_expr = f"COALESCE({detail_quoted}, '')"
 
+    # The scan window is taken from the head of this ordering, so an unstable
+    # order would change *which* events get decoded, not just their order.
+    # _combined is included because two detections of one event by different
+    # rules differ only there once the projected columns are exhausted.
+    decode_order_terms = _total_order_terms(
+        ["Timestamp", "Computer", "RuleTitle", "Level"],
+        leading=[f"TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}') ASC NULLS LAST"],
+    ) + ["_combined ASC"]
+
     query = f"""
         SELECT
             "Timestamp", "Computer", "RuleTitle", "Level",
@@ -2398,9 +2448,7 @@ def decode_powershell_commands(
         FROM logs
         WHERE regexp_matches(LOWER({combined_expr}), ?)
         {and_clause}
-        ORDER BY
-            TRY_STRPTIME("Timestamp", '{TIMESTAMP_FORMAT}') ASC NULLS LAST,
-            "Timestamp" ASC
+        ORDER BY {", ".join(decode_order_terms)}
     """
 
     raw_df, total_count = _query_with_pagination(
@@ -2595,7 +2643,11 @@ def correlate_lateral_movement(
           AND a.ts IS NOT NULL
           AND b.ts IS NOT NULL
           AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '{time_window_minutes} minutes'
-        ORDER BY a.ts ASC, b.ts ASC
+        ORDER BY
+            a.ts ASC, b.ts ASC,
+            a."Computer" ASC, b."Computer" ASC,
+            a."RuleTitle" ASC, b."RuleTitle" ASC,
+            a."Level" ASC, b."Level" ASC
     """
 
     result_df, total_count = _query_with_pagination(
