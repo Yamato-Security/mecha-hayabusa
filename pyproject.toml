@@ -1,7 +1,7 @@
 [project]
 name = "hayabusa-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-driven DFIR analyzer for Hayabusa results: an MCP server exposing read-only DuckDB analytics over Hayabusa CSV timelines, with an investigation skill for LLM-driven incident timeline and report generation."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
