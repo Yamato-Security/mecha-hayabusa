@@ -158,8 +158,69 @@ def render_html(template, *, title, all_events_json, phases_json, segments_json,
     return html
 
 
+def _fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _require_list(data, key):
+    """The collection itself must be a list before anything indexes into it."""
+    value = data[key]
+    if not isinstance(value, list):
+        _fail(f"{key!r} must be a list, got {type(value).__name__}")
+    return value
+
+
+def _item_dict(item, index, collection):
+    if not isinstance(item, dict):
+        _fail(f"{collection}[{index}] must be an object, got {type(item).__name__}")
+    return item
+
+
+def _require_str(item, key, index, collection):
+    _item_dict(item, index, collection)
+    if key not in item:
+        _fail(f"{collection}[{index}] is missing required key: {key!r}")
+    value = item[key]
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str(item, key, index, collection, default=""):
+    value = item.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        _fail(f"{collection}[{index}].{key} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str_list(item, key, index, collection):
+    value = item.get(key, [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _fail(f"{collection}[{index}].{key} must be a list, got {type(value).__name__}")
+    for position, entry in enumerate(value):
+        if not isinstance(entry, str):
+            _fail(
+                f"{collection}[{index}].{key}[{position}] must be a string,"
+                f" got {type(entry).__name__}"
+            )
+    return value
+
+
 def main():
-    data = json.load(sys.stdin)
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        _fail(f"input is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        _fail("input must be a JSON object")
+    for key in ("events", "output"):
+        if key not in data:
+            _fail(f"missing required key: {key!r}")
     events = data["events"]
     phases = data.get("phases", [])
     title = data.get("title", "インシデントタイムライン")
@@ -169,20 +230,28 @@ def main():
         print(f"Output path must end with .html, got: {output_path}", file=sys.stderr)
         sys.exit(1)
 
+    # Validated here rather than beside the assignment so this block stays
+    # clear of the localized title default the JP tree overrides.
+    if not isinstance(events, list):
+        _fail(f"'events' must be a list, got {type(events).__name__}")
     if not events:
         print("No events to plot", file=sys.stderr)
         sys.exit(1)
 
     # Parse events
     parsed = []
-    for ev in events:
-        ts = parse_ts(ev["timestamp"])
+    for index, ev in enumerate(events):
+        timestamp = _require_str(ev, "timestamp", index, "events")
+        try:
+            ts = parse_ts(timestamp)
+        except (TypeError, ValueError) as exc:
+            _fail(f"events[{index}].timestamp is not a valid timestamp: {timestamp!r} ({exc})")
         parsed.append({
             "ts": ts,
-            "host": ev["host"],
-            "rule": ev.get("rule", ""),
-            "level": ev.get("level", "info").lower(),
-            "mitre": ev.get("mitre", ""),
+            "host": _require_str(ev, "host", index, "events"),
+            "rule": _optional_str(ev, "rule", index, "events"),
+            "level": (_optional_str(ev, "level", index, "events", "info") or "info").lower(),
+            "mitre": _optional_str(ev, "mitre", index, "events"),
         })
     parsed.sort(key=lambda x: x["ts"])
 
