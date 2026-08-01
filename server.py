@@ -66,6 +66,17 @@ def _ensure_within_dataset_roots(path: pathlib.Path) -> pathlib.Path:
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
+# Upper bound on the candidate pairs correlate_lateral_movement will join.
+# total_count enumerates every pair, so the estimate is computed first (see the
+# bucketing in the tool) and the call refused when it exceeds this. Tuned
+# against measured cost: ~3.4M real pairs takes ~2.2s and ~36M takes ~24s, so
+# 10M keeps the worst accepted case within a few seconds while still refusing
+# the runs that would hang an interactive session.
+MAX_CORRELATION_CANDIDATE_PAIRS = 10_000_000
+# Buckets per window used by that estimate. Higher is tighter and costs a few
+# more bucket rows to join; 4 is enough to stop a cluster just outside the
+# window from being charged as if it were inside one.
+CORRELATION_ESTIMATE_SUB_BUCKETS = 4
 RUN_SQL_MAX_ROWS = 500
 DATASET_LIST_MAX_ROWS = 500
 SUMMARY_FIELD_CANDIDATES = ("RuleTitle", "Computer", "Level", "EventID", "Channel", "Provider")
@@ -2587,7 +2598,17 @@ def correlate_lateral_movement(
     if time_window_minutes < 1 or time_window_minutes > 1440:
         raise ValueError("time_window_minutes must be between 1 and 1440.")
 
-    params: list[object] = []
+    # Parameters are collected per side and concatenated in the order the two
+    # WHERE clauses appear in the statement. Collecting them into one list as
+    # the conditions were built bound them in the wrong order as soon as a
+    # level filter was combined with source_host/target_host: the SQL order is
+    # (level_a, source_host, level_b, target_host) while the list was
+    # (level_a, level_b, source_host, target_host). The host predicate then
+    # received a level string, matched no Computer, and the tool reported "no
+    # lateral movement patterns detected" — a false negative rather than an
+    # error, since the placeholder count still happened to line up.
+    params_a: list[object] = []
+    params_b: list[object] = []
     conditions_a: list[str] = []
     conditions_b: list[str] = []
 
@@ -2595,22 +2616,115 @@ def correlate_lateral_movement(
     if level_values:
         placeholders = ", ".join("?" for _ in level_values)
         conditions_a.append(f'"Level" IN ({placeholders})')
-        params.extend(level_values)
+        params_a.extend(level_values)
         conditions_b.append(f'"Level" IN ({placeholders})')
-        params.extend(level_values)
+        params_b.extend(level_values)
     else:
         conditions_a.append("""("Level" IN ('high', 'crit') OR POSITION('LatMov' IN COALESCE("MitreTactics", '')) > 0)""")
         conditions_b.append("""("Level" IN ('high', 'crit') OR POSITION('LatMov' IN COALESCE("MitreTactics", '')) > 0)""")
 
     if source_host:
         conditions_a.append('POSITION(? IN COALESCE("Computer", \'\')) > 0')
-        params.append(source_host)
+        params_a.append(source_host)
     if target_host:
         conditions_b.append('POSITION(? IN COALESCE("Computer", \'\')) > 0')
-        params.append(target_host)
+        params_b.append(target_host)
 
     where_a = f"WHERE {' AND '.join(conditions_a)}" if conditions_a else ""
     where_b = f"WHERE {' AND '.join(conditions_b)}" if conditions_b else ""
+    params: list[object] = [*params_a, *params_b]
+
+    # Guard the self-join before running it. total_count is COUNT(*) over the
+    # joined pairs, so the cost of one page is driven by the pair count, not by
+    # page_size: 12,000 events across 4 hosts in a one-hour window already
+    # yields ~36M pairs and ~24s for a 10-row page.
+    #
+    # The bound has to be time-aware or the guard is useless. Since b.ts lies
+    # in [a.ts, a.ts + window], bucketing timestamps by the window width means
+    # a row in bucket i can only pair with rows in buckets i and i+1 — so
+    # summing A_i * (B_i + B_i+1) bounds the join, and subtracting the
+    # same-host products applies the a.Computer != b.Computer predicate the
+    # join also enforces. Both are exact exclusions, so this stays an upper
+    # bound, while tracking how sparse the events actually are in time.
+    #
+    # A plain count_a * count_b Cartesian bound was tried first and is not
+    # usable: it is identical for every window width, so it refused a
+    # 133k-match / 0.13s query as if it were a 9M-pair one and made the
+    # "shorten time_window_minutes" advice in the refusal impossible to act on.
+    window_seconds = time_window_minutes * 60
+    # Bucket at a fraction of the window rather than at the window itself. With
+    # bucket width w, a pair separated by at most `window` spans at most
+    # ceil(window / w) buckets, so charging buckets i..i+SUB is still an upper
+    # bound — but a quarter-window grid charges far less slop than a
+    # whole-window one. Charging the entire adjacent bucket rejected joins with
+    # no possible matches at all: 3,200 events at 00:00:00 against 3,200 at
+    # 00:01:59 with a 1-minute window is 0 real pairs, and was refused at
+    # 10,240,000. It also made the estimate jump with grid alignment, so a
+    # *shorter* window could flip a served call to refused.
+    sub_buckets = CORRELATION_ESTIMATE_SUB_BUCKETS
+    bucket_seconds = max(1, -(-window_seconds // sub_buckets))
+    bucket_expr = (
+        f"CAST(FLOOR(EPOCH(TRY_STRPTIME(\"Timestamp\", '{TIMESTAMP_FORMAT}'))"
+        f" / {bucket_seconds}) AS BIGINT)"
+    )
+    # The join is over bucket rows (distinct buckets x hosts), not event rows,
+    # so the range condition here is cheap however large the dataset is.
+    estimate = repo.query_dataframe(
+        f"""
+        WITH a_bucket_host AS (
+            SELECT bucket, host, COUNT(*) AS n FROM (
+                SELECT {bucket_expr} AS bucket, "Computer" AS host FROM logs {where_a}
+            ) WHERE bucket IS NOT NULL GROUP BY 1, 2
+        ),
+        b_bucket_host AS (
+            SELECT bucket, host, COUNT(*) AS n FROM (
+                SELECT {bucket_expr} AS bucket, "Computer" AS host FROM logs {where_b}
+            ) WHERE bucket IS NOT NULL GROUP BY 1, 2
+        ),
+        a_bucket AS (SELECT bucket, SUM(n) AS n FROM a_bucket_host GROUP BY 1),
+        b_bucket AS (SELECT bucket, SUM(n) AS n FROM b_bucket_host GROUP BY 1)
+        SELECT
+            COALESCE((SELECT SUM(n) FROM a_bucket), 0) AS side_a,
+            COALESCE((SELECT SUM(n) FROM b_bucket), 0) AS side_b,
+            COALESCE((
+                SELECT SUM(a.n * b.n)
+                FROM a_bucket AS a
+                JOIN b_bucket AS b
+                  ON b.bucket BETWEEN a.bucket AND a.bucket + {sub_buckets}
+            ), 0)
+            - COALESCE((
+                SELECT SUM(a.n * b.n)
+                FROM a_bucket_host AS a
+                JOIN b_bucket_host AS b
+                  ON b.host = a.host
+                 AND b.bucket BETWEEN a.bucket AND a.bucket + {sub_buckets}
+            ), 0) AS candidate_pairs
+        """,
+        params,
+    )
+    count_a = int(estimate.iloc[0]["side_a"])
+    count_b = int(estimate.iloc[0]["side_b"])
+    search_space = int(estimate.iloc[0]["candidate_pairs"] or 0)
+    if search_space > MAX_CORRELATION_CANDIDATE_PAIRS:
+        return _attach_pagination_metadata(
+            pd.DataFrame(), total_count=0,
+            page_size=page_size, page_offset=page_offset,
+            status="too_broad",
+            message=(
+                f"Correlation search space is too large: {count_a:,} source and {count_b:,} target"
+                f" events within {time_window_minutes} minute(s) of each other give up to"
+                f" {search_space:,} candidate pairs (limit {MAX_CORRELATION_CANDIDATE_PAIRS:,})."
+                " Narrow the scope and retry — a shorter time_window_minutes, a level filter,"
+                " or source_host/target_host all reduce it. No events were correlated."
+            ),
+            extra_meta={
+                "source_event_count": count_a,
+                "target_event_count": count_b,
+                "candidate_pairs": search_space,
+                "max_candidate_pairs": MAX_CORRELATION_CANDIDATE_PAIRS,
+                "time_window_minutes": time_window_minutes,
+            },
+        )
 
     query = f"""
         WITH parsed_a AS (
