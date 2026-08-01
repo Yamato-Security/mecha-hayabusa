@@ -4,8 +4,10 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import pathlib
 import re
+import tempfile
 from typing import Sequence
 
 import duckdb
@@ -2680,7 +2682,61 @@ if __name__ == "__main__":
              " Defaults to the current working directory. Paths outside every"
              " root — including symlink targets — are rejected.",
     )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        metavar="FILE",
+        help="Path to the DuckDB working database (default: ./hayabusa.duckdb in"
+             " the current working directory). A server instance holds one loaded"
+             " dataset in a single 'logs' table and is designed for one"
+             " analyst/client at a time; run separate instances with distinct"
+             " --db-path files rather than pointing several clients at one server.",
+    )
     args = parser.parse_args()
+    # Resolve the working database unconditionally, not just when --db-path is
+    # given. Leaving the default as the relative "hayabusa.duckdb" meant the
+    # startup banner printed exactly the CWD-relative path this option exists
+    # to disambiguate, so the line looked like it answered "which database am I
+    # using" while still leaving it open. Validating here also moves the
+    # failure for an unusable path to startup: .resolve() does not require the
+    # path to exist, so a missing parent directory previously let the server
+    # start and surfaced later as a DuckDB error from the first dataset load,
+    # well away from the argument that caused it.
+    DB_PATH = pathlib.Path(args.db_path or DB_PATH).expanduser().resolve()
+    # The parent is required rather than created: this codebase does not create
+    # filesystem state from a path argument (see the --dataset-root rules), and
+    # a typo'd directory should be reported, not silently made.
+    if not DB_PATH.parent.is_dir():
+        parser.error(
+            f"--db-path directory does not exist: {DB_PATH.parent}"
+            f" (for {DB_PATH}). Create it first, or choose another path."
+        )
+    if DB_PATH.exists():
+        if not DB_PATH.is_file():
+            parser.error(f"--db-path is not a file: {DB_PATH}")
+        if not os.access(DB_PATH, os.W_OK):
+            parser.error(
+                f"--db-path exists but is not writable: {DB_PATH}."
+                " The ingester needs write access to load a dataset."
+            )
+    else:
+        # Probe by actually creating a file, not by reading permission bits.
+        # A real write is what the server will do, so it accounts for ACLs,
+        # read-only mounts and a full filesystem — and it answers for the user
+        # the process is actually running as, which mode-bit inspection does
+        # not. The probe file is created next to the database and removed
+        # immediately; the database itself is deliberately NOT created, since
+        # DuckDBRepository.is_initialised() is `db_path.exists()` and an empty
+        # file would make an unloaded server report itself as initialised.
+        try:
+            with tempfile.NamedTemporaryFile(dir=DB_PATH.parent, prefix=".hayabusa-mcp-"):
+                pass
+        except OSError as exc:
+            parser.error(
+                f"--db-path directory is not writable: {DB_PATH.parent}"
+                f" (for {DB_PATH}): {exc.strerror or exc}"
+            )
+    repo.db_path = DB_PATH
     if args.dataset_root:
         roots = []
         for raw in args.dataset_root:
@@ -2709,6 +2765,7 @@ if __name__ == "__main__":
         print(f"Current dataset: {status.get('dataset_path', '')}")
     else:
         print("No dataset loaded. Please load a CSV using the switch_dataset tool.")
+    print(f"Database: {repo.db_path}")
     print("Dataset root(s): " + ", ".join(str(root) for root in DATASET_ROOTS))
 
     try:
