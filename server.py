@@ -2361,6 +2361,12 @@ _ENCODED_PS_PATTERN = re.compile(
 # DuckDB (RE2) form of the same switch match, used to pre-filter candidate rows.
 _ENCODED_PS_SQL_REGEX = rf"{_SWITCH_PREFIX_SQL}(?:{_ENCODED_PS_FLAG_ALT})\s"
 
+# Upper bound on candidate rows scanned for encoded-PowerShell decoding. The
+# candidate set is already narrowed by the -enc LIKE predicates, so this is a
+# generous ceiling; when the true match count exceeds it the response reports
+# status="partial" rather than silently truncating.
+MAX_DECODE_SCAN_ROWS = 5000
+
 
 @app.tool()
 def decode_powershell_commands(
@@ -2420,14 +2426,35 @@ def decode_powershell_commands(
     """
 
     raw_df, total_count = _query_with_pagination(
-        query, params, page_size=page_size * 2, page_offset=0, include_total=True
+        query, params, page_size=MAX_DECODE_SCAN_ROWS, page_offset=0, include_total=True
+    )
+    scan_truncated = total_count is not None and total_count > MAX_DECODE_SCAN_ROWS
+    source_event_count = int(total_count) if total_count is not None else len(raw_df)
+
+    # Built before any early return. Deriving the status further down meant a
+    # capped scan that decoded to nothing fell out through a "no_data" branch
+    # that dropped both the partial status and source_event_count — reporting
+    # "no commands matched" for a scan that never reached the matching rows.
+    # That is the same evidence loss this change exists to remove, moved from
+    # the pagination window into the decode window, and it reads as a cleared
+    # hypothesis rather than a truncated search.
+    decode_meta: dict[str, object] = {"source_event_count": source_event_count}
+    truncated_status = "partial" if scan_truncated else "no_data"
+    truncated_note = (
+        f" Scan capped at {MAX_DECODE_SCAN_ROWS} of {source_event_count} matching"
+        " events, so encoded commands beyond the cap were not examined; narrow with"
+        " level/rule_title/detail_source to reach them."
+        if scan_truncated
+        else ""
     )
 
     if total_count == 0 or raw_df.empty:
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No Base64-encoded PowerShell commands found",
+            status=truncated_status,
+            message="No Base64-encoded PowerShell commands found." + truncated_note,
+            extra_meta=decode_meta,
         ))
 
     decoded_rows: list[dict[str, str]] = []
@@ -2454,7 +2481,9 @@ def decode_powershell_commands(
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=0,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No commands matching the Base64 pattern were found",
+            status=truncated_status,
+            message="No commands matching the Base64 pattern were found." + truncated_note,
+            extra_meta=decode_meta,
         ))
 
     all_df = pd.DataFrame(decoded_rows)
@@ -2464,16 +2493,36 @@ def decode_powershell_commands(
     # identity stamped on the raw query result (G5 audit trail).
     paged.attrs = dict(raw_df.attrs)
 
+    # source_event_count is the true number of matching source events (which can
+    # differ from the decoded-row count, since one event may hold several encoded
+    # blobs). When the match count exceeds the scan cap, say so explicitly instead
+    # of reporting the capped window as if it were complete.
+    status, message = "ok", ""
+    if scan_truncated:
+        status = "partial"
+        message = (
+            f"Scan capped at {MAX_DECODE_SCAN_ROWS} of {source_event_count} matching"
+            " events; narrow with level/rule_title/detail_source to decode the rest."
+        )
+
     if paged.empty:
+        # A page past the decoded rows during a capped scan is still a capped
+        # scan: source_event_count already says more events matched than were
+        # examined, so reporting a bare "no data on this page" here would
+        # contradict it. no_data is reserved for a complete scan.
         return _WideDisplayDataFrame(_attach_pagination_metadata(
             pd.DataFrame(), total_count=total,
             page_size=page_size, page_offset=page_offset,
-            status="no_data", message="No data on the specified page",
+            status=truncated_status,
+            message="No data on the specified page." + truncated_note,
+            extra_meta=decode_meta,
         ))
 
     return _WideDisplayDataFrame(_attach_pagination_metadata(
         paged, total_count=total,
         page_size=page_size, page_offset=page_offset,
+        status=status, message=message,
+        extra_meta=decode_meta,
     ))
 
 
