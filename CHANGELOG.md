@@ -4,7 +4,7 @@
 
 **Bug Fixes:**
 
-- Fixed count-based Hayabusa correlation rules being impossible to triage, which blocked report generation entirely. Those rules emit one aggregated row per correlation window with an empty `RecordID`, but `state.py` demanded evidence refs whenever the dataset had a `RecordID` *column*, so no verdict — not even `indeterminate` — could be recorded for them, gate G1 could never reach zero pending, and `report.py` refused to generate. A triage entry may now declare `"refs_unavailable": true`; gate G7 verifies that claim against the dataset and rejects it if the rule does have rows carrying RecordIDs, so the row-level audit guarantee is preserved. (#38) (@YamatoSecurity)
+- Fixed count-based Hayabusa correlation rules being impossible to triage, which blocked report generation entirely. Those rules emit one aggregated row per correlation window with an empty `RecordID`, but `state.py` demanded evidence refs whenever the dataset had a `RecordID` *column*, so no verdict — not even `indeterminate` — could be recorded for them, gate G1 could never reach zero pending, and `report.py` refused to generate. A triage entry may now declare `"refs_unavailable": true`; gate G7 verifies that claim against the dataset and rejects it if the rule does have rows carrying RecordIDs, so the row-level audit guarantee is preserved. (#38 #39) (@YamatoSecurity)
 
 ## 1.0.0 [2026/07/31] - Black Hat Arsenal USA 2026 Release
 
