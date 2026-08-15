@@ -150,6 +150,7 @@ python3 "$STATE_PY" triage --dir "$STATE_DIR" --batch < "$STATE_DIR/work/triage_
 ```
 
 - **全ての評決（`attack` / `false_positive` / `indeterminate`）に `refs`（実際に検証した代表イベントへの参照、最低1件）が必須**（RecordIDカラムを持つデータセットの場合。記録時に拒否され、ゲート G6/G7 でも強制される）。偽陽性の除外も攻撃の認定と同じく、行レベルまで監査可能でなければならない
+- **例外 — 件数集約（correlation）ルール**。Hayabusa の一部のルール（`Failed Logins with Different Accounts from Single Source System`、`Rare Service Installations` など）は相関ウィンドウごとに1行の*集約*レコードを出力し、`RecordID` が空であるため個別イベントを引用できない。この種のルールに限り、`refs` の代わりに triage エントリへ `"refs_unavailable": true` を指定する。ゲート G7 はこの申告をデータセットと突き合わせて検証し、当該ルールに RecordID を持つ行が1件でも存在すれば証拠不足として拒否する。単に未確認のルールの証拠を省くために使ってはならない
 - **`refs` は `{"record_id": ..., "computer": ..., "channel": ...}` の修飾形式で記録する**（`channel` は同一ホスト内でRecordIDが衝突する場合のみ必要）。旧形式 `record_ids` も受理され、`"123@HOST-A"` / `"123@HOST-A@Sysmon"` のコンパクト表記が使える。**重複RecordID（複数ホストに同じ値が存在）を computer なしで引用すると G6 が FAIL する**
 - **`excerpt` は詳細フィールドの逐語引用（コピー&ペースト）にする**: `false_positive` では必須。言い換え・要約・省略記号は不可 — G6 が引用イベントの実データと突合し、一致しなければ FAIL する。攻撃判定でも読者が再判定できるように残すことを推奨
 - **`rationale` は実体的に書く**: "reviewed" のようなスタブは記録時に拒否される。判定根拠となったフィールドと値（プロセスパス、ユーザー、署名者等）に言及する
@@ -896,7 +897,7 @@ Step 3.5 の検証で偽陽性と判定し、攻撃タイムラインから**除
 レポート全体を通じて以下に留意する:
 
 - **ステートの逐次記録（最重要）**: トリアージ判定・finding・IOC・ホストカバレッジ・クラスタ判定は、**確定したその時点で**ステートファイルに記録する（最後にまとめて記録しない）。ステートファイルは調査の一次情報源であり、コンテキスト圧縮を越えて残り、再開を可能にし、カバレッジゲート（`state.py check`）が PASS するまでレポートは生成できない
-- **証跡refsの引用（最重要）**: 全てのトリアージ評決（attack / false_positive / indeterminate）と全てのfindingには、裏付けイベントへの `refs`（`{"record_id": ..., "computer": ...}`、必要なら `channel` も）を必ず含める（ゲート G6/G7）。IOCにも可能な限り出典 `refs` を付ける。RecordIDと Computer は検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い。**RecordIDは全体で一意ではない**ため、`get_event_detail` が status=ambiguous（候補一覧）を返したら `computer`/`channel` を指定して確定させる
+- **証跡refsの引用（最重要）**: 全てのトリアージ評決（attack / false_positive / indeterminate）と全てのfindingには、裏付けイベントへの `refs`（`{"record_id": ..., "computer": ...}`、必要なら `channel` も）を必ず含める（ゲート G6/G7）。IOCにも可能な限り出典 `refs` を付ける。RecordIDと Computer は検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い。**RecordIDは全体で一意ではない**ため、`get_event_detail` が status=ambiguous（候補一覧）を返したら `computer`/`channel` を指定して確定させる（唯一の例外は、行が一切RecordIDを持たない件数集約ルール — Step 3.5 の `refs_unavailable` を参照）
 - **ステート記録の時刻表記**: finding や triage の `summary` / `rationale` に時刻を書く場合は、タイムゾーンオフセット付き（例: `2023-10-10T14:11:45+09:00`）またはTZ注記付きで記録する。レポート本文の表記タイムゾーン（UTC）と元ログのタイムゾーンが異なっても、ステートとレポートを突合できるようにするため
 - **攻撃者ツールの特定**: Hayabusaのルール名には攻撃ツール名が含まれることが多い（例: "HackTool - [ツール名]", "[ツール名] Execution"）。ルール名のパターンから攻撃ツール/フレームワークを識別し、セクション2に反映する
 - **正規活動との区別**: 構成管理ツール（Packer, Ansible, SCCM等）やIT管理ツール由来の活動は攻撃と誤認しやすい。コンテキスト（実行パス、実行ユーザー、タイミング）から判断し、判断根拠をセクション9に記載する

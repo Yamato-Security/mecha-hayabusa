@@ -78,6 +78,10 @@ VARIANT_EVIDENCE_THRESHOLD = 20
 # Distinct variant keys tracked per rule during the recount; beyond this the
 # chosen fields are too unstable to be a meaningful grouping.
 VARIANT_GROUPS_CAP = 2000
+# Detail strings kept per refs_unavailable rule so G6 can still verify its excerpt.
+# These rules have no citable row, so the quote is checked against the rule's own
+# rows instead; a few hundred is ample for a correlation rule's aggregated output.
+UNCITED_EXCERPT_ROWS = 500
 
 # Grouping fields that carry no event content: a variant key made ONLY of
 # these (e.g. per-host counts) satisfies the count arithmetic without
@@ -314,6 +318,15 @@ class DatasetFacts:
         self.rules: dict[str, dict[str, int]] = {}        # title -> level -> count
         self.hosts: dict[str, dict[str, int]] = {}        # host -> level -> count
         self.record_ids: set[str] = set()
+        # Rule titles with at least one row carrying a RecordID. Hayabusa's
+        # count-based correlation rules emit one aggregated row per window with
+        # NO RecordID, so those rules cannot cite an event; this lets the gates
+        # verify that claim against the data instead of trusting the analyst.
+        self.rules_with_record_id: set[str] = set()
+        # rule title -> normalised detail strings (capped). Only collected for rules
+        # that declared refs_unavailable, so G6 can still verify their excerpt even
+        # though there is no citable row to resolve.
+        self.rule_details: dict[str, set[str]] = {}
         self.ts_total = 0                                 # rows with a non-empty Timestamp
         self.ts_parsed = 0                                # rows whose Timestamp parsed
         self._dates_by_level: dict[str, set] = {}
@@ -334,10 +347,12 @@ def scan_csv(
     csv_path: str,
     cited_ids: "set[str] | None" = None,
     variant_specs: "dict[str, list] | None" = None,
+    excerpt_titles: "set[str] | None" = None,
     probe_titles: "set[str] | None" = None,
 ) -> DatasetFacts:
     cited_ids = cited_ids or set()
     variant_specs = variant_specs or {}
+    excerpt_titles = excerpt_titles or set()
     probe_titles = probe_titles or set()
     facts = DatasetFacts()
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
@@ -353,6 +368,12 @@ def scan_csv(
             if title:
                 facts.rules.setdefault(title, {}).setdefault(level, 0)
                 facts.rules[title][level] += 1
+                if record_id:
+                    facts.rules_with_record_id.add(title)
+                if title in excerpt_titles and detail:
+                    seen = facts.rule_details.setdefault(title, set())
+                    if len(seen) < UNCITED_EXCERPT_ROWS:
+                        seen.add(" ".join(detail.split()))
                 spec = variant_specs.get(title)
                 if spec is not None and title not in facts.variant_overflow:
                     counts = facts.variant_counts.setdefault(title, {})
@@ -647,7 +668,26 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
             _fail(f"rationale is required for {title!r} (record why, so the report and reviewers can re-evaluate)")
         _require_substantive_rationale(rationale, f"rule {title!r}")
         refs = _normalize_refs(entry)
-        if has_record_id_col and not refs:
+        # Hayabusa's count-based correlation rules ("Failed Logins with Different
+        # Accounts from Single Source System", "Rare Service Installations", ...)
+        # emit one aggregated row per correlation window with an EMPTY RecordID,
+        # so no single event can be cited for them. Such an entry may set
+        # "refs_unavailable": true; gate G7 then checks that claim against the
+        # dataset and rejects it if the rule does have citable rows.
+        refs_unavailable_raw = entry.get("refs_unavailable", False)
+        if not isinstance(refs_unavailable_raw, bool):
+            _fail(
+                f"refs_unavailable for {title!r} must be a JSON boolean, got"
+                f" {type(refs_unavailable_raw).__name__} {refs_unavailable_raw!r}"
+                ' (a string such as "false" would silently enable it)'
+            )
+        refs_unavailable = refs_unavailable_raw
+        if refs_unavailable and refs:
+            _fail(
+                f"{title!r} sets refs_unavailable but also cites refs. The flag means"
+                " the rule has no citable row at all; drop it and keep the refs."
+            )
+        if has_record_id_col and not refs and not refs_unavailable:
             _fail(
                 f"refs (or record_ids) is required for a {verdict!r} verdict on {title!r}:"
                 " cite the event(s) you actually verified as"
@@ -655,6 +695,9 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
                 " Every verdict — false_positive and indeterminate included — must be"
                 " auditable down to the row; RecordIDs duplicated across hosts need the"
                 " computer (and channel) qualifier."
+                ' If this rule is a count-based correlation rule whose rows carry no'
+                ' RecordID at all, set "refs_unavailable": true instead (gate G7'
+                " verifies that against the dataset)."
             )
         excerpt = entry.get("excerpt")
         excerpt_text = ("" if excerpt is None else str(excerpt)).strip()[:2000]
@@ -691,6 +734,15 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
         rule["evidence"]["refs"] = refs
         rule["evidence"]["record_ids"] = [r["record_id"] for r in refs]
         rule["evidence"]["detail_excerpt"] = excerpt_text
+        rule["evidence"]["refs_unavailable"] = refs_unavailable
+        if refs_unavailable and verdict in ("attack", "mixed"):
+            print(
+                f"warning: {title!r} is verdict {verdict!r} with refs_unavailable."
+                " Gate G4 will require a finding to cite this rule, and findings have"
+                " no refs_unavailable equivalent, so that finding must also cite at"
+                " least one rule whose rows carry RecordIDs.",
+                file=sys.stderr,
+            )
         rule["variants"] = variants
         rule["verified_at"] = _now()
     _save(state_dir, RULE_TRIAGE, triage)
@@ -715,6 +767,7 @@ def cmd_triage(args) -> None:
         "rationale": args.rationale,
         "record_ids": args.record_ids,
         "excerpt": args.excerpt,
+        "refs_unavailable": args.refs_unavailable,
     }])
 
 
@@ -1478,8 +1531,13 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
             title for title, fields in variant_specs.items()
             if all(f in NON_CONTENT_FIELDS for f in fields)
         }
+        excerpt_titles = {
+            r["rule_title"] for r in triage["rules"]
+            if (r.get("evidence") or {}).get("refs_unavailable")
+            and (r["evidence"].get("detail_excerpt") or "").strip()
+        }
         facts = scan_csv(csv_path, cited_ids=cited_ids, variant_specs=variant_specs,
-                         probe_titles=probe_titles)
+                         probe_titles=probe_titles, excerpt_titles=excerpt_titles)
 
     # G1: rule triage coverage at investigated levels
     gate_rules = [r for r in triage["rules"] if set(r["levels"]) & set(levels)]
@@ -1596,7 +1654,19 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         for rule in triage["rules"]:
             refs = triage_refs[rule["rule_title"]]
             if not refs:
-                continue  # missing evidence is G7's finding, not G6's
+                # A verified-uncitable rule has no row to resolve, but its excerpt is
+                # still a quote and must still be verbatim — check it against the
+                # rule's own rows rather than letting it through unverified.
+                excerpt = " ".join((rule["evidence"].get("detail_excerpt") or "").split())
+                if excerpt and (rule.get("evidence") or {}).get("refs_unavailable"):
+                    known = facts.rule_details.get(rule["rule_title"])
+                    if known is not None and not any(excerpt in d for d in known):
+                        g6_gaps.append(
+                            f"rule {rule['rule_title']}: detail_excerpt is not a verbatim"
+                            " substring of any row of this rule — quote the"
+                            " Details/AllFieldInfo content exactly (no paraphrase, no ellipsis)"
+                        )
+                continue  # otherwise missing evidence is G7's finding, not G6's
             resolved_rows: list[dict] = []
             for ref in refs:
                 rows = check_ref(f"rule {rule['rule_title']}", ref, rule["rule_title"])
@@ -1645,11 +1715,34 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         dataset_columns = manifest["dataset"]["columns"]
         has_detail_col = ("Details" in dataset_columns) or ("AllFieldInfo" in dataset_columns)
         judged_rules = [r for r in triage["rules"] if r["verdict"]]
-        no_evidence = []
+        no_evidence: list[str] = []
+        uncitable: list[str] = []
         for r in judged_rules:
             reasons = []
             if not triage_refs[r["rule_title"]]:
-                reasons.append("no refs")
+                claimed = bool((r.get("evidence") or {}).get("refs_unavailable"))
+                title = r["rule_title"]
+                if not claimed:
+                    reasons.append("no refs")
+                elif facts is None:
+                    # Fail closed: the claim is unverifiable without the dataset.
+                    reasons.append(
+                        "claims refs_unavailable but the dataset could not be read to"
+                        " verify it"
+                    )
+                elif title not in facts.rules:
+                    # Fail closed: a title absent from the CSV is not evidence of
+                    # uncitability, it is an inconsistent state file.
+                    reasons.append(
+                        "claims refs_unavailable but the rule title is absent from the"
+                        " dataset"
+                    )
+                elif title in facts.rules_with_record_id:
+                    reasons.append(
+                        "claims refs_unavailable but the rule has rows with RecordIDs"
+                    )
+                else:
+                    uncitable.append(title)  # verified: no row of this rule has a RecordID
             if (r["verdict"] == "false_positive" and has_detail_col
                     and not (r["evidence"].get("detail_excerpt") or "").strip()):
                 reasons.append("false_positive without verbatim excerpt")
@@ -1660,9 +1753,15 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
             if not finding_refs[f["id"]]
         ]
         total = len(judged_rules) + len(findings["findings"])
-        gate("G7", "verdicts cite row-level evidence", not no_evidence,
-             f"{total - len(no_evidence)}/{total} verdicts and findings cite evidence refs",
-             no_evidence)
+        cited = total - len(no_evidence) - len(uncitable)
+        detail = f"{cited}/{total} verdicts and findings cite evidence refs"
+        if uncitable:
+            detail += (
+                f"; {len(uncitable)} rule(s) verified uncitable (no row carries a"
+                " RecordID): " + ", ".join(sorted(uncitable)[:5])
+                + (" ..." if len(uncitable) > 5 else "")
+            )
+        gate("G7", "verdicts cite row-level evidence", not no_evidence, detail, no_evidence)
     else:
         gate("G7", "verdicts cite row-level evidence", True, "skipped (no RecordID column)")
 
@@ -2115,6 +2214,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--record-ids", default="",
                    help='comma-separated evidence refs: "RID", "RID@Computer" or'
                         ' "RID@Computer@Channel" (qualify duplicated RecordIDs)')
+    p.add_argument("--refs-unavailable", action="store_true",
+                   help="the rule's rows carry no RecordID at all (count-based correlation"
+                        " rules); gate G7 verifies this against the dataset")
     p.add_argument("--excerpt", default="",
                    help="verbatim quote of the cited event's detail field"
                         " (required for false_positive; verified by gate G6)")
