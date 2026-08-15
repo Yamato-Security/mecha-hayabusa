@@ -286,12 +286,31 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+# Hayabusa's count-based correlation rules render their aggregated fields as
+# "Key:Value" with NO space after the colon ("Count:21 ¦ ServiceName:AnyDesk MSI
+# Service"), unlike the "Key: Value" form every other rule uses. Splitting on a
+# bare colon would be unsafe -- a fragment such as "C:\\Windows\\foo.exe" would
+# yield the field "C" -- so the fallback only fires on a pair the normal rule
+# rejected, and only when the key looks like a field name: at least two
+# characters, starting with a letter, alphanumerics and underscores only. That
+# excludes drive letters, and paths carry no colon at all once the drive is gone.
+_AGGREGATE_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]+$")
+
+
 def _parse_detail_fields(detail: str) -> dict:
-    """Split a Hayabusa detail string ('Key: Value ¦ Key: Value') into a dict."""
+    """Split a Hayabusa detail string ('Key: Value ¦ Key: Value') into a dict.
+
+    Also understands the 'Key:Value' form emitted by count-based correlation
+    rules, which would otherwise parse to no fields at all.
+    """
     fields: dict[str, str] = {}
     for pair in detail.split(DETAILS_SEPARATOR):
         if ": " in pair:
             key, value = pair.split(": ", 1)
+            fields[key.strip()] = value.strip()
+            continue
+        key, sep, value = pair.partition(":")
+        if sep and value and _AGGREGATE_KEY.match(key.strip()):
             fields[key.strip()] = value.strip()
     return fields
 
@@ -379,9 +398,8 @@ def scan_csv(
                 if title in host_titles and host:
                     hosts = facts.rule_hosts.setdefault(title, set())
                     for part in host.split(DETAILS_SEPARATOR):
-                        part = part.strip()
-                        if part:
-                            hosts.add(part)
+                        if part.strip():
+                            hosts.add(part.strip())
                 if title in excerpt_titles and detail:
                     seen = facts.rule_details.setdefault(title, set())
                     if len(seen) < UNCITED_EXCERPT_ROWS:
@@ -406,8 +424,16 @@ def scan_csv(
                                 if len(seen) <= VARIANT_KEY_DIVERSITY_CAP:
                                     seen.add(value)
             if host:
-                facts.hosts.setdefault(host, {}).setdefault(level, 0)
-                facts.hosts[host][level] += 1
+                # Correlation rules aggregate several machines into one row, joining
+                # them with the detail separator. Count the constituent hosts so
+                # coverage (G2) is asked for real machines rather than for a
+                # pseudo-host like "dc01.example.com ¦ rd01.example.com".
+                for one_host in host.split(DETAILS_SEPARATOR):
+                    one_host = one_host.strip()
+                    if not one_host:
+                        continue
+                    facts.hosts.setdefault(one_host, {}).setdefault(level, 0)
+                    facts.hosts[one_host][level] += 1
             if record_id:
                 facts.record_ids.add(record_id)
                 if record_id in cited_ids:
