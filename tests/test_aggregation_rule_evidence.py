@@ -184,7 +184,7 @@ class AggregationRuleEvidenceTests(unittest.TestCase):
         }])
         check = run_state("check", "--dir", str(self.state_dir))
         self.assertIn("1/2 verdicts and findings cite evidence refs", check.stdout)
-        self.assertIn("1 rule(s) verified uncitable", check.stdout)
+        self.assertIn("1 verified uncitable", check.stdout)
 
     def test_refs_unavailable_fails_closed_when_the_dataset_is_unreadable(self) -> None:
         """Without the CSV the claim cannot be verified, so it must not pass."""
@@ -207,6 +207,104 @@ class AggregationRuleEvidenceTests(unittest.TestCase):
             "--rationale", "Count-correlation rows carry no RecordID to cite.",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def _finding(self, entries: list[dict]) -> subprocess.CompletedProcess:
+        return run_state("finding", "--dir", str(self.state_dir), "--batch",
+                         stdin_data=json.dumps(entries))
+
+    def _triage_aggregated_attack(self) -> None:
+        result = self._triage([{
+            "rule_title": "Aggregated", "verdict": "attack",
+            "rationale": "Correlated failed-logon burst against several accounts from one source.",
+            "refs_unavailable": True,
+        }])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_finding_may_declare_refs_unavailable_when_all_its_rules_are_uncitable(self) -> None:
+        """An attack on a correlation rule must be reportable, not deadlocked at G4."""
+        self._triage_citable()
+        self._triage_aggregated_attack()
+        result = self._finding([{
+            "title": "Password spraying against HOST-A",
+            "summary": "Correlated failed-logon burst; the rule emits only aggregated rows.",
+            "hosts": ["HOST-A"], "rules": ["Aggregated"], "refs_unavailable": True,
+        }])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        check = run_state("check", "--dir", str(self.state_dir))
+        for gate in ("G4", "G6", "G7", "G8", "G9"):
+            self.assertIn(f"[PASS] {gate}", check.stdout, check.stdout)
+
+    def test_finding_refs_unavailable_rejected_when_a_cited_rule_is_citable(self) -> None:
+        """The hatch is only for findings that rest entirely on uncitable rules."""
+        self._triage_citable()
+        self._triage_aggregated_attack()
+        result = self._finding([{
+            "title": "Mixed citability",
+            "summary": "Cites a rule whose rows do carry RecordIDs, so a ref is possible.",
+            "hosts": ["HOST-A"], "rules": ["Aggregated", "Citable"], "refs_unavailable": True,
+        }])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[FAIL] G7", check.stdout, check.stdout)
+        self.assertIn("do carry RecordIDs", check.stdout)
+
+    def test_finding_refs_unavailable_requires_at_least_one_cited_rule(self) -> None:
+        """With no cited rule there is nothing to verify the claim against."""
+        self._triage_citable()
+        self._triage_aggregated_attack()
+        self._finding([{
+            "title": "Unanchored", "summary": "Claims uncitability but cites no rule.",
+            "hosts": ["HOST-A"], "rules": [], "refs_unavailable": True,
+        }])
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[FAIL] G7", check.stdout, check.stdout)
+        self.assertIn("cites no rule", check.stdout)
+
+    def test_uncitable_finding_hosts_are_verified_against_the_dataset(self) -> None:
+        """G9 still refuses a host the finding's own rules never fired on."""
+        self._triage_citable()
+        self._triage_aggregated_attack()
+        self._finding([{
+            "title": "Wrong host", "summary": "Claims a host the correlation rule never touched.",
+            "hosts": ["HOST-Z"], "rules": ["Aggregated"], "refs_unavailable": True,
+        }])
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[FAIL] G9", check.stdout, check.stdout)
+        self.assertIn("did not fire on that host", check.stdout)
+
+    def test_finding_refs_and_flag_together_are_rejected(self) -> None:
+        self._triage_citable()
+        self._triage_aggregated_attack()
+        result = self._finding([{
+            "title": "Contradictory", "summary": "Cites a row and claims none exists.",
+            "hosts": ["HOST-A"], "rules": ["Aggregated"],
+            "refs": [{"record_id": "10", "computer": "HOST-A"}], "refs_unavailable": True,
+        }])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("also cites refs", result.stdout + result.stderr)
+
+    def test_renaming_a_rule_title_in_the_state_file_does_not_defeat_g7(self) -> None:
+        """A title absent from the dataset is corruption, not proof of uncitability."""
+        result = self._triage([{
+            "rule_title": "Citable", "verdict": "false_positive",
+            "rationale": "Asserting uncitability for a rule that demonstrably has RecordIDs.",
+            "excerpt": "Cmdline: evil.exe ¦ User: bob",
+            "refs_unavailable": True,
+        }])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        triage_path = self.state_dir / "rule_triage.json"
+        data = json.loads(triage_path.read_text())
+        for rule in data["rules"]:
+            if rule["rule_title"] == "Citable":
+                rule["rule_title"] = "Citable "  # one trailing space
+        triage_path.write_text(json.dumps(data))
+
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[FAIL] G7", check.stdout, check.stdout)
+        self.assertIn("absent from the dataset", check.stdout)
 
 
 if __name__ == "__main__":

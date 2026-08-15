@@ -897,7 +897,7 @@ Step 3.5 の検証で偽陽性と判定し、攻撃タイムラインから**除
 レポート全体を通じて以下に留意する:
 
 - **ステートの逐次記録（最重要）**: トリアージ判定・finding・IOC・ホストカバレッジ・クラスタ判定は、**確定したその時点で**ステートファイルに記録する（最後にまとめて記録しない）。ステートファイルは調査の一次情報源であり、コンテキスト圧縮を越えて残り、再開を可能にし、カバレッジゲート（`state.py check`）が PASS するまでレポートは生成できない
-- **証跡refsの引用（最重要）**: 全てのトリアージ評決（attack / false_positive / indeterminate）と全てのfindingには、裏付けイベントへの `refs`（`{"record_id": ..., "computer": ...}`、必要なら `channel` も）を必ず含める（ゲート G6/G7）。IOCにも可能な限り出典 `refs` を付ける。RecordIDと Computer は検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い。**RecordIDは全体で一意ではない**ため、`get_event_detail` が status=ambiguous（候補一覧）を返したら `computer`/`channel` を指定して確定させる（唯一の例外は、行が一切RecordIDを持たない件数集約ルール — Step 3.5 の `refs_unavailable` を参照）
+- **証跡refsの引用（最重要）**: 全てのトリアージ評決（attack / false_positive / indeterminate）と全てのfindingには、裏付けイベントへの `refs`（`{"record_id": ..., "computer": ...}`、必要なら `channel` も）を必ず含める（ゲート G6/G7）。IOCにも可能な限り出典 `refs` を付ける。RecordIDと Computer は検証時のSQL/`get_event_detail` の結果からその場で控える — 後から探し直すのはコストが高い。**RecordIDは全体で一意ではない**ため、`get_event_detail` が status=ambiguous（候補一覧）を返したら `computer`/`channel` を指定して確定させる（唯一の例外は、行が一切RecordIDを持たない件数集約ルール — Step 3.5 の `refs_unavailable` を参照。そうしたルール*のみ*に依拠するfindingにも同じフラグを指定でき、その場合ゲートG9は当該ルールが実際に発火したホストでhostsを裏付ける）
 - **ステート記録の時刻表記**: finding や triage の `summary` / `rationale` に時刻を書く場合は、タイムゾーンオフセット付き（例: `2023-10-10T14:11:45+09:00`）またはTZ注記付きで記録する。レポート本文の表記タイムゾーン（UTC）と元ログのタイムゾーンが異なっても、ステートとレポートを突合できるようにするため
 - **攻撃者ツールの特定**: Hayabusaのルール名には攻撃ツール名が含まれることが多い（例: "HackTool - [ツール名]", "[ツール名] Execution"）。ルール名のパターンから攻撃ツール/フレームワークを識別し、セクション2に反映する
 - **正規活動との区別**: 構成管理ツール（Packer, Ansible, SCCM等）やIT管理ツール由来の活動は攻撃と誤認しやすい。コンテキスト（実行パス、実行ユーザー、タイミング）から判断し、判断根拠をセクション9に記載する

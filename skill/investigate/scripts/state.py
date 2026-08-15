@@ -327,6 +327,10 @@ class DatasetFacts:
         # that declared refs_unavailable, so G6 can still verify their excerpt even
         # though there is no citable row to resolve.
         self.rule_details: dict[str, set[str]] = {}
+        # rule title -> hosts the rule fired on. Aggregation rows can carry several
+        # hosts joined by DETAILS_SEPARATOR, so those are split out: a finding that
+        # can cite no row is still host-checkable against the data (gate G9).
+        self.rule_hosts: dict[str, set[str]] = {}
         self.ts_total = 0                                 # rows with a non-empty Timestamp
         self.ts_parsed = 0                                # rows whose Timestamp parsed
         self._dates_by_level: dict[str, set] = {}
@@ -348,11 +352,13 @@ def scan_csv(
     cited_ids: "set[str] | None" = None,
     variant_specs: "dict[str, list] | None" = None,
     excerpt_titles: "set[str] | None" = None,
+    host_titles: "set[str] | None" = None,
     probe_titles: "set[str] | None" = None,
 ) -> DatasetFacts:
     cited_ids = cited_ids or set()
     variant_specs = variant_specs or {}
     excerpt_titles = excerpt_titles or set()
+    host_titles = host_titles or set()
     probe_titles = probe_titles or set()
     facts = DatasetFacts()
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
@@ -370,6 +376,12 @@ def scan_csv(
                 facts.rules[title][level] += 1
                 if record_id:
                     facts.rules_with_record_id.add(title)
+                if title in host_titles and host:
+                    hosts = facts.rule_hosts.setdefault(title, set())
+                    for part in host.split(DETAILS_SEPARATOR):
+                        part = part.strip()
+                        if part:
+                            hosts.add(part)
                 if title in excerpt_titles and detail:
                     seen = facts.rule_details.setdefault(title, set())
                     if len(seen) < UNCITED_EXCERPT_ROWS:
@@ -738,9 +750,10 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
         if refs_unavailable and verdict in ("attack", "mixed"):
             print(
                 f"warning: {title!r} is verdict {verdict!r} with refs_unavailable."
-                " Gate G4 will require a finding to cite this rule, and findings have"
-                " no refs_unavailable equivalent, so that finding must also cite at"
-                " least one rule whose rows carry RecordIDs.",
+                " Gate G4 will require a finding to cite this rule. Either cite it"
+                " alongside a rule whose rows carry RecordIDs, or set"
+                ' "refs_unavailable": true on that finding too (allowed only when'
+                " every rule it cites is itself verified uncitable).",
                 file=sys.stderr,
             )
         rule["variants"] = variants
@@ -1033,11 +1046,27 @@ def _apply_findings(state_dir: str, entries: list[dict]) -> None:
         if not title or not summary:
             _fail("each finding requires 'title' and 'summary'")
         refs = _normalize_refs(entry)
-        if has_record_id_col and not refs:
+        refs_unavailable_raw = entry.get("refs_unavailable", False)
+        if not isinstance(refs_unavailable_raw, bool):
+            _fail(
+                f"refs_unavailable for finding {title!r} must be a JSON boolean, got"
+                f" {type(refs_unavailable_raw).__name__} {refs_unavailable_raw!r}"
+            )
+        refs_unavailable = refs_unavailable_raw
+        if refs_unavailable and refs:
+            _fail(
+                f"finding {title!r} sets refs_unavailable but also cites refs. The flag"
+                " means every rule this finding rests on is a count-based correlation"
+                " rule with no citable row; drop it and keep the refs."
+            )
+        if has_record_id_col and not refs and not refs_unavailable:
             _fail(
                 f"finding {title!r} requires refs (or record_ids): cite the supporting"
                 ' event(s) as {"record_id": ..., "computer": ..., "channel": ...}'
                 " (gate G7), so every report claim can be traced back to the data."
+                ' If every rule this finding rests on is a count-based correlation rule'
+                ' whose rows carry no RecordID, set "refs_unavailable": true instead'
+                " (gate G7 verifies that against the dataset)."
             )
         rule_titles = _resolve_rule_titles(entry.get("rules") or entry.get("rule_titles"), known_titles)
         unknown = [t for t in rule_titles if t not in known_titles]
@@ -1060,6 +1089,7 @@ def _apply_findings(state_dir: str, entries: list[dict]) -> None:
             "title": title,
             "phase": (entry.get("phase") or "").strip(),
             "hosts": _normalize_hosts(entry.get("hosts")),
+            "refs_unavailable": refs_unavailable,
             "rule_titles": rule_titles,
             "refs": refs,
             "record_ids": [r["record_id"] for r in refs],
@@ -1081,6 +1111,7 @@ def cmd_finding(args) -> None:
         "hosts": args.hosts,
         "rules": args.rules,
         "record_ids": args.record_ids,
+        "refs_unavailable": args.refs_unavailable,
         "summary": args.summary,
         "query": args.query,
     }])
@@ -1536,8 +1567,13 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
             if (r.get("evidence") or {}).get("refs_unavailable")
             and (r["evidence"].get("detail_excerpt") or "").strip()
         }
+        host_titles = {
+            t for f in findings["findings"] if f.get("refs_unavailable")
+            for t in (f.get("rule_titles") or []) if str(t).strip()
+        }
         facts = scan_csv(csv_path, cited_ids=cited_ids, variant_specs=variant_specs,
-                         probe_titles=probe_titles, excerpt_titles=excerpt_titles)
+                         probe_titles=probe_titles, excerpt_titles=excerpt_titles,
+                         host_titles=host_titles)
 
     # G1: rule triage coverage at investigated levels
     gate_rules = [r for r in triage["rules"] if set(r["levels"]) & set(levels)]
@@ -1748,18 +1784,41 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                 reasons.append("false_positive without verbatim excerpt")
             if reasons:
                 no_evidence.append(f"rule: {r['rule_title']} ({r['verdict']}: {', '.join(reasons)})")
-        no_evidence += [
-            f"finding: {f['id']} ({f['title']})" for f in findings["findings"]
-            if not finding_refs[f["id"]]
-        ]
+        uncitable_findings: list[str] = []
+        for f in findings["findings"]:
+            if finding_refs[f["id"]]:
+                continue
+            label = f"finding: {f['id']} ({f['title']})"
+            cited = [t for t in (f.get("rule_titles") or []) if str(t).strip()]
+            if not f.get("refs_unavailable"):
+                no_evidence.append(label)
+            elif facts is None:
+                no_evidence.append(label + ": claims refs_unavailable but the dataset"
+                                           " could not be read to verify it")
+            elif not cited:
+                no_evidence.append(label + ": claims refs_unavailable but cites no rule,"
+                                           " so there is nothing to verify it against")
+            else:
+                bad = [t for t in cited
+                       if t not in facts.rules or t in facts.rules_with_record_id]
+                if bad:
+                    no_evidence.append(
+                        label + ": claims refs_unavailable but cites rule(s) whose rows"
+                        " do carry RecordIDs (or are absent from the dataset): "
+                        + ", ".join(sorted(bad)[:3])
+                    )
+                else:
+                    uncitable_findings.append(f["id"])
         total = len(judged_rules) + len(findings["findings"])
-        cited = total - len(no_evidence) - len(uncitable)
+        verified_uncitable = len(uncitable) + len(uncitable_findings)
+        cited = total - len(no_evidence) - verified_uncitable
         detail = f"{cited}/{total} verdicts and findings cite evidence refs"
-        if uncitable:
+        if verified_uncitable:
+            names = sorted(uncitable) + sorted(uncitable_findings)
             detail += (
-                f"; {len(uncitable)} rule(s) verified uncitable (no row carries a"
-                " RecordID): " + ", ".join(sorted(uncitable)[:5])
-                + (" ..." if len(uncitable) > 5 else "")
+                f"; {verified_uncitable} verified uncitable (no row carries a"
+                " RecordID): " + ", ".join(names[:5])
+                + (" ..." if len(names) > 5 else "")
             )
         gate("G7", "verdicts cite row-level evidence", not no_evidence, detail, no_evidence)
     else:
@@ -1814,14 +1873,23 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         total_host_claims = 0
         for finding in findings["findings"]:
             evidence_computers = finding_evidence_computers.get(finding["id"], set())
+            uncited = not finding_refs[finding["id"]] and finding.get("refs_unavailable")
+            if uncited:
+                # No citable row exists, so back each host against the hosts the
+                # finding's own rules actually fired on, taken from the dataset.
+                for cited_title in (finding.get("rule_titles") or []):
+                    evidence_computers |= facts.rule_hosts.get(cited_title, set())
             for host in (finding.get("hosts") or []):
                 if not str(host).strip():
                     continue
                 total_host_claims += 1
                 if host not in evidence_computers:
+                    hint = (" — the finding's rules did not fire on that host"
+                            if uncited else
+                            " — add a ref to an event on that host")
                     g9_gaps.append(
                         f"finding {finding['id']} ({finding['title']}): host {host} is not"
-                        " backed by any cited event — add a ref to an event on that host"
+                        " backed by any cited event" + hint
                     )
         gate("G9", "finding hosts backed by evidence", not g9_gaps,
              f"{total_host_claims - len(g9_gaps)}/{total_host_claims} finding-host claims backed by cited events",
@@ -2232,6 +2300,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--record-ids", default="",
                    help='comma-separated evidence refs: "RID", "RID@Computer" or'
                         ' "RID@Computer@Channel" (qualify duplicated RecordIDs)')
+    p.add_argument("--refs-unavailable", action="store_true",
+                   help="every rule this finding rests on is a count-based correlation"
+                        " rule whose rows carry no RecordID; gate G7 verifies this")
     p.add_argument("--summary", default="")
     p.add_argument("--query", default="")
     p.set_defaults(func=cmd_finding)
