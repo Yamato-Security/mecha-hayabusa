@@ -236,7 +236,7 @@ Detailsの確認中に、以下の攻撃インフラパターンを発見した�
 
 **確定した結果はその場でステートに記録する**:
 
-- crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`refs` も必須**（裏付けイベントへの修飾参照、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G6/G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。整合性ルール: (1) `rules` に引用したルールは重要度に関わらずトリアージ判定が必要で、**偽陽性判定のルールをfindingの証拠に引用すると G8 が FAIL する**、(2) `refs` の各イベントは `rules` に挙げたいずれかのルールが検出したものであること（G6）、(3) **`hosts` に挙げた各ホストには、そのホスト上のイベントへの ref が最低1件必要**（G9 — 証拠のないホスト帰属を防ぐ）:
+- crit/highイベントから確認した攻撃活動 → `state.py finding --batch`。`title` と `summary` は**必須**。**`refs` も必須**（裏付けイベントへの修飾参照、最低1件。RecordIDカラムを持つデータセットでは記録時に拒否され、ゲート G6/G7 でも強制される）。関連 `rules`、`hosts`、使用した `query` も含め、レポートの全主張をデータまで遡れるようにする。整合性ルール: (1) `rules` に引用したルールは重要度に関わらずトリアージ判定が必要で、**偽陽性判定のルールをfindingの証拠に引用すると G8 が FAIL する**、(2) `refs` の各イベントは `rules` に挙げたいずれかのルールが検出したものであること（G6）、(3) **`hosts` に挙げた各ホストには、そのホスト上のイベントへの ref が最低1件必要**（G9 — 証拠のないホスト帰属を防ぐ）。唯一の例外として、findingが引用する**全ての**ルールが行に一切RecordIDを持たない件数集約ルールである場合は、`refs` の代わりにfindingへ `"refs_unavailable": true` を指定する。G7がこの申告をデータセットと突き合わせて検証し、G9は当該ルールが実際に発火したホストでfindingのhostsを裏付ける:
 
 JSONはWriteツールでファイル（例: `$STATE_DIR/work/finding_batch.json`）に書き、リダイレクトで渡す（Windowsパスの `Invalid \escape` 回避）:
 
@@ -528,7 +528,7 @@ JSON入力の構造:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack/mixed判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはexcerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト、G10 大量イベント（20件超）のfalse_positive/mixed判定にバリアント網羅証拠が無い、または宣言バリアントがCSV再集計と一致しない、G11 finding・大量FP/mixed判定に整合する独立検証票が無い（Step 5.7）。該当ステップに戻ってギャップを解消し、再実行する
+- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack/mixed判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはfinding（ただし `refs_unavailable` を宣言し、かつ当該ルールにRecordIDを持つ行が存在しないことをデータセットが裏付ける場合を除く）、excerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト、G10 大量イベント（20件超）のfalse_positive/mixed判定にバリアント網羅証拠が無い、または宣言バリアントがCSV再集計と一致しない、G11 finding・大量FP/mixed判定に整合する独立検証票が無い（Step 5.7）。該当ステップに戻ってギャップを解消し、再実行する
 - **G6 の曖昧性FAIL**: 「RecordID X is ambiguous」と出た場合、そのRecordIDは複数ホスト/チャネルの別イベントに使われている。`get_event_detail(record_id=...)` も候補一覧（status=ambiguous）を返すので、`computer`（必要なら `channel`）を指定して対象イベントを確定し、refs を修飾形式で記録し直す
 - **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告。ただし**1件もパースできなかった場合はウィンドウを手動追加するまでG3はハードFAIL**になる）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - レポート生成時もこのゲートが再実行される: `report.py` は `state_dir` を渡し忘れても出力ディレクトリ（`manifest.json` がある場所）から `$STATE_DIR` を自動検出するため、ゲートを暗黙にスキップできない

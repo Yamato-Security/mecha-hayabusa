@@ -307,5 +307,94 @@ class AggregationRuleEvidenceTests(unittest.TestCase):
         self.assertIn("absent from the dataset", check.stdout)
 
 
+class UncitableExcerptVerificationTests(unittest.TestCase):
+    """The excerpt of a refs_unavailable rule is matched while streaming the CSV.
+
+    Retaining a bounded sample of rows instead would falsely reject a genuine quote
+    that happens to appear beyond the sample, and would let a rule whose rows carry
+    no detail at all pass with an invented one.
+    """
+
+    def _build(self, rows: list[list[str]]) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        tmpdir = pathlib.Path(self.tmp.name)
+        self.csv_path = tmpdir / "sample.csv"
+        self.state_dir = tmpdir / "state"
+        with self.csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADER)
+            w.writerows(rows)
+        result = run_state("init", "--csv", str(self.csv_path), "--dir", str(self.state_dir))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def tearDown(self) -> None:
+        if hasattr(self, "tmp"):
+            self.tmp.cleanup()
+
+    def _triage(self, entries: list[dict]) -> subprocess.CompletedProcess:
+        return run_state("triage", "--dir", str(self.state_dir), "--batch",
+                         stdin_data=json.dumps(entries))
+
+    def test_a_quote_from_a_late_row_is_accepted(self) -> None:
+        """600 distinct rows; the quote comes from the last one."""
+        self._build([
+            ["2024-01-01 00:00:00.000 +00:00", "Aggregated", "high", "HOST-A", "Sec",
+             "4625", "", f"Count:1 ¦ ServiceName:svc{i:04d}"]
+            for i in range(600)
+        ])
+        result = self._triage([{
+            "rule_title": "Aggregated", "verdict": "indeterminate",
+            "rationale": "Quoting a row far beyond any bounded sample of the rule's rows.",
+            "excerpt": "Count:1 ¦ ServiceName:svc0599",
+            "refs_unavailable": True,
+        }])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[PASS] G6", check.stdout, check.stdout)
+
+    def test_a_rule_whose_rows_have_no_detail_cannot_supply_an_excerpt(self) -> None:
+        """No row can produce the quote, so it must be treated as a mismatch."""
+        self._build([
+            ["2024-01-01 00:00:00.000 +00:00", "Aggregated", "high", "HOST-A", "Sec",
+             "4625", "", ""],
+            ["2024-01-01 00:01:00.000 +00:00", "Aggregated", "high", "HOST-A", "Sec",
+             "4625", "", ""],
+        ])
+        result = self._triage([{
+            "rule_title": "Aggregated", "verdict": "false_positive",
+            "rationale": "Benign, supported by a quote the rule's rows cannot contain.",
+            "excerpt": "Count:5 ¦ ServiceName:INVENTED",
+            "refs_unavailable": True,
+        }])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[FAIL] G6", check.stdout, check.stdout)
+        self.assertIn("not a verbatim substring of any row of this rule", check.stdout)
+
+    def test_a_string_flag_in_a_hand_edited_state_does_not_activate_the_claim(self) -> None:
+        """Entry-time validation cannot protect state that `check` loads later."""
+        self._build([
+            ["2024-01-01 00:00:00.000 +00:00", "Aggregated", "high", "HOST-A", "Sec",
+             "4625", "", "Count:5 ¦ ServiceName:svc"],
+            ["2024-01-01 00:01:00.000 +00:00", "Citable", "high", "HOST-A", "Sec",
+             "4688", "10", "Cmdline: evil.exe"],
+        ])
+        self._triage([{
+            "rule_title": "Aggregated", "verdict": "indeterminate",
+            "rationale": "Recorded correctly, then the state file is tampered with.",
+            "refs_unavailable": True,
+        }])
+        triage_path = self.state_dir / "rule_triage.json"
+        data = json.loads(triage_path.read_text())
+        for rule in data["rules"]:
+            if rule["rule_title"] == "Aggregated":
+                rule["evidence"]["refs_unavailable"] = "false"  # truthy string
+        triage_path.write_text(json.dumps(data))
+
+        check = run_state("check", "--dir", str(self.state_dir))
+        self.assertIn("[FAIL] G7", check.stdout, check.stdout)
+        self.assertIn("Aggregated", check.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

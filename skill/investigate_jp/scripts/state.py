@@ -78,10 +78,6 @@ VARIANT_EVIDENCE_THRESHOLD = 20
 # Distinct variant keys tracked per rule during the recount; beyond this the
 # chosen fields are too unstable to be a meaningful grouping.
 VARIANT_GROUPS_CAP = 2000
-# Detail strings kept per refs_unavailable rule so G6 can still verify its excerpt.
-# These rules have no citable row, so the quote is checked against the rule's own
-# rows instead; a few hundred is ample for a correlation rule's aggregated output.
-UNCITED_EXCERPT_ROWS = 500
 
 # Grouping fields that carry no event content: a variant key made ONLY of
 # these (e.g. per-host counts) satisfies the count arithmetic without
@@ -342,10 +338,11 @@ class DatasetFacts:
         # NO RecordID, so those rules cannot cite an event; this lets the gates
         # verify that claim against the data instead of trusting the analyst.
         self.rules_with_record_id: set[str] = set()
-        # rule title -> normalised detail strings (capped). Only collected for rules
-        # that declared refs_unavailable, so G6 can still verify their excerpt even
-        # though there is no citable row to resolve.
-        self.rule_details: dict[str, set[str]] = {}
+        # Rule titles whose declared excerpt was found verbatim in one of their own
+        # rows. A refs_unavailable rule has no citable row to resolve, so its quote is
+        # matched while streaming rather than by retaining rows: no cap to fall off,
+        # and a rule whose rows cannot supply the quote simply never appears here.
+        self.excerpt_matched: set[str] = set()
         # rule title -> hosts the rule fired on. Aggregation rows can carry several
         # hosts joined by DETAILS_SEPARATOR, so those are split out: a finding that
         # can cite no row is still host-checkable against the data (gate G9).
@@ -370,13 +367,13 @@ def scan_csv(
     csv_path: str,
     cited_ids: "set[str] | None" = None,
     variant_specs: "dict[str, list] | None" = None,
-    excerpt_titles: "set[str] | None" = None,
+    excerpt_titles: "dict[str, str] | None" = None,
     host_titles: "set[str] | None" = None,
     probe_titles: "set[str] | None" = None,
 ) -> DatasetFacts:
     cited_ids = cited_ids or set()
     variant_specs = variant_specs or {}
-    excerpt_titles = excerpt_titles or set()
+    excerpt_titles = excerpt_titles or {}
     host_titles = host_titles or set()
     probe_titles = probe_titles or set()
     facts = DatasetFacts()
@@ -400,10 +397,9 @@ def scan_csv(
                     for part in host.split(DETAILS_SEPARATOR):
                         if part.strip():
                             hosts.add(part.strip())
-                if title in excerpt_titles and detail:
-                    seen = facts.rule_details.setdefault(title, set())
-                    if len(seen) < UNCITED_EXCERPT_ROWS:
-                        seen.add(" ".join(detail.split()))
+                if detail and title in excerpt_titles and title not in facts.excerpt_matched:
+                    if excerpt_titles[title] in " ".join(detail.split()):
+                        facts.excerpt_matched.add(title)
                 spec = variant_specs.get(title)
                 if spec is not None and title not in facts.variant_overflow:
                     counts = facts.variant_counts.setdefault(title, {})
@@ -1589,12 +1585,13 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
             if all(f in NON_CONTENT_FIELDS for f in fields)
         }
         excerpt_titles = {
-            r["rule_title"] for r in triage["rules"]
-            if (r.get("evidence") or {}).get("refs_unavailable")
+            r["rule_title"]: " ".join((r["evidence"].get("detail_excerpt") or "").split())
+            for r in triage["rules"]
+            if (r.get("evidence") or {}).get("refs_unavailable") is True
             and (r["evidence"].get("detail_excerpt") or "").strip()
         }
         host_titles = {
-            t for f in findings["findings"] if f.get("refs_unavailable")
+            t for f in findings["findings"] if f.get("refs_unavailable") is True
             for t in (f.get("rule_titles") or []) if str(t).strip()
         }
         facts = scan_csv(csv_path, cited_ids=cited_ids, variant_specs=variant_specs,
@@ -1720,9 +1717,8 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                 # still a quote and must still be verbatim — check it against the
                 # rule's own rows rather than letting it through unverified.
                 excerpt = " ".join((rule["evidence"].get("detail_excerpt") or "").split())
-                if excerpt and (rule.get("evidence") or {}).get("refs_unavailable"):
-                    known = facts.rule_details.get(rule["rule_title"])
-                    if known is not None and not any(excerpt in d for d in known):
+                if excerpt and (rule.get("evidence") or {}).get("refs_unavailable") is True:
+                    if rule["rule_title"] not in facts.excerpt_matched:
                         g6_gaps.append(
                             f"rule {rule['rule_title']}: detail_excerpt is not a verbatim"
                             " substring of any row of this rule — quote the"
@@ -1782,7 +1778,7 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         for r in judged_rules:
             reasons = []
             if not triage_refs[r["rule_title"]]:
-                claimed = bool((r.get("evidence") or {}).get("refs_unavailable"))
+                claimed = (r.get("evidence") or {}).get("refs_unavailable") is True
                 title = r["rule_title"]
                 if not claimed:
                     reasons.append("no refs")
@@ -1816,7 +1812,7 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                 continue
             label = f"finding: {f['id']} ({f['title']})"
             cited = [t for t in (f.get("rule_titles") or []) if str(t).strip()]
-            if not f.get("refs_unavailable"):
+            if f.get("refs_unavailable") is not True:
                 no_evidence.append(label)
             elif facts is None:
                 no_evidence.append(label + ": claims refs_unavailable but the dataset"
@@ -1899,7 +1895,8 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         total_host_claims = 0
         for finding in findings["findings"]:
             evidence_computers = finding_evidence_computers.get(finding["id"], set())
-            uncited = not finding_refs[finding["id"]] and finding.get("refs_unavailable")
+            uncited = (not finding_refs[finding["id"]]
+                       and finding.get("refs_unavailable") is True)
             if uncited:
                 # No citable row exists, so back each host against the hosts the
                 # finding's own rules actually fired on, taken from the dataset.
