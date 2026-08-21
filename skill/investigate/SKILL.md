@@ -36,7 +36,7 @@ STATE_PY="$HOME/.claude/skills/investigate/scripts/state.py"
 Rules:
 
 - **All state.py invocations use the Bash tool** with absolute paths (same restriction as chart scripts)
-- The state directory `STATE_DIR` is the report output directory created in Step 1. All state files (`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `queries.jsonl`, `verification_votes.jsonl`) live there alongside the charts and report
+- The state directory `STATE_DIR` is the report output directory created in Step 1. All state files (`manifest.json`, `rule_triage.json`, `clusters.json`, `findings.json`, `iocs.json`, `hosts.json`, `environment.json`, `reachability.json`, `queries.jsonl`, `verification_votes.jsonl`) live there alongside the charts and report
 - **Record state as you go** at each step (commands are described inline in the steps below). Batch entry is supported: pipe a JSON array to `state.py triage --batch` / `finding --batch` / `ioc --batch` / `host --batch` via stdin
 - **★ Always pass batch JSON via a file, not inline `echo` (important)**: rationale and excerpt fields routinely contain Windows paths (`C:\Users\...`, `\Device\...`, `C:\$SNAP_...`). Piping these through a single-quoted `echo '[...]'` makes `\U` `\D` `\$` etc. **invalid JSON escapes**, so `state.py` fails with `Invalid \escape` every time. The canonical procedure is to **write the JSON to a file under `$STATE_DIR/work/` with the Write tool and redirect it in with `--batch < "$STATE_DIR/work/batch.json"`**. Avoid inline `echo`. If you must inline, double every backslash (`\\`) or use forward slashes in the path (forward slashes still read fine as prose)
 - **Working files live in `$STATE_DIR/work/`**: temporary files — batch JSON, chart input JSON, the report-body draft, `report_input.json` — go into the `$STATE_DIR/work/` subdirectory that `init` creates, so they do not mingle with the canonical state files (`manifest.json`, ...) or the final deliverables
@@ -349,9 +349,9 @@ Record Hashes values (SHA256, SHA1, MD5) from Details fields confirmed in Steps 
 
 Record correlation results and hash IOCs in state as well (`state.py finding` / `state.py ioc --type hash`), including the `refs` of the source events.
 
-### Step 5.6: Evtx reachability — measure what the timeline can never show
+### Step 5.6: Evtx representation coverage — measure identities absent from the supplied timeline
 
-A Hayabusa CSV is a **detection** artifact, not an **evidence** artifact: it contains only events that matched a rule. Everything no rule matched is missing from the timeline while still sitting in the evtx. So "not in the timeline" and "not in the logs" are different statements, and only the first one is yours to make from the CSV alone.
+A Hayabusa CSV is a **detection** artifact, not a complete copy of the source evtx. It contains rule output, including derived correlation summaries, rather than every original event as a standalone row. Therefore "this identity is not represented in the supplied timeline" and "this event is absent from the logs" are different statements. This step measures only the former.
 
 **Measure the gap once, at the start of the report phase.** Run `hayabusa eid-metrics` over the ORIGINAL evtx corpus and import it:
 
@@ -360,14 +360,19 @@ hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
 ```
 
-This records what share of corpus events belong to a `(channel, event id)` **not present in the timeline's event-identity fields**. Review the largest ones before writing conclusions; that list is where unreachable evidence lives. The figure appears in the report appendix so a reader is not left assuming the timeline is complete.
+This records what share of corpus events belong to a `(channel, event id)` **not unambiguously represented in the supplied timeline's identity fields**. Review the largest definite-absent pairs before writing conclusions. The figure appears in the report appendix so a reader is not left assuming the timeline is a complete copy of the evtx.
 
-**Read the claim narrowly.** It is a statement about which `(channel, event id)` values literally appear on rows carrying a RecordID — not about what the ruleset "could" detect. Correlation rows carry no RecordID and only summarise: their Channel and EventID are deduplicated lists built independently of each other, and a *temporal* correlation renders only the first referenced rule's result, so a row may name `Sec/4624` while `Sys/7045` was equally required and appears nowhere. Such rows therefore never attest a pair; the pairs they mention are reported as **undetermined**, and true absence lies between the stated figure and that figure plus the undetermined events.
+**Read the claim narrowly.** A pair is unambiguously represented when either:
+
+- a normal event row carries a RecordID and names exactly one channel and one event ID; or
+- a correlation summary's candidate graph against the same-corpus metrics forces a pair. A one-channel or one-event-ID summary forces every displayed pair; a sparse many-channel/many-ID graph can also force an edge when it is the only candidate for a displayed channel or ID.
+
+When a correlation summary contains several channels **and** several event IDs, those values are independently deduplicated lists and do not directly reveal their pairing. The importer intersects that row's candidate graph with the corpus, records edges forced by a single-candidate channel or ID as represented, and keeps only the remaining optional edges **undetermined**. The reported representation gap has a lower bound that excludes undetermined events and an upper bound that includes them. A *temporal* correlation may also render only its first referenced rule's result, so another required identity can be absent from the displayed fields entirely. The metric consequently describes literal identity representation in this CSV, not what the ruleset could detect or whether a source event matched a rule.
 
 Two caveats the tool states rather than hides:
 
-- **Generate both from the same evtx, unfiltered.** `state.py` cannot tell an unfiltered timeline from one restricted by time, host, level or rule selection — a filtered run is legitimately a subset of full-corpus metrics, and its excluded pairs would be reported as absent. If your timeline was filtered, read the figure as an upper bound.
-- **Channel spelling must match.** If a timeline pair is missing from the metrics file the import is refused rather than recording a false number.
+- **Generate both from the same evtx, unfiltered.** `state.py` cannot tell an unfiltered timeline from one restricted by time, host, level or rule selection. A filtered run legitimately omits identities that an equivalent unfiltered timeline might represent. In that case, interpret the reported gap only as a property of the supplied file; it may overstate the representation gap of an unfiltered timeline.
+- **Every comparable identity projection must match.** If a real timeline pair is absent from metrics, or a correlation row has a concrete event ID with no compatible same-row corpus edge, the import is refused rather than silently discarding that value. Displayed channels must likewise have an edge unless that same row explicitly includes a missing EventID (`-`/blank), whose source record `eid-metrics` omits by definition.
 
 **If the original evtx is not available to you**, say so explicitly rather than quietly reasoning as if the CSV were complete:
 
@@ -375,7 +380,7 @@ Two caveats the tool states rather than hides:
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "only the CSV was provided"
 ```
 
-**Wording follows from this.** Absent a search of the evtx itself, the claim the CSV supports is *"did not match any rule"* or *"not present in the timeline"* — not *"no evidence in the logs"*. Enforcing that distinction mechanically needs raw-evtx search evidence the skill does not yet capture; until then it is on you.
+**Wording follows from this.** Without a search of the evtx itself, say *"not unambiguously represented in the supplied timeline"* (or, for a pair in the definite set, *"absent from the supplied timeline's identity fields"*). Do not turn this metric into *"did not match any rule"*, *"could never be surfaced"*, or *"no evidence in the logs"*: it establishes none of those claims. Mechanically proving log-level absence requires raw-evtx search evidence the skill does not yet capture.
 
 ### Step 5.7: Independent verification (fresh-context) — required before the report
 
