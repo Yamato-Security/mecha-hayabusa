@@ -349,7 +349,7 @@ Record Hashes values (SHA256, SHA1, MD5) from Details fields confirmed in Steps 
 
 Record correlation results and hash IOCs in state as well (`state.py finding` / `state.py ioc --type hash`), including the `refs` of the source events.
 
-### Step 5.6: Evtx reachability — required before verification and before any claim of absence
+### Step 5.6: Evtx reachability — measure what the timeline can never show
 
 A Hayabusa CSV is a **detection** artifact, not an **evidence** artifact: it contains only events that matched a rule. Everything no rule matched is missing from the timeline while still sitting in the evtx. So "not in the timeline" and "not in the logs" are different statements, and only the first one is yours to make from the CSV alone.
 
@@ -360,23 +360,12 @@ hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
 ```
 
-This records what share of corpus events are of a type **no rule ever matched**, and which `(channel, event id)` pairs those are — the blind spots for this dataset. Review the largest ones before writing conclusions; that list is where unreachable evidence lives.
+This records what share of corpus events belong to a `(channel, event id)` **absent from the timeline** — the blind spots for this dataset. Review the largest ones before writing conclusions; that list is where unreachable evidence lives. The figure appears in the report appendix so a reader is not left assuming the timeline is complete.
 
-**Search known IOCs back against the raw evtx.** Once findings and `iocs.json` exist, take each significant IOC and look for it in the original evtx, not just the CSV:
+Two caveats the tool states rather than hides:
 
-```bash
-hayabusa search -d /path/to/evtx -i -k "<ioc>" -o "$STATE_DIR/work/searchback.csv"
-python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
-    --raw-hits 504 --timeline-hits 1 \
-    --raw-hosts "HOST-A,HOST-B,HOST-C" --timeline-hosts "HOST-A" \
-    --finding f7 --tool "hayabusa search -d ... -k <ioc>"
-```
-
-**Record `--timeline-hosts` too.** Hit counts alone are not comparable: the timeline carries one row per (event × matching rule), so a raw event that matched no rule and a visible event that matched two rules cancel out to equal totals while a whole host is missing. The gate compares **host sets** first for exactly that reason.
-
-**`--finding` matters when the search-back found hosts the timeline never saw.** Those hosts have no timeline row to cite, so adding them to the finding's `hosts` would otherwise make **G9** fail. Linking the search-back to the finding lets its raw hosts back that claim — raw-evtx evidence is still evidence.
-
-**If the raw hit count exceeds the timeline count, the finding is incomplete** — that difference is exactly where missed hosts and missed C2 hide. Update the affected findings first, then re-record the same IOC with `--reconciled` and a `--note` saying what changed. Re-recording **merges** — omitted arguments keep their previous values, so you need only supply what changed. Closing a gap is checked structurally, not on trust: **every host seen only in the raw evtx must actually appear in the linked finding**, and the note is mandatory, so the audit trail says what the findings now reflect rather than just carrying a boolean. G12 FAILs on any unreconciled gap.
+- **Generate both from the same evtx, unfiltered.** `state.py` cannot tell an unfiltered timeline from one restricted by time, host, level or rule selection — a filtered run is legitimately a subset of full-corpus metrics, and its excluded pairs would be reported as absent. If your timeline was filtered, read the figure as an upper bound.
+- **Channel spelling must match.** If a timeline pair is missing from the metrics file the import is refused rather than recording a false number.
 
 **If the original evtx is not available to you**, say so explicitly rather than quietly reasoning as if the CSV were complete:
 
@@ -384,25 +373,7 @@ python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "only the CSV was provided"
 ```
 
-**Declare what you claim is absent.** If a triage rationale or finding summary asserts that something was not there, say so as data on that entry:
-
-```json
-{
-  "rule_title": "...", "verdict": "false_positive",
-  "rationale": "No evidence of beaconing to evil.example.com in the raw evtx.",
-  "absence": ["evil.example.com", "10.0.0.1"]
-}
-```
-
-**G12 requires a zero-hit search-back for every declared artifact.** No search-back → FAIL. A search-back that **found** the artifact → FAIL, because it refutes the claim rather than supporting it. Declaring the artifact is what makes the obligation checkable; prose alone is not, which is why enforcement keys on the declaration.
-
-If the evtx corpus is unavailable, `reach --none --reason ...` excuses a search you could not run. It does **not** erase a contradiction already recorded — a positive hit refutes the claim whether or not the corpus is still mounted.
-
-**Undeclared prose that reads like an absence claim produces a warning, never a failure.** A phrase matcher cannot reliably tell "no evidence of X in the logs" from "little evidence either way", nor work out which artifacts a sentence is about, so it advises and you decide. If the warning is right, add the `absence` declaration; if it is wrong, ignore it.
-
-Claims scoped to the timeline need no declaration at all — "no evidence of X in the timeline", "did not match any rule". That is the weaker, accurate statement the CSV alone supports, and it is the wording to use when you have not gone back to the evtx.
-
-**Run this before Step 5.7.** Reconciliation can materially change a finding (new hosts, new evidence), and an independent verification vote recorded before that change would be verifying something the report no longer says.
+**Wording follows from this.** Absent a search of the evtx itself, the claim the CSV supports is *"did not match any rule"* or *"not present in the timeline"* — not *"no evidence in the logs"*. Enforcing that distinction mechanically needs raw-evtx search evidence the skill does not yet capture; until then it is on you.
 
 ### Step 5.7: Independent verification (fresh-context) — required before the report
 
@@ -583,7 +554,7 @@ Run the coverage check and make it PASS before assembling the report:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack/mixed-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs — unless they declare `refs_unavailable` AND the dataset confirms the rule genuinely has no row with a RecordID — or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event, G10 false_positive/mixed verdicts over high-volume rules (>20 events) without variant evidence, or declared variants that do not match the CSV recount, G11 findings or high-volume FP/mixed verdicts without a consistent independent verification vote (Step 5.7), G12 absence claims with no recorded evtx search-back, or a search-back whose raw-corpus hit count still exceeds what the timeline holds (Step 5.6). Go back to the corresponding step, close the gaps, and re-run
+- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack/mixed-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs — unless they declare `refs_unavailable` AND the dataset confirms the rule genuinely has no row with a RecordID — or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event, G10 false_positive/mixed verdicts over high-volume rules (>20 events) without variant evidence, or declared variants that do not match the CSV recount, G11 findings or high-volume FP/mixed verdicts without a consistent independent verification vote (Step 5.7). Go back to the corresponding step, close the gaps, and re-run
 - **G6 ambiguity FAIL**: "RecordID X is ambiguous" means that RecordID denotes different events on several hosts/channels. `get_event_detail(record_id=...)` returns the candidate list too (status=ambiguous); pass `computer` (and `channel` if needed) to pin the event, then re-record the refs in qualified form
 - **G3 timestamp warning**: if the G3 detail warns that some rows have unparseable Timestamps, they were excluded from the auto-derived clusters (this is a visible warning, not a failure; when NO timestamps parsed at all, G3 hard-fails until windows are added). If you know a distinct activity wave was missed, add it manually and judge it: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - Report generation also re-runs this gate: `report.py` auto-detects `$STATE_DIR` from the output directory (where `manifest.json` sits) even if you forget to pass `state_dir`, so the gate cannot be silently skipped
