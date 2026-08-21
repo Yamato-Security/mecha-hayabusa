@@ -2125,78 +2125,94 @@ def _load_reachability(state_dir: str) -> dict:
     })
 
 
-def _scan_timeline_pairs(csv_path: str) -> tuple[set, set, set, set, int, int]:
+def _scan_timeline_pairs(csv_path: str) -> dict:
     """Read the event identities a timeline attests to.
 
-    Returns (attested pairs, candidate pairs, channels named without any usable
-    id, ids named without any channel, row count, correlation row count).
+    Rows carrying a RecordID are real events; their Channel and EventID are
+    authoritative. Correlation rules emit one DERIVED row with an empty
+    RecordID, whose Channel and EventID hold the constituent values of the
+    underlying base records, deduplicated and joined (" ¦ ", or CRLF/TAB under
+    -M/-S). Those displayed sets come from real base records, so:
 
-    Only rows carrying a RecordID are real events, and only their Channel and
-    EventID are authoritative. Correlation rules emit one DERIVED row with an
-    empty RecordID summarising many events; its Channel and EventID hold the
-    constituent values deduplicated and joined (" ¦ ", or CRLF/TAB under -M/-S),
-    built independently of one another. Those values cannot establish which
-    pairs occurred:
+      * one channel with several ids (or one id with several channels) fixes
+        every pair it names -- those identities ARE represented; while
+      * several of each leaves the mapping unknown, and the pairs are only
+        candidates.
 
-      * a multi-channel, multi-id row does not say which id belongs to which
-        channel, and
-      * a TEMPORAL correlation renders only the FIRST referenced rule's result,
-        so a row may name Sec/4624 while Sys/7045 was equally required and
-        appears nowhere (referenced rules default to `generate: false`).
-
-    So correlation rows never contribute an attested pair. Their values are
-    returned separately as CANDIDATES, used only to withhold a pair from the
-    definite-absent set -- never to claim it was present.
+    Separately, a TEMPORAL correlation renders only the first referenced rule's
+    result, so identities required for it to fire may appear nowhere at all.
+    Nothing here can recover those; the metric is documented as a statement
+    about identities that literally appear, not about what a ruleset could
+    detect.
     """
     attested: set = set()
     candidates: set = set()
     open_channels: set = set()
     open_ids: set = set()
+    named: set = set()
     rows = 0
     correlation_rows = 0
     try:
         with open(csv_path, newline="", encoding="utf-8-sig", errors="strict") as fh:
-            reader = csv.DictReader(fh)
-            missing = sorted({"Channel", "EventID"} - set(reader.fieldnames or []))
+            reader = csv.DictReader(fh, strict=True)
+            fields = set(reader.fieldnames or [])
+            # RecordID is what separates a real event from a summary, so the
+            # measurement cannot be made without it.
+            missing = sorted({"Channel", "EventID", "RecordID"} - fields)
             if missing:
                 _fail(
-                    f"{csv_path} is missing timeline column(s) needed to compare"
-                    f" coverage: {', '.join(missing)}"
+                    f"{csv_path} is missing column(s) needed to compare coverage:"
+                    f" {', '.join(missing)}. RecordID distinguishes real events"
+                    " from correlation summaries, so all three are required."
                 )
-            has_record_id = "RecordID" in (reader.fieldnames or [])
             for row in reader:
                 rows += 1
                 where = f"{csv_path}:{reader.line_num}"
+                if None in row or any(v is None for v in row.values()):
+                    _fail(f"{where}: wrong number of fields for the timeline header")
                 raw_channel = (row.get("Channel") or "").strip()
                 raw_id = (row.get("EventID") or "").strip()
-                record_id = (row.get("RecordID") or "").strip() if has_record_id else "?"
+                record_id = (row.get("RecordID") or "").strip()
                 channels = [c.strip().casefold()
                             for c in _MULTIVALUE_SPLIT_RE.split(raw_channel) if c.strip()]
                 ids = [i.strip() for i in _MULTIVALUE_SPLIT_RE.split(raw_id)
                        if i.strip() and i.strip() != "-"]
-                if not record_id:
-                    correlation_rows += 1
-                    if channels and ids:
-                        candidates.update((c, i) for c in channels for i in ids)
-                    elif channels:
-                        # "Sec / -": some events on this channel, id unknown, so
-                        # every corpus pair on it becomes undetermined.
-                        open_channels.update(channels)
-                    elif ids:
-                        open_ids.update(ids)
+                if record_id:
+                    if len(channels) != 1 or len(ids) != 1:
+                        _fail(
+                            f"{where}: a row with a RecordID must name exactly one"
+                            f" event identity (Channel={raw_channel!r},"
+                            f" EventID={raw_id!r})"
+                        )
+                    attested.add((channels[0], ids[0]))
                     continue
-                if len(channels) != 1 or len(ids) != 1:
+                correlation_rows += 1
+                if not channels and not ids:
                     _fail(
-                        f"{where}: a row with a RecordID must name exactly one"
-                        f" event identity (Channel={raw_channel!r},"
-                        f" EventID={raw_id!r})"
+                        f"{where}: correlation row names neither a channel nor an"
+                        " event id, so it constrains nothing and cannot be compared"
                     )
-                attested.add((channels[0], ids[0]))
+                named.update(channels)
+                if channels and ids:
+                    if len(channels) == 1 or len(ids) == 1:
+                        # One dimension is a singleton: every pair is fixed.
+                        attested.update((c, i) for c in channels for i in ids)
+                    else:
+                        candidates.update((c, i) for c in channels for i in ids)
+                elif channels:
+                    open_channels.update(channels)
+                else:
+                    open_ids.update(ids)
     except UnicodeDecodeError as exc:
         _fail(f"{csv_path} is not valid UTF-8: {exc}")
     except (OSError, csv.Error) as exc:
         _fail(f"cannot read timeline CSV {csv_path}: {exc}")
-    return attested, candidates, open_channels, open_ids, rows, correlation_rows
+    return {
+        "attested": attested, "candidates": candidates,
+        "open_channels": open_channels, "open_ids": open_ids,
+        "named_channels": named, "rows": rows,
+        "correlation_rows": correlation_rows,
+    }
 
 
 def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
@@ -2218,7 +2234,7 @@ def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
         # Strict: errors="replace" turns corrupt bytes into U+FFFD and invents a
         # channel, which then counts as a blind spot.
         with open(path, newline="", encoding="utf-8-sig", errors="strict") as fh:
-            reader = csv.DictReader(fh)
+            reader = csv.DictReader(fh, strict=True)
             if reader.fieldnames != ["Total", "%", "Channel", "ID", "Event"]:
                 _fail(
                     f"{path} does not look like `hayabusa eid-metrics` output"
@@ -2322,7 +2338,13 @@ def cmd_reach(args) -> None:
                   f" across {corpus['corpus_pairs']:,} (channel, event id) pairs")
             print(f"  timeline     : {corpus['timeline_rows']:,} rows"
                   f" across {corpus['timeline_pairs']:,} pairs")
-            print(f"  unreachable  : {corpus['unreachable_pct']}% of corpus events")
+            if corpus.get("possible_pairs"):
+                print(f"  unreachable  : {corpus['unreachable_pct']}%"
+                      f" – {corpus.get('upper_pct')}% of corpus events"
+                      f" ({corpus['possible_pairs']:,} pair(s) ="
+                      f" {corpus.get('possible_events', 0):,} events undetermined)")
+            else:
+                print(f"  unreachable  : {corpus['unreachable_pct']}% of corpus events")
             uncovered = corpus.get("uncovered") or []
             print(f"  absent from the timeline: {corpus['uncovered_pairs']:,} pair(s)"
                   f" = {corpus['uncovered_events']:,} events")
@@ -2354,8 +2376,13 @@ def cmd_reach(args) -> None:
                 " investigation records. Re-run init, or restore the original CSV."
             )
         corpus_pairs, corpus_events, corpus_display = _parse_eid_metrics(args.eid_metrics)
-        (timeline_pairs, candidate_pairs, open_channels, open_ids,
-         timeline_rows, correlation_rows) = _scan_timeline_pairs(csv_path)
+        scan = _scan_timeline_pairs(csv_path)
+        timeline_pairs = scan["attested"]
+        candidate_pairs = scan["candidates"]
+        open_channels = scan["open_channels"]
+        open_ids = scan["open_ids"]
+        timeline_rows = scan["rows"]
+        correlation_rows = scan["correlation_rows"]
         # Columns can be present and still carry nothing usable; comparing
         # against an empty pair set would record the whole corpus as absent.
         if timeline_rows > correlation_rows and not timeline_pairs:
@@ -2374,6 +2401,16 @@ def cmd_reach(args) -> None:
         # evtx, or spell channels differently. A partial overlap is not enough
         # to accept -- a `-b` timeline sharing one unabbreviated custom channel
         # would otherwise pass and silently record real pairs as unreachable.
+        corpus_channels = {ch for ch, _ in corpus_pairs}
+        stray_channels = sorted(scan["named_channels"] - corpus_channels)
+        if stray_channels:
+            _fail(
+                "refusing to record coverage: correlation row(s) name channel(s)"
+                f" absent from {args.eid_metrics}: {', '.join(stray_channels[:5])}"
+                + (" ..." if len(stray_channels) > 5 else "")
+                + ". The two files spell channels differently, so the pairs those"
+                " rows cover would be miscounted as absent."
+            )
         missing_from_corpus = sorted(timeline_pairs - set(corpus_pairs))
         if missing_from_corpus:
             shared_eids = ({eid for _, eid in timeline_pairs}
@@ -2427,6 +2464,13 @@ def cmd_reach(args) -> None:
                 f" events out of {corpus_events:,} corpus events"
             )
         unreachable_pct = round(100.0 * uncovered_events / corpus_events, 2) if corpus_events else 0.0
+        possible_list = sorted(
+            ({"channel": corpus_display.get(k, k[0]), "event_id": k[1],
+              "events": corpus_pairs[k]} for k in possible),
+            key=lambda e: -e["events"],
+        )
+        upper_events = uncovered_events + possible_events
+        upper_pct = round(100.0 * upper_events / corpus_events, 2) if corpus_events else 0.0
         reach["corpus"] = {
             "source": "hayabusa eid-metrics",
             "source_path": os.path.abspath(args.eid_metrics),
@@ -2434,6 +2478,9 @@ def cmd_reach(args) -> None:
             "correlation_rows": correlation_rows,
             "possible_pairs": len(possible),
             "possible_events": possible_events,
+            "possible": possible_list,
+            "upper_events": upper_events,
+            "upper_pct": upper_pct,
             "corpus_events": corpus_events,
             "corpus_pairs": len(corpus_pairs),
             "timeline_rows": timeline_rows,
@@ -2467,9 +2514,8 @@ def cmd_reach(args) -> None:
                   " event identities are summaries and cannot attest a pair")
         if possible:
             print(f"  {len(possible):,} further pair(s) = {possible_events:,} events are"
-                  " UNDETERMINED — named by a correlation row but not attested by any"
-                  " event row, so absence is between the figure above and"
-                  f" {round(100.0 * (uncovered_events + possible_events) / corpus_events, 2)}%")
+                  " UNDETERMINED (named only by an ambiguous correlation row), so"
+                  f" absence is between {unreachable_pct}% and {upper_pct}%")
         if uncovered:
             print("  largest unreachable pairs:")
             for entry in uncovered[:5]:
@@ -2541,7 +2587,7 @@ APPENDIX_LABELS = {
         "reach_missing": "not measured — the timeline holds only rule matches, so absence of an event here does not mean absence in the evtx",
         "reach_unavailable": "original evtx corpus unavailable ({reason}) — absence claims are timeline-only",
         "reach_coverage": "{pct}% of {events} evtx events are of a (channel, event id) absent from the supplied timeline ({pairs} pair(s)); a filtered timeline understates coverage",
-        "reach_ambiguous": "a further {n} pair(s) are undetermined — named only by a correlation row, which summarises events and cannot attest an identity, so true absence is at least the figure given and at most that plus these",
+        "reach_ambiguous": "true absence is between {low}% and {high}%: a further {n} pair(s) = {events} events are undetermined, named only by an ambiguous correlation row",
     },
     "ja": {
         "title": "## 付録: カバレッジと再現性",
@@ -2565,7 +2611,7 @@ APPENDIX_LABELS = {
         "reach_missing": "未計測 — タイムラインにはルール一致イベントのみが含まれるため、ここに無いことは evtx に無いことを意味しません",
         "reach_unavailable": "元の evtx コーパスが利用不可 ({reason}) — 不在の主張はタイムライン範囲に限られます",
         "reach_coverage": "evtx {events} 件のうち {pct}% は、提供されたタイムラインに存在しない (チャネル, イベントID) のイベント（{pairs} 個）。絞り込まれたタイムラインではカバレッジを過小評価する",
-        "reach_ambiguous": "さらに {n} 個は未確定 — 相関行にのみ現れる。相関行は events の要約であり識別子を保証しないため、真の不在は上記の値以上、これを加えた値以下である",
+        "reach_ambiguous": "真の不在は {low}% 以上 {high}% 以下: さらに {n} 個（{events} 件）は曖昧な相関行にのみ現れるため未確定",
     },
 }
 
@@ -2662,7 +2708,11 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
                 pairs=f"{corpus['uncovered_pairs']:,}"))
         undetermined = (corpus or {}).get("possible_pairs") or 0
         if undetermined:
-            parts.append(labels["reach_ambiguous"].format(n=undetermined))
+            parts.append(labels["reach_ambiguous"].format(
+                n=undetermined,
+                events=f"{(corpus or {}).get('possible_events', 0):,}",
+                low=(corpus or {}).get("unreachable_pct"),
+                high=(corpus or {}).get("upper_pct")))
         reach_line = "; ".join(parts) or labels["reach_missing"]
     lines += [f"- **{labels['reach']}**: {reach_line}"]
 

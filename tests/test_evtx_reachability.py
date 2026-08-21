@@ -189,7 +189,7 @@ class ReachabilityTests(unittest.TestCase):
         self.assertEqual(run_state("init", "--csv", str(bad), "--dir", str(state2)).returncode, 0)
         r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("missing timeline column", r.stderr + r.stdout)
+        self.assertIn("missing column(s) needed to compare coverage", r.stderr + r.stdout)
 
     def test_malformed_metrics_rows_are_rejected_not_skipped(self) -> None:
         for label, rows in [
@@ -323,6 +323,87 @@ class ReachabilityTests(unittest.TestCase):
             self.assertIn("cannot read", r.stderr + r.stdout)
         finally:
             os.chmod(metrics, 0o644)
+
+    def test_timeline_without_recordid_is_refused(self) -> None:
+        # RecordID is what separates a real event from a correlation summary,
+        # so without it every row would be taken as attested.
+        bad = self.state_dir.parent / "norec.csv"
+        with bad.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Timestamp", "RuleTitle", "Level", "Computer", "Channel", "EventID", "Details"])
+            w.writerow(["2024-01-01 00:00:00.000 +00:00", "R", "high", "H1", "Sec", "4688", "x"])
+        state2 = self.state_dir.parent / "norec_state"
+        self.assertEqual(run_state("init", "--csv", str(bad), "--dir", str(state2)).returncode, 0)
+        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("RecordID", r.stderr + r.stdout)
+
+    def test_singleton_channel_determines_every_pair_it_names(self) -> None:
+        # The displayed sets come from real base records, so one channel with
+        # several ids fixes each pair; calling them undetermined would widen an
+        # exact 0% to 0%-100% for no reason.
+        tl = self.make_timeline("single.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec", "4688 ¦ 4624", "", "Count:9"]])
+        m = self.write_metrics("single_m.csv", [["1", "50", "Sec", "4688", "a"],
+                                                ["1", "50", "Sec", "4624", "b"]])
+        r, state = self.measure(tl, m, "single")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 0)
+        self.assertEqual(corpus["possible_pairs"], 0)
+
+    def test_correlation_channel_absent_from_metrics_is_refused(self) -> None:
+        # "System" vs "Sys": the candidate would silently miss and the pair
+        # would be reported as definitely absent.
+        tl = self.make_timeline("spell.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "R", "high", "H1", "Sec", "4688", "7", "x"],
+            ["2024-01-01 00:01:00.000 +00:00", "Corr", "high", "H1", "System", "7045", "", "Count:3"]])
+        m = self.write_metrics("spell_m.csv", [["1", "50", "Sec", "4688", "a"],
+                                               ["1", "50", "Sys", "7045", "b"]])
+        r, _ = self.measure(tl, m, "spell")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("spell channels differently", r.stderr + r.stdout)
+
+    def test_correlation_row_naming_nothing_is_refused(self) -> None:
+        tl = self.make_timeline("nada.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "", "-", "", "Count:3"]])
+        r, _ = self.measure(tl, self.metrics_path, "nada")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("constrains nothing", r.stderr + r.stdout)
+
+    def test_malformed_timeline_quoting_is_refused(self) -> None:
+        # An unterminated quote swallowed a real event row and turned it into a
+        # false 100% gap.
+        bad = self.state_dir.parent / "quote.csv"
+        bad.write_text(
+            ",".join(CSV_HEADER) + "\n"
+            '2024-01-01 00:00:00.000 +00:00,R,high,H1,"Sec,4688,7,x\n',
+            encoding="utf-8")
+        state2 = self.state_dir.parent / "quote_state"
+        run_state("init", "--csv", str(bad), "--dir", str(state2))
+        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_undetermined_range_is_identical_everywhere(self) -> None:
+        # import, --list and the appendix must state the same bounds.
+        tl = self.make_timeline("rng.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1",
+             "Sec ¦ Sys", "4624 ¦ 7045", "", "Count:9"]])
+        m = self.write_metrics("rng_m.csv", [["1", "25", "Sec", "4624", "a"],
+                                             ["1", "25", "Sec", "7045", "b"],
+                                             ["1", "25", "Sys", "4624", "c"],
+                                             ["1", "25", "Sys", "7045", "d"]])
+        r, state = self.measure(tl, m, "rng")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        low, high = corpus["unreachable_pct"], corpus["upper_pct"]
+        self.assertEqual((low, high), (0.0, 100.0))
+        self.assertEqual(len(corpus["possible"]), 4)
+        self.assertIn(f"between {low}% and {high}%", r.stdout)
+        listed = run_state("reach", "--dir", str(state), "--list")
+        self.assertIn(f"{low}% – {high}%", listed.stdout)
+        appendix = run_state("appendix", "--dir", str(state))
+        self.assertIn(f"between {low}% and {high}%", appendix.stdout)
 
     # -- unavailable corpus ----------------------------------------------
 
