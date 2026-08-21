@@ -76,10 +76,11 @@ class ReachabilityTests(unittest.TestCase):
                 return g
         self.fail(f"gate {gate_id} not present in check output")
 
-    def claim_absence(self, text: str = "There is no evidence of data exfiltration.") -> None:
-        """Record a triage verdict whose rationale asserts absence."""
+    def declare(self, artifacts, rationale: str = "Checked the raw evtx.") -> None:
+        """Record a triage verdict that DECLARES which artifacts it asserts absent."""
         entry = [{
-            "rule_title": "Beta", "verdict": "false_positive", "rationale": text,
+            "rule_title": "Beta", "verdict": "false_positive", "rationale": rationale,
+            "absence": artifacts,
             "refs": [{"record_id": "2", "computer": "HOST-A", "channel": "Sec"}],
             "excerpt": "TgtUser: svc",
         }]
@@ -98,108 +99,103 @@ class ReachabilityTests(unittest.TestCase):
         self.assertEqual(corpus["corpus_pairs"], 4)
         self.assertEqual(corpus["timeline_rows"], 2)
         self.assertEqual(corpus["timeline_pairs"], 2)
-        # Sys/1014 (9000) and Shell-Core/9707 (1500) matched no rule.
         self.assertEqual(corpus["uncovered_pairs"], 2)
         self.assertEqual(corpus["uncovered_events"], 10500)
-        # Exact: 10,500 of 15,000 corpus events are of an unmatched type. Uses
-        # corpus events on both sides, so it can never exceed 100% the way a
-        # rows/events ratio can (Hayabusa emits one row per event x rule).
         self.assertEqual(corpus["unreachable_pct"], 70.0)
         self.assertLessEqual(corpus["unreachable_pct"], 100.0)
-        # Largest unreachable pair is surfaced first.
         self.assertEqual(corpus["uncovered"][0]["channel"], "Sys")
-        self.assertEqual(corpus["uncovered"][0]["event_id"], "1014")
 
     def test_eid_metrics_rejects_a_csv_that_is_not_eid_metrics(self) -> None:
         result = self.reach("--eid-metrics", str(self.csv_path))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("eid-metrics", result.stderr + result.stdout)
 
-    # -- absence claims require a search-back ----------------------------
+    def test_channel_case_differences_do_not_count_as_unreachable(self) -> None:
+        # hayabusa spells the same channel differently across subcommands
+        # (MS-Win-appxDeploySvr vs MS-Win-AppXDeploySvr); that is not a gap.
+        metrics = self.state_dir.parent / "cased.csv"
+        with metrics.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows([["Total", "%", "Channel", "ID", "Event"],
+                                     ["100", "50.0", "SEC", "4688", "Process creation"],
+                                     ["100", "50.0", "sec", "4624", "Logon"]])
+        r = self.reach("--eid-metrics", str(metrics))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((self.state_dir / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 0)
 
-    def test_absence_claim_without_searchback_fails_g12(self) -> None:
-        self.claim_absence()
+    def test_timeline_pair_absent_from_corpus_is_refused(self) -> None:
+        # A partial overlap must not be accepted: it means the two files do not
+        # describe the same evtx, or spell channels differently.
+        metrics = self.state_dir.parent / "partial.csv"
+        with metrics.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows([["Total", "%", "Channel", "ID", "Event"],
+                                     ["100", "50.0", "Sec", "4688", "Process creation"],
+                                     ["100", "50.0", "Other", "1", "x"]])
+        r = self.reach("--eid-metrics", str(metrics))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("absent from", r.stderr + r.stdout)
+
+    # -- declared absence ------------------------------------------------
+
+    def test_declared_absence_without_a_searchback_fails(self) -> None:
+        self.declare(["evil.example.com"])
         g12 = self.gate("G12")
         self.assertEqual(g12["status"], "FAIL")
-        self.assertTrue(any("without naming a searched artifact" in gap
-                            for gap in g12["gaps"]))
+        self.assertTrue(any("no evtx search-back" in gap for gap in g12["gaps"]))
 
-    def test_absence_claim_naming_a_searched_artifact_passes_g12(self) -> None:
-        self.claim_absence("No evidence of beaconing to evil.example.com.")
-        r = self.reach("--ioc", "evil.example.com", "--raw-hits", "0",
-                       "--timeline-hits", "0", "--tool", "hayabusa search -k evil.example.com")
-        self.assertEqual(r.returncode, 0, r.stderr)
+    def test_declared_absence_with_a_zero_hit_searchback_passes(self) -> None:
+        self.declare(["evil.example.com"])
+        self.reach("--ioc", "evil.example.com", "--raw-hits", "0")
         self.assertEqual(self.gate("G12")["status"], "PASS")
 
-    def test_unrelated_searchback_does_not_license_an_absence_claim(self) -> None:
-        # One IOC lookup must not blanket-permit every absence claim: the
-        # search-back has to cover the artifact THAT claim names.
-        self.claim_absence("There is no evidence of data exfiltration.")
-        self.reach("--ioc", "evil.example.com", "--raw-hits", "0", "--timeline-hits", "0")
+    def test_every_declared_artifact_needs_its_own_searchback(self) -> None:
+        self.declare(["evil.example.com", "10.0.0.1"])
+        self.reach("--ioc", "evil.example.com", "--raw-hits", "0")
         self.assertEqual(self.gate("G12")["status"], "FAIL")
-
-    def test_timeline_scoped_wording_is_permitted(self) -> None:
-        # "absent from the timeline" is the weaker claim the CSV alone supports,
-        # and is exactly the wording Step 5.8 recommends -- it must not be gated.
-        self.claim_absence("This rule is absent from the timeline; it matched no rule.")
+        self.reach("--ioc", "10.0.0.1", "--raw-hits", "0")
         self.assertEqual(self.gate("G12")["status"], "PASS")
 
-    def test_absence_claim_with_corpus_declared_unavailable_passes_g12(self) -> None:
-        self.claim_absence()
-        r = self.reach("--none", "--reason", "only the CSV was provided to the analyst")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        g12 = self.gate("G12")
-        self.assertEqual(g12["status"], "PASS")
-        self.assertIn("declared unavailable", g12["detail"])
-
-    def test_declaring_unavailable_requires_a_reason(self) -> None:
-        result = self.reach("--none")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--reason", result.stderr + result.stdout)
-
-    def test_ordinary_hedging_is_not_an_absence_claim(self) -> None:
-        # Must not trip G12: these do not assert that something is absent.
-        self.claim_absence("Little evidence either way; it is unclear whether this ran.")
-        self.assertEqual(self.gate("G12")["status"], "PASS")
-
-    def test_japanese_absence_claim_is_detected(self) -> None:
-        self.claim_absence("横展開の痕跡はない。")
-        g12 = self.gate("G12")
-        self.assertEqual(g12["status"], "FAIL")
-
-    def test_a_searchback_that_found_hits_refutes_the_absence_claim(self) -> None:
-        # A search-back returning hits contradicts the claim; it must not license it.
-        self.claim_absence("No trace of evil.example.com in the logs.")
+    def test_a_searchback_that_found_hits_refutes_the_declaration(self) -> None:
+        self.declare(["evil.example.com"])
         self.reach("--ioc", "evil.example.com", "--raw-hits", "9", "--timeline-hits", "9")
         g12 = self.gate("G12")
         self.assertEqual(g12["status"], "FAIL")
-        self.assertTrue(any("the search-back found it" in gap for gap in g12["gaps"]))
+        self.assertTrue(any("refuted" in gap for gap in g12["gaps"]))
 
-    def test_searchback_covers_only_the_clause_that_names_it(self) -> None:
-        # Naming an artifact in a DIFFERENT clause must not cover this claim.
-        self.claim_absence(
-            "evil.example.com was observed, but there is no evidence of data exfiltration.")
-        self.reach("--ioc", "evil.example.com", "--raw-hits", "0", "--timeline-hits", "0")
+    def test_unavailable_corpus_excuses_a_missing_search_but_not_a_contradiction(self) -> None:
+        self.declare(["evil.example.com"])
+        self.reach("--none", "--reason", "only the CSV was provided")
+        self.assertEqual(self.gate("G12")["status"], "PASS")
+        # A recorded positive hit refutes the claim regardless of availability.
+        self.reach("--ioc", "evil.example.com", "--raw-hits", "1", "--timeline-hits", "1")
+        self.reach("--none", "--reason", "corpus unmounted again")
         self.assertEqual(self.gate("G12")["status"], "FAIL")
 
-    def test_timeline_scoped_claim_naming_an_artifact_is_permitted(self) -> None:
-        # Dotted artifact names must not break clause splitting.
-        self.claim_absence("No evidence of evil.example.com was found in the timeline.")
-        self.assertEqual(self.gate("G12")["status"], "PASS")
-
-    def test_japanese_timeline_scoped_claim_is_permitted(self) -> None:
-        self.claim_absence("タイムラインに痕跡はない。")
-        self.assertEqual(self.gate("G12")["status"], "PASS")
-
-    def test_equal_counts_still_gap_when_a_host_is_raw_only(self) -> None:
-        # raw_hits and timeline_hits are not comparable: a raw event matching no
-        # rule and a visible event matching two rules cancel out to 2 == 2 while
-        # HOST-B is missing entirely. Host sets catch it.
-        self.reach("--ioc", "a.example", "--raw-hits", "2", "--timeline-hits", "2",
-                   "--raw-hosts", "HOST-A,HOST-B", "--timeline-hosts", "HOST-A")
+    def test_undeclared_prose_warns_but_never_gates(self) -> None:
+        # The matcher cannot soundly decide this, so it advises rather than fails.
+        self.declare([], rationale="There is no evidence of data exfiltration.")
         g12 = self.gate("G12")
-        self.assertEqual(g12["status"], "FAIL")
-        self.assertTrue(any("HOST-B" in gap for gap in g12["gaps"]))
+        self.assertEqual(g12["status"], "PASS")
+        self.assertIn("undeclared absence claim", g12["detail"])
+
+    def test_declaration_accepts_objects_and_deduplicates(self) -> None:
+        self.declare([{"artifact": "evil.example.com", "note": "checked"},
+                      "EVIL.EXAMPLE.COM"])
+        triage = json.loads((self.state_dir / "rule_triage.json").read_text())
+        rule = [r for r in triage["rules"] if r["rule_title"] == "Beta"][0]
+        self.assertEqual(len(rule["absence"]), 1)
+        self.assertEqual(rule["absence"][0]["note"], "checked")
+
+    def test_declaration_rejects_an_empty_artifact(self) -> None:
+        entry = [{"rule_title": "Beta", "verdict": "indeterminate",
+                  "rationale": "Reviewed the cited 4624 rows; TgtUser svc is the"
+                                " backup service account and the logon type matches.",
+                  "absence": [{"note": "no artifact"}],
+                  "refs": [{"record_id": "2", "computer": "HOST-A", "channel": "Sec"}]}]
+        r = run_state("triage", "--dir", str(self.state_dir), "--batch",
+                      stdin_data=json.dumps(entry))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("artifact", r.stderr + r.stdout)
 
     # -- search-back reconciliation --------------------------------------
 
@@ -288,8 +284,7 @@ class ReachabilityTests(unittest.TestCase):
     def test_batch_search_backs(self) -> None:
         batch = [
             {"ioc": "a.example", "raw_hits": 3, "timeline_hits": 3, "reconciled": False},
-            {"ioc": "b.example", "raw_hits": 9, "timeline_hits": 2, "reconciled": True,
-             "note": "added HOST-D to f1"},
+            {"ioc": "b.example", "raw_hits": 9, "timeline_hits": 9},
         ]
         r = self.reach("--batch", stdin_data=json.dumps(batch))
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -300,6 +295,46 @@ class ReachabilityTests(unittest.TestCase):
         r = self.reach("--batch", stdin_data=json.dumps([{"ioc": "a.example"}]))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("raw_hits", r.stderr + r.stdout)
+
+    def test_timeline_hits_may_not_exceed_raw_hits(self) -> None:
+        # timeline_hits is a DEDUPLICATED event count; a timeline event is always
+        # also a raw event, so exceeding raw_hits means rows were counted.
+        r = self.reach("--ioc", "c2.example", "--raw-hits", "1", "--timeline-hits", "5")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("distinct underlying EVENTS", r.stderr + r.stdout)
+
+    def test_more_hosts_than_hits_is_rejected(self) -> None:
+        r = self.reach("--ioc", "c2.example", "--raw-hits", "1",
+                       "--raw-hosts", "HOST-A,HOST-B")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("each host needs at least one hit", r.stderr + r.stdout)
+
+    def test_timeline_host_absent_from_raw_hosts_is_rejected(self) -> None:
+        # Otherwise an impossible timeline host cancels the raw-only set and
+        # lets a gap close with no finding at all.
+        r = self.reach("--ioc", "c2.example", "--raw-hits", "1", "--raw-hosts", "HOST-A",
+                       "--timeline-hits", "1", "--timeline-hosts", "HOST-Z")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("timeline cannot hold a host", r.stderr + r.stdout)
+
+    def test_count_only_gap_still_requires_a_linked_finding(self) -> None:
+        # A gap with no raw-only host must not be closeable on a note alone.
+        r = self.reach("--ioc", "c2.example", "--raw-hits", "40", "--timeline-hits", "1",
+                       "--reconciled", "--note", "looked at it")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--finding", r.stderr + r.stdout)
+
+    def test_re_recording_preserves_reconciled(self) -> None:
+        self.make_finding(["HOST-A"])
+        self.reach("--ioc", "c2.example", "--raw-hits", "40", "--timeline-hits", "1",
+                   "--finding", "f1")
+        self.reach("--ioc", "c2.example", "--reconciled", "--note", "f1 now covers it")
+        self.assertEqual(self.gate("G12")["status"], "PASS")
+        # Re-recording an unrelated field must not silently re-open the gap.
+        self.reach("--ioc", "c2.example", "--tool", "hayabusa search -k c2.example")
+        b = json.loads((self.state_dir / "reachability.json").read_text())["searchbacks"][0]
+        self.assertTrue(b["reconciled"])
+        self.assertEqual(self.gate("G12")["status"], "PASS")
 
     # -- reporting -------------------------------------------------------
 

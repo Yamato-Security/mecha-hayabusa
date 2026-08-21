@@ -819,6 +819,7 @@ def _apply_triage(state_dir: str, entries: list[dict]) -> None:
         rule["status"] = "verified"
         rule["verdict"] = verdict
         rule["rationale"] = rationale
+        rule["absence"] = _normalize_absence(entry.get("absence"))
         rule["evidence"]["refs"] = refs
         rule["evidence"]["record_ids"] = [r["record_id"] for r in refs]
         rule["evidence"]["detail_excerpt"] = excerpt_text
@@ -1170,6 +1171,7 @@ def _apply_findings(state_dir: str, entries: list[dict]) -> None:
             "refs": refs,
             "record_ids": [r["record_id"] for r in refs],
             "summary": summary,
+            "absence": _normalize_absence(entry.get("absence")),
             "query": (entry.get("query") or "").strip(),
             "created_at": _now(),
         })
@@ -2127,60 +2129,61 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     # An absence claim is only covered when a search-back exists for the artifact
     # THAT claim names. Accepting any non-empty search-back list would let one
     # unrelated IOC lookup license every absence claim in the investigation.
-    by_ioc = {b["ioc"]: b for b in searchbacks if b.get("ioc")}
-
-    def _absence_problems(where: str, text: str) -> list[str]:
-        """Absence clauses in `text` that no search-back supports.
-
-        Two ways to fail: the clause names no searched artifact, or it names one
-        whose search FOUND something — a search-back that returns hits refutes
-        the claim rather than licensing it.
-        """
-        problems = []
-        for clause in _unscoped_absence_clauses(text):
-            lowered = clause.lower()
-            # Bind on the clause, not the whole field: "X was observed, but there
-            # is no evidence of Y" must not be covered by a search-back for X.
-            named = [b for ioc, b in by_ioc.items() if ioc.lower() in lowered]
-            if not named:
-                problems.append(
-                    f"{where} asserts absence without naming a searched artifact:"
-                    f' "{clause[:120]}"'
-                )
-                continue
-            contradicted = [b for b in named if b["raw_hits"] > 0]
-            if contradicted:
-                names = ", ".join(f"{b['ioc']} ({b['raw_hits']} raw hit(s))"
-                                  for b in contradicted[:3])
-                problems.append(
-                    f"{where} asserts absence but the search-back found it — {names}:"
-                    f' "{clause[:120]}"'
-                )
-        return problems
-
-    absence_claims = []
+    # Absence is enforced from DECLARED artifacts, never inferred from prose: a
+    # phrase matcher cannot soundly decide whether free text asserts log-level
+    # absence, nor which artifacts it names, and three rounds of tightening one
+    # produced three new ways around it. The matcher survives below as a
+    # non-gating lint that points out prose which looks like an undeclared claim.
+    by_ioc = {b["ioc"].casefold(): b for b in searchbacks if b.get("ioc")}
+    declared = []
     for rule in triage["rules"]:
-        absence_claims.extend(
-            _absence_problems(f"rule '{rule['rule_title']}' rationale",
-                              rule.get("rationale") or ""))
+        for item in rule.get("absence") or []:
+            declared.append((f"rule '{rule['rule_title']}'", item["artifact"]))
     for finding in findings["findings"]:
-        absence_claims.extend(
-            _absence_problems(f"finding {finding['id']} ({finding['title']}) summary",
-                              finding.get("summary") or ""))
+        for item in finding.get("absence") or []:
+            declared.append(
+                (f"finding {finding['id']} ({finding['title']})", item["artifact"]))
+
+    unsearched, contradicted = [], []
+    for where, artifact in declared:
+        back = by_ioc.get(artifact.casefold())
+        if back is None:
+            unsearched.append(
+                f"{where} declares '{artifact}' absent but no evtx search-back for it"
+                " was recorded (run: reach --ioc " + artifact + " ...)"
+            )
+        elif back["raw_hits"] > 0:
+            contradicted.append(
+                f"{where} declares '{artifact}' absent but the raw-evtx search-back"
+                f" found {back['raw_hits']} hit(s) — the claim is refuted, not supported"
+            )
+
+    # Undeclared prose that reads like an absence claim: surfaced, never gated.
+    lint = []
+    for rule in triage["rules"]:
+        if not (rule.get("absence") or []):
+            for clause in _unscoped_absence_clauses(rule.get("rationale") or ""):
+                lint.append(f"rule '{rule['rule_title']}': \"{clause[:80]}\"")
+    for finding in findings["findings"]:
+        if not (finding.get("absence") or []):
+            for clause in _unscoped_absence_clauses(finding.get("summary") or ""):
+                lint.append(f"finding {finding['id']}: \"{clause[:80]}\"")
+
+    corpus = reach.get("corpus")
     unreconciled = [
         f"IOC '{b['ioc']}': {gap} — reconcile the affected findings,"
         " then re-record with reconciled=true"
         for b, gap in ((b, _searchback_gap(b)) for b in searchbacks)
         if gap and not b.get("reconciled")
     ]
-    g12_gaps = list(unreconciled)
-    corpus = reach.get("corpus")
-    if absence_claims and not reach.get("declared_unavailable"):
-        g12_gaps.extend(
-            claim + " (name the artifact and record `reach --ioc <artifact> ...`,"
-            " or `reach --none --reason ...` if the evtx corpus is unavailable)"
-            for claim in absence_claims
-        )
+
+    # An unavailable corpus excuses a search that could not be run. It does NOT
+    # erase a contradiction already sitting in state: a recorded positive hit
+    # refutes the claim whether or not the corpus is still mounted.
+    g12_gaps = list(unreconciled) + contradicted
+    if not reach.get("declared_unavailable"):
+        g12_gaps.extend(unsearched)
+
     bits = []
     if corpus:
         bits.append(
@@ -2191,8 +2194,14 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     else:
         bits.append("no corpus coverage recorded")
     bits.append(f"{len(searchbacks)} IOC search-back(s)")
-    if absence_claims:
-        bits.append(f"{len(absence_claims)} absence claim(s)")
+    if declared:
+        bits.append(f"{len(declared)} declared absence claim(s)")
+    if lint:
+        bits.append(
+            f"WARNING: {len(lint)} verdict/finding reads like an undeclared absence"
+            " claim (declare it with \"absence\": [...] so G12 can check it): "
+            + "; ".join(lint[:3]) + (" ..." if len(lint) > 3 else "")
+        )
     if reach.get("declared_unavailable"):
         bits.append(f"evtx corpus declared unavailable: {reach.get('unavailable_reason')}")
     gate("G12", "evidence reachability beyond the timeline", not g12_gaps,
@@ -2270,6 +2279,40 @@ def _require_count(ioc: str, name: str, value) -> int:
     if value < 0:
         _fail(f"search-back for {ioc}: '{name}' must be >= 0 (got {value})")
     return value
+
+
+def _normalize_absence(value) -> list[dict]:
+    """Normalize a declared absence list.
+
+    Absence is DECLARED as data rather than inferred from prose. A phrase
+    matcher cannot soundly decide whether free text asserts log-level absence,
+    nor which artifacts it is about, and every attempt to tighten one produced
+    a new way around it. Declaring the artifact makes the obligation explicit
+    and checkable: G12 requires a zero-hit search-back for each one.
+
+    Accepts ["evil.example.com"] or [{"artifact": "...", "note": "..."}].
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, list):
+        _fail("'absence' must be a list of artifacts (strings or {artifact, note} objects)")
+    out = []
+    seen = set()
+    for item in value:
+        if isinstance(item, str):
+            item = {"artifact": item}
+        if not isinstance(item, dict):
+            _fail(f"'absence' entries must be strings or objects (got {type(item).__name__})")
+        artifact = str(item.get("artifact") or "").strip()
+        if not artifact:
+            _fail("each 'absence' entry requires a non-empty 'artifact'")
+        if artifact.casefold() in seen:
+            continue
+        seen.add(artifact.casefold())
+        out.append({"artifact": artifact, "note": str(item.get("note") or "").strip()})
+    return out
 
 
 def _searchback_gap(entry: dict) -> str:
@@ -2428,23 +2471,33 @@ def cmd_reach(args) -> None:
         # generated with -b/--disable-abbreviations writes full names
         # ("Security"). Comparing those two representations makes every pair look
         # unreachable, so refuse rather than record a metric that is simply wrong.
-        if timeline_pairs and not (timeline_pairs & set(corpus_pairs)):
+        # Every pair the timeline holds must exist in the corpus metrics: the
+        # timeline is a projection of that corpus, so a pair present in one and
+        # absent from the other means the two files do not describe the same
+        # evtx, or spell channels differently. A partial overlap is not enough
+        # to accept -- a `-b` timeline sharing one unabbreviated custom channel
+        # would otherwise pass and silently record real pairs as unreachable.
+        missing_from_corpus = sorted(timeline_pairs - set(corpus_pairs))
+        if missing_from_corpus:
             shared_eids = ({eid for _, eid in timeline_pairs}
                            & {eid for _, eid in corpus_pairs})
+            shown = ", ".join(f"{ch}/{eid}" for ch, eid in missing_from_corpus[:5])
             hint = (
-                " The two files share event IDs but no channel names, which means"
-                " they use different channel representations: regenerate BOTH with"
-                " the same abbreviation setting (either both default, or both with"
+                " The two files share event IDs but not channel names, so they use"
+                " different channel representations — regenerate the TIMELINE with"
+                " the same channel spelling `eid-metrics` produces (that is, without"
                 " -b/--disable-abbreviations)."
                 if shared_eids else
-                " The two files have nothing in common — check that the eid-metrics"
-                " run covered the evtx this timeline was generated from."
+                " Check that the eid-metrics run covered the same evtx this timeline"
+                " was generated from."
             )
             _fail(
-                "refusing to record coverage: not one of the timeline's"
-                f" {len(timeline_pairs):,} (channel, event id) pairs appears in"
-                f" {args.eid_metrics}." + hint
+                f"refusing to record coverage: {len(missing_from_corpus):,} of the"
+                f" timeline's {len(timeline_pairs):,} (channel, event id) pairs are"
+                f" absent from {args.eid_metrics} ({shown}"
+                + (" ..." if len(missing_from_corpus) > 5 else "") + ")." + hint
             )
+
         uncovered = [
             {"channel": corpus_display.get((ch, eid), ch), "event_id": eid, "events": n}
             for (ch, eid), n in corpus_pairs.items()
@@ -2542,7 +2595,40 @@ def cmd_reach(args) -> None:
                 f"search-back for {ioc}: raw_hosts lists {len(raw_hosts)} host(s)"
                 " but raw_hits is 0 — a search that found nothing attributes no host"
             )
-        reconciled = supplied.get("reconciled", False)
+        # Every event the timeline shows is an event the raw corpus contains, so
+        # timeline_hits must be a DEDUPLICATED underlying-event count (not a
+        # rule-match row count) and can never exceed raw_hits. Without this the
+        # two numbers are not comparable and a same-host miss cancels out.
+        if timeline_hits > raw_hits:
+            _fail(
+                f"search-back for {ioc}: timeline_hits ({timeline_hits}) exceeds"
+                f" raw_hits ({raw_hits}). timeline_hits must be a count of distinct"
+                " underlying EVENTS, not rule-match rows — the timeline carries one"
+                " row per (event x matching rule)"
+            )
+        if timeline_hosts and timeline_hits == 0:
+            _fail(
+                f"search-back for {ioc}: timeline_hosts lists host(s) but"
+                " timeline_hits is 0"
+            )
+        if len(raw_hosts) > raw_hits:
+            _fail(
+                f"search-back for {ioc}: {len(raw_hosts)} raw host(s) but only"
+                f" {raw_hits} raw hit(s) — each host needs at least one hit"
+            )
+        if len(timeline_hosts) > timeline_hits:
+            _fail(
+                f"search-back for {ioc}: {len(timeline_hosts)} timeline host(s) but"
+                f" only {timeline_hits} timeline hit(s)"
+            )
+        stray = sorted(set(timeline_hosts) - set(raw_hosts)) if raw_hosts else []
+        if stray:
+            _fail(
+                f"search-back for {ioc}: {', '.join(stray[:5])} appear(s) in"
+                " timeline_hosts but not raw_hosts — the timeline cannot hold a host"
+                " the raw corpus does not"
+            )
+        reconciled = supplied.get("reconciled", prior.get("reconciled", False))
         if not isinstance(reconciled, bool):
             _fail(
                 f"search-back for {ioc}: 'reconciled' must be a JSON boolean"
@@ -2570,24 +2656,22 @@ def cmd_reach(args) -> None:
                     f"search-back for {ioc}: reconciling a gap ({gap}) requires a"
                     " note describing what the findings now reflect"
                 )
+            if not finding_id:
+                _fail(
+                    f"search-back for {ioc}: cannot reconcile ({gap}) — link the"
+                    " finding that now accounts for it with --finding. Closing a gap"
+                    " is a claim that a finding changed, so it must name that finding"
+                )
             raw_only = sorted(set(raw_hosts) - set(timeline_hosts))
-            if raw_only:
-                if not finding_id:
-                    _fail(
-                        f"search-back for {ioc}: cannot reconcile — {len(raw_only)}"
-                        " host(s) were seen only in the raw evtx"
-                        f" ({', '.join(raw_only[:5])}); link the finding that now"
-                        " carries them with --finding"
-                    )
-                covered = set(findings_by_id[finding_id].get("hosts") or [])
-                missing = [h for h in raw_only if h not in covered]
-                if missing:
-                    _fail(
-                        f"search-back for {ioc}: cannot reconcile — finding"
-                        f" {finding_id} does not list {', '.join(missing[:5])}."
-                        " Add the raw-only host(s) to the finding, or drop them"
-                        " from raw_hosts and say why in the note"
-                    )
+            covered = set(findings_by_id[finding_id].get("hosts") or [])
+            missing = [h for h in raw_only if h not in covered]
+            if missing:
+                _fail(
+                    f"search-back for {ioc}: cannot reconcile — finding"
+                    f" {finding_id} does not list {', '.join(missing[:5])}."
+                    " Add the raw-only host(s) to the finding, or drop them"
+                    " from raw_hosts and say why in the note"
+                )
         reach["searchbacks"] = [b for b in reach.get("searchbacks", []) if b.get("ioc") != ioc]
         reach["searchbacks"].append(candidate)
         existing[ioc] = candidate
@@ -2942,7 +3026,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--finding", help="finding id this search-back belongs to (its raw hosts then satisfy G9)")
     p.add_argument("--tool", help="command used (e.g. 'hayabusa search -d ... -k ...')")
     p.add_argument("--note", help="what the reconciliation changed")
-    p.add_argument("--reconciled", action="store_true",
+    p.add_argument("--reconciled", action="store_const", const=True, default=None,
                    help="the findings now reflect the raw-corpus hits")
     p.add_argument("--batch", action="store_true", help="read a JSON list of search-backs from stdin")
     p.add_argument("--none", action="store_true", help="declare the original evtx corpus unavailable")

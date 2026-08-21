@@ -384,9 +384,23 @@ python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "only the CSV was provided"
 ```
 
-**Absence language is gated.** Phrases such as "no evidence of", "no trace of", "left no trace", "absent from the logs" (and their Japanese equivalents) in a triage rationale or finding summary make **G12 FAIL** unless the corpus is declared unavailable — or a search-back exists **for the artifact that claim names**. Name the artifact in the text (`"no evidence of beaconing to evil.example.com"`) and record `reach --ioc evil.example.com ...`. The binding is per **clause**, so naming an artifact in a different clause (`"evil.example.com was observed, but there is no evidence of exfiltration"`) does not cover the absence claim — and a search-back that **found** hits refutes the claim rather than licensing it.
+**Declare what you claim is absent.** If a triage rationale or finding summary asserts that something was not there, say so as data on that entry:
 
-Note that **any claim scoped to the timeline is deliberately NOT gated** — "no evidence of X in the timeline", "did not match any rule", "タイムラインに痕跡はない". That is the weaker, accurate claim the CSV alone supports, and it is the wording to use when you have not gone back to the evtx.
+```json
+{
+  "rule_title": "...", "verdict": "false_positive",
+  "rationale": "No evidence of beaconing to evil.example.com in the raw evtx.",
+  "absence": ["evil.example.com", "10.0.0.1"]
+}
+```
+
+**G12 requires a zero-hit search-back for every declared artifact.** No search-back → FAIL. A search-back that **found** the artifact → FAIL, because it refutes the claim rather than supporting it. Declaring the artifact is what makes the obligation checkable; prose alone is not, which is why enforcement keys on the declaration.
+
+If the evtx corpus is unavailable, `reach --none --reason ...` excuses a search you could not run. It does **not** erase a contradiction already recorded — a positive hit refutes the claim whether or not the corpus is still mounted.
+
+**Undeclared prose that reads like an absence claim produces a warning, never a failure.** A phrase matcher cannot reliably tell "no evidence of X in the logs" from "little evidence either way", nor work out which artifacts a sentence is about, so it advises and you decide. If the warning is right, add the `absence` declaration; if it is wrong, ignore it.
+
+Claims scoped to the timeline need no declaration at all — "no evidence of X in the timeline", "did not match any rule". That is the weaker, accurate statement the CSV alone supports, and it is the wording to use when you have not gone back to the evtx.
 
 **Run this before Step 5.7.** Reconciliation can materially change a finding (new hosts, new evidence), and an independent verification vote recorded before that change would be verifying something the report no longer says.
 
