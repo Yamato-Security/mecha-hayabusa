@@ -351,6 +351,47 @@ Step 3.5〜5 で確認したDetailsフィールド内のHashes値（SHA256, SHA1
 
 相関分析の結果とハッシュIOCもステートに記録する（`state.py finding` / `state.py ioc --type hash`）。出典イベントの `refs` を含めること。
 
+### Step 5.6: Evtx 到達性の確認 ★独立検証の前、および「痕跡なし」と述べる前に必須
+
+Hayabusa の CSV は **検知**の成果物であって**証拠**そのものではない。CSV に含まれるのはルールに一致したイベントだけであり、どのルールにも一致しなかったイベントは evtx に存在したままタイムラインからは消える。したがって「タイムラインに無い」と「ログに無い」は別の主張であり、CSV だけから言えるのは前者のみである。
+
+**まずギャップを一度計測する。** 元の evtx コーパスに対して `hayabusa eid-metrics` を実行し、結果を取り込む:
+
+```bash
+hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
+python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
+```
+
+コーパスのイベントのうち何%が**どのルールにも一致しない種別**であるか、そしてそれがどの `(チャネル, イベントID)` かが記録される。これがこのデータセットの盲点であり、結論を書く前に上位の項目を必ず確認すること。
+
+**判明した IOC は生の evtx に対して再検索する。** finding と `iocs.json` が揃ったら、主要な IOC を CSV だけでなく元の evtx でも探す:
+
+```bash
+hayabusa search -d /path/to/evtx -i -k "<ioc>" -o "$STATE_DIR/work/searchback.csv"
+python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
+    --raw-hits 504 --timeline-hits 1 \
+    --raw-hosts "HOST-A,HOST-B,HOST-C" --timeline-hosts "HOST-A" \
+    --finding f7 --tool "hayabusa search -d ... -k <ioc>"
+```
+
+**`--timeline-hosts` も記録すること。** ヒット件数だけでは比較にならない。タイムラインは (イベント × 一致ルール) ごとに1行を持つため、どのルールにも一致しなかった生イベントと、2つのルールに一致した可視イベントが相殺され、ホストが丸ごと欠けているのに件数が一致してしまう。ゲートが**ホスト集合**を優先して比較するのはこのためである。
+
+**再検索でタイムラインに存在しないホストが見つかった場合は `--finding` を指定する。** それらのホストには引用できるタイムライン行が存在しないため、そのまま finding の `hosts` に追加すると **G9** が FAIL する。再検索を finding に紐付けることで、その生ホストが当該主張の裏付けとして認められる（生の evtx の証拠も証拠である）。
+
+**生のヒット数がタイムラインのヒット数を上回る場合、その finding は不完全である** — 差分こそが見落とされたホストや C2 が潜む場所である。まず該当 finding を更新し、その後で同じ IOC を `--reconciled` と変更内容を書いた `--note` 付きで再登録する。再登録は**マージ**であり、省略した引数は以前の値を保持するため、変更点だけを指定すればよい。差分の解消は信用ではなく構造的に検証される。**生の evtx でのみ観測されたホストは、リンクした finding に実際に含まれていなければならない**。また `--note` は必須である。未解消の差分があると G12 は FAIL する。
+
+**元の evtx を参照できない場合**は、CSV が完全であるかのように黙って推論せず、明示的に宣言する:
+
+```bash
+python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "CSVのみ提供された"
+```
+
+**不在を断定する表現はゲート対象。** トリアージの rationale や finding の summary に「痕跡はない」「証拠がない」「確認されなかった」「ログに記録されていない」（および英語の "no evidence of" 等）が含まれる場合、コーパス不可の宣言が無く、かつ**その主張が名指ししている対象に対する再検索**が無ければ **G12 が FAIL** する。対象を本文中に明記し（例:「evil.example.com への通信の痕跡はない」）、`reach --ioc evil.example.com ...` を記録すること。紐付けは**節（clause）単位**で行われるため、別の節で対象に言及しても（例:「evil.example.com は観測されたが、持ち出しの痕跡はない」）その不在主張はカバーされない。また再検索が**ヒットした**場合、それは主張を裏付けるのではなく否定する。
+
+なお**タイムラインに限定した主張はゲート対象外**である（「タイムラインに痕跡はない」「どのルールにも一致しなかった」など）。これは CSV だけから言える弱い（そして正確な）主張であり、evtx まで遡っていない段階ではこの表現を使うこと。
+
+**このステップは Step 5.7 より前に実行する。** 突き合わせにより finding が実質的に変化する（ホストや証拠の追加）ことがあり、その変更前に記録された独立検証票は、もはやレポートが述べていない内容を検証したものになってしまう。
+
 ### Step 5.7: 独立検証（fresh-context verification） ★レポート生成前に必須
 
 調査エージェント自身の確証バイアス（自分で立てた攻撃仮説の追認、大量除外の正当化）を抑えるため、**レポートに載る判定を新しいコンテキストのサブエージェントに独立検証させる**。ゲート G11 が検証票の存在と整合を強制する。
@@ -394,42 +435,6 @@ python3 "$STATE_PY" verify --dir "$STATE_DIR" --target-type rule --target "[正�
 - **false_positive 判定への attack 票は多数決でも覆せない**（見逃しコスト非対称のため）: ルールを再トリアージ（mixed / attack / indeterminate）するしかない
 - `cannot_verify` はどの判定の裏付けにもならない
 - 注意: この検証は**手続き的な保証**であり、state.py はサブエージェントのコンテキスト分離自体を証明できない。パケット中立性ルールを守ることが前提
-
-### Step 5.8: Evtx 到達性の確認 ★「痕跡なし」と述べる前に必須
-
-Hayabusa の CSV は **検知**の成果物であって**証拠**そのものではない。CSV に含まれるのはルールに一致したイベントだけであり、どのルールにも一致しなかったイベントは evtx に存在したままタイムラインからは消える。したがって「タイムラインに無い」と「ログに無い」は別の主張であり、CSV だけから言えるのは前者のみである。
-
-**まずギャップを一度計測する。** 元の evtx コーパスに対して `hayabusa eid-metrics` を実行し、結果を取り込む:
-
-```bash
-hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
-python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
-```
-
-コーパスのイベントのうち何%が**どのルールにも一致しない種別**であるか、そしてそれがどの `(チャネル, イベントID)` かが記録される。これがこのデータセットの盲点であり、結論を書く前に上位の項目を必ず確認すること。
-
-**判明した IOC は生の evtx に対して再検索する。** finding と `iocs.json` が揃ったら、主要な IOC を CSV だけでなく元の evtx でも探す:
-
-```bash
-hayabusa search -d /path/to/evtx -i -k "<ioc>" -o "$STATE_DIR/work/searchback.csv"
-python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
-    --raw-hits 504 --timeline-hits 1 --raw-hosts "HOST-A,HOST-B,HOST-C" \
-    --finding f7 --tool "hayabusa search -d ... -k <ioc>"
-```
-
-**再検索でタイムラインに存在しないホストが見つかった場合は `--finding` を指定する。** それらのホストには引用できるタイムライン行が存在しないため、そのまま finding の `hosts` に追加すると **G9** が FAIL する。再検索を finding に紐付けることで、その生ホストが当該主張の裏付けとして認められる（生の evtx の証拠も証拠である）。
-
-**生のヒット数がタイムラインのヒット数を上回る場合、その finding は不完全である** — 差分こそが見落とされたホストや C2 が潜む場所である。まず該当 finding を更新し、その後で同じ IOC を `--reconciled` と変更内容を書いた `--note` 付きで再登録する。**差分がプラスの場合 `--note` は必須**であり、真偽値だけでなく finding に何が反映されたかが監査証跡として残る。未解消の差分があると G12 は FAIL する。
-
-**元の evtx を参照できない場合**は、CSV が完全であるかのように黙って推論せず、明示的に宣言する:
-
-```bash
-python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "CSVのみ提供された"
-```
-
-**不在を断定する表現はゲート対象。** トリアージの rationale や finding の summary に「痕跡はない」「証拠がない」「確認されなかった」「ログに記録されていない」（および英語の "no evidence of" 等）が含まれる場合、コーパス不可の宣言が無く、かつ**その主張が名指ししている対象に対する再検索**が無ければ **G12 が FAIL** する。対象を本文中に明記し（例:「evil.example.com への通信の痕跡はない」）、`reach --ioc evil.example.com ...` を記録すること。無関係な IOC を1件検索しただけで調査中のあらゆる不在主張が許可されるわけではない。
-
-なお**「タイムラインに存在しない」という表現はゲート対象外**である。これは CSV だけから言える弱い（そして正確な）主張であり、evtx まで遡っていない段階ではこの表現を使うこと。同義の正確な表現は「どのルールにも一致しなかった」である。
 
 ### Step 6: 可視化グラフ生成
 
@@ -564,7 +569,7 @@ JSON入力の構造:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack/mixed判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはfinding（ただし `refs_unavailable` を宣言し、かつ当該ルールにRecordIDを持つ行が存在しないことをデータセットが裏付ける場合を除く）、excerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト、G10 大量イベント（20件超）のfalse_positive/mixed判定にバリアント網羅証拠が無い、または宣言バリアントがCSV再集計と一致しない、G11 finding・大量FP/mixed判定に整合する独立検証票が無い（Step 5.7）、G12 evtx 再検索の記録が無いまま不在を断定している、または再検索の生ヒット数がタイムラインのヒット数を上回ったまま解消されていない（Step 5.8）。該当ステップに戻ってギャップを解消し、再実行する
+- **FAIL** → ゲートごとに不足項目が列挙される: G1 pending のルール、G2 未カバーのホスト、G3 未判定のクラスタ、G4 どのfindingからも参照されていないattack/mixed判定ルール、G5 未解決のページネーション、G6 解決できない証拠ref（存在しない/曖昧なRecordID、別ルールのイベントの引用、逐語でないexcerpt）、G7 refsを1件も引用していない評決（attack/false_positive/indeterminate全て）またはfinding（ただし `refs_unavailable` を宣言し、かつ当該ルールにRecordIDを持つ行が存在しないことをデータセットが裏付ける場合を除く）、excerptのない偽陽性判定、G8 findingが引用しているのにトリアージ未判定または**偽陽性判定**のルール、G9 引用イベントで裏付けられていないfindingのホスト、G10 大量イベント（20件超）のfalse_positive/mixed判定にバリアント網羅証拠が無い、または宣言バリアントがCSV再集計と一致しない、G11 finding・大量FP/mixed判定に整合する独立検証票が無い（Step 5.7）、G12 evtx 再検索の記録が無いまま不在を断定している、または再検索の生ヒット数がタイムラインのヒット数を上回ったまま解消されていない（Step 5.6）。該当ステップに戻ってギャップを解消し、再実行する
 - **G6 の曖昧性FAIL**: 「RecordID X is ambiguous」と出た場合、そのRecordIDは複数ホスト/チャネルの別イベントに使われている。`get_event_detail(record_id=...)` も候補一覧（status=ambiguous）を返すので、`computer`（必要なら `channel`）を指定して対象イベントを確定し、refs を修飾形式で記録し直す
 - **G3 タイムスタンプ警告**: G3 の詳細に「一部の行のTimestampがパース不能」と警告が出た場合、それらの行は自動導出クラスタから除外されている（これは失敗ではなく可視の警告。ただし**1件もパースできなかった場合はウィンドウを手動追加するまでG3はハードFAIL**になる）。明確な活動の波が漏れていると分かる場合は、手動で追加して判定する: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - レポート生成時もこのゲートが再実行される: `report.py` は `state_dir` を渡し忘れても出力ディレクトリ（`manifest.json` がある場所）から `$STATE_DIR` を自動検出するため、ゲートを暗黙にスキップできない

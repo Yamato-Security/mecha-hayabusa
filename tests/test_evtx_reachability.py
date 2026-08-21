@@ -121,7 +121,7 @@ class ReachabilityTests(unittest.TestCase):
         self.claim_absence()
         g12 = self.gate("G12")
         self.assertEqual(g12["status"], "FAIL")
-        self.assertTrue(any("without a search-back naming the artifact" in gap
+        self.assertTrue(any("without naming a searched artifact" in gap
                             for gap in g12["gaps"]))
 
     def test_absence_claim_naming_a_searched_artifact_passes_g12(self) -> None:
@@ -167,6 +167,40 @@ class ReachabilityTests(unittest.TestCase):
         g12 = self.gate("G12")
         self.assertEqual(g12["status"], "FAIL")
 
+    def test_a_searchback_that_found_hits_refutes_the_absence_claim(self) -> None:
+        # A search-back returning hits contradicts the claim; it must not license it.
+        self.claim_absence("No trace of evil.example.com in the logs.")
+        self.reach("--ioc", "evil.example.com", "--raw-hits", "9", "--timeline-hits", "9")
+        g12 = self.gate("G12")
+        self.assertEqual(g12["status"], "FAIL")
+        self.assertTrue(any("the search-back found it" in gap for gap in g12["gaps"]))
+
+    def test_searchback_covers_only_the_clause_that_names_it(self) -> None:
+        # Naming an artifact in a DIFFERENT clause must not cover this claim.
+        self.claim_absence(
+            "evil.example.com was observed, but there is no evidence of data exfiltration.")
+        self.reach("--ioc", "evil.example.com", "--raw-hits", "0", "--timeline-hits", "0")
+        self.assertEqual(self.gate("G12")["status"], "FAIL")
+
+    def test_timeline_scoped_claim_naming_an_artifact_is_permitted(self) -> None:
+        # Dotted artifact names must not break clause splitting.
+        self.claim_absence("No evidence of evil.example.com was found in the timeline.")
+        self.assertEqual(self.gate("G12")["status"], "PASS")
+
+    def test_japanese_timeline_scoped_claim_is_permitted(self) -> None:
+        self.claim_absence("タイムラインに痕跡はない。")
+        self.assertEqual(self.gate("G12")["status"], "PASS")
+
+    def test_equal_counts_still_gap_when_a_host_is_raw_only(self) -> None:
+        # raw_hits and timeline_hits are not comparable: a raw event matching no
+        # rule and a visible event matching two rules cancel out to 2 == 2 while
+        # HOST-B is missing entirely. Host sets catch it.
+        self.reach("--ioc", "a.example", "--raw-hits", "2", "--timeline-hits", "2",
+                   "--raw-hosts", "HOST-A,HOST-B", "--timeline-hosts", "HOST-A")
+        g12 = self.gate("G12")
+        self.assertEqual(g12["status"], "FAIL")
+        self.assertTrue(any("HOST-B" in gap for gap in g12["gaps"]))
+
     # -- search-back reconciliation --------------------------------------
 
     def test_raw_hits_exceeding_timeline_must_be_reconciled(self) -> None:
@@ -175,19 +209,81 @@ class ReachabilityTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         g12 = self.gate("G12")
         self.assertEqual(g12["status"], "FAIL")
-        self.assertTrue(any("504" in gap and "cloudfront" in gap for gap in g12["gaps"]))
+        self.assertTrue(any("cloudfront" in gap and "only in the raw evtx" in gap
+                            for gap in g12["gaps"]))
+
+    def make_finding(self, hosts: list[str]) -> None:
+        finding = [{
+            "id": "f1", "title": "C2 beacon", "summary": "Implant beaconing out.",
+            "hosts": hosts, "rule_titles": ["Alpha"],
+            "refs": [{"record_id": "1", "computer": "HOST-A", "channel": "Sec"}],
+        }]
+        r = run_state("finding", "--dir", str(self.state_dir), "--batch",
+                      stdin_data=json.dumps(finding))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_reconciled_search_back_passes(self) -> None:
-        self.reach("--ioc", "d3azl80n0qqn6q.cloudfront.net", "--raw-hits", "504",
-                   "--timeline-hits", "1", "--raw-hosts", "HOST-A,HOST-B,HOST-C")
-        self.assertEqual(self.gate("G12")["status"], "FAIL")
-        # Re-recording the same IOC replaces it rather than duplicating.
+        self.make_finding(["HOST-A", "HOST-B", "HOST-C"])
         self.reach("--ioc", "d3azl80n0qqn6q.cloudfront.net", "--raw-hits", "504",
                    "--timeline-hits", "1", "--raw-hosts", "HOST-A,HOST-B,HOST-C",
-                   "--reconciled", "--note", "added HOST-B and HOST-C to the C2 finding")
+                   "--timeline-hosts", "HOST-A", "--finding", "f1")
+        self.assertEqual(self.gate("G12")["status"], "FAIL")
+        # The finding now carries every raw-only host, so the gap can be closed.
+        r = self.reach("--ioc", "d3azl80n0qqn6q.cloudfront.net", "--reconciled",
+                       "--note", "added HOST-B and HOST-C to the C2 finding")
+        self.assertEqual(r.returncode, 0, r.stderr)
         state = json.loads((self.state_dir / "reachability.json").read_text())
         self.assertEqual(len(state["searchbacks"]), 1)
         self.assertEqual(self.gate("G12")["status"], "PASS")
+
+    def test_re_recording_preserves_omitted_fields(self) -> None:
+        # The documented workflow re-records with only --reconciled --note; it
+        # must not silently drop raw_hosts / finding / tool.
+        self.make_finding(["HOST-A", "HOST-B", "HOST-C"])
+        self.reach("--ioc", "c2.example", "--raw-hits", "504", "--timeline-hits", "1",
+                   "--raw-hosts", "HOST-A,HOST-B,HOST-C", "--timeline-hosts", "HOST-A",
+                   "--finding", "f1", "--tool", "hayabusa search -k c2.example")
+        self.reach("--ioc", "c2.example", "--reconciled", "--note", "hosts added to f1")
+        b = json.loads((self.state_dir / "reachability.json").read_text())["searchbacks"][0]
+        self.assertEqual(b["raw_hosts"], ["HOST-A", "HOST-B", "HOST-C"])
+        self.assertEqual(b["finding"], "f1")
+        self.assertEqual(b["tool"], "hayabusa search -k c2.example")
+        self.assertEqual(b["raw_hits"], 504)
+
+    def test_cannot_reconcile_while_a_raw_only_host_is_unaccounted(self) -> None:
+        # The motivating case: HOST-Z was found only in the raw evtx and the
+        # finding never picked it up. A note must not be able to close that.
+        self.make_finding(["HOST-A"])
+        self.reach("--ioc", "c2.example", "--raw-hits", "40", "--timeline-hits", "1",
+                   "--raw-hosts", "HOST-A,HOST-Z", "--timeline-hosts", "HOST-A",
+                   "--finding", "f1")
+        r = self.reach("--ioc", "c2.example", "--reconciled", "--note", "looked at it")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not list HOST-Z", r.stderr + r.stdout)
+        self.assertEqual(self.gate("G12")["status"], "FAIL")
+
+    def test_cannot_reconcile_raw_only_hosts_without_linking_a_finding(self) -> None:
+        self.reach("--ioc", "c2.example", "--raw-hits", "40", "--timeline-hits", "0",
+                   "--raw-hosts", "HOST-A,HOST-Z")
+        r = self.reach("--ioc", "c2.example", "--reconciled", "--note", "done")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--finding", r.stderr + r.stdout)
+
+    def test_hosts_without_hits_are_rejected(self) -> None:
+        r = self.reach("--ioc", "c2.example", "--raw-hits", "0", "--raw-hosts", "HOST-Z")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("attributes no host", r.stderr + r.stdout)
+
+    def test_non_integer_and_negative_counts_are_rejected(self) -> None:
+        for bad in (True, -1, 3.9, "7"):
+            r = self.reach("--batch", stdin_data=json.dumps(
+                [{"ioc": "c2.example", "raw_hits": bad}]))
+            self.assertNotEqual(r.returncode, 0, f"accepted raw_hits={bad!r}")
+
+    def test_linking_a_nonexistent_finding_is_rejected(self) -> None:
+        r = self.reach("--ioc", "c2.example", "--raw-hits", "3", "--finding", "f99")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not exist", r.stderr + r.stdout)
 
     def test_batch_search_backs(self) -> None:
         batch = [

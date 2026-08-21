@@ -116,7 +116,7 @@ ABSENCE_CLAIM_RE = re.compile(
     r"|no (?:trace|traces|sign|signs|indication|record|records) of"
     r"|(?:not|never) (?:observed|detected|recorded) in the (?:log|logs|evtx|data|dataset)"
     r"|nothing in the (?:log|logs|evtx|data|dataset)"
-    r"|absent from the (?:log|logs|evtx|data|dataset)"
+    r"|absent from the (?:log|logs|evtx|timeline|data|dataset)"
     r"|left no (?:trace|traces|evidence)"
     r"|痕跡(?:は|が)(?:ない|無い|見つから|残っ(?:ていない|ておらず))"
     r"|証拠(?:は|が)(?:ない|無い|見つから)"
@@ -124,6 +124,39 @@ ABSENCE_CLAIM_RE = re.compile(
     r"|(?:確認|観測|検出)(?:されなかった|できなかった)",
     re.IGNORECASE,
 )
+
+# An absence claim SCOPED to the timeline ("no evidence of X in the timeline",
+# "did not match any rule") is the weaker, accurate statement the CSV alone
+# supports, and Step 5.8 recommends exactly that wording. Scope is judged per
+# clause rather than per alternation: the qualifier can sit on either side of
+# the absence phrase, and only one clause of a sentence may carry it.
+TIMELINE_SCOPE_RE = re.compile(
+    r"timeline|タイムライン"
+    r"|match(?:ed|es)? no rule|no rule match|(?:not|never) match(?:ed)? any rule"
+    r"|ルールに(?:は|が)?一致",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?<=[.;!?])\s+|(?<=[。；！？])|\n+"
+    r"|,?\s+(?:but|however|although|though|whereas)\s+"
+    r"|(?:しかし|ただし|一方|ものの)",
+    re.IGNORECASE,
+)
+
+
+def _unscoped_absence_clauses(text: str) -> list[str]:
+    """Clauses of `text` that assert absence without scoping it to the timeline.
+
+    Splitting first matters: "X was observed, but there is no evidence of Y"
+    and "no evidence of X in the timeline" must be judged on the clause that
+    carries the claim, not on the whole field.
+    """
+    found = []
+    for clause in _CLAUSE_SPLIT_RE.split(text or ""):
+        clause = clause.strip()
+        if clause and ABSENCE_CLAIM_RE.search(clause) and not TIMELINE_SCOPE_RE.search(clause):
+            found.append(clause)
+    return found
 
 # Rationales that carry no information get rejected at record time: an
 # unauditable verdict ("reviewed") over thousands of events is exactly the
@@ -2094,38 +2127,58 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     # An absence claim is only covered when a search-back exists for the artifact
     # THAT claim names. Accepting any non-empty search-back list would let one
     # unrelated IOC lookup license every absence claim in the investigation.
-    searched_iocs = [b["ioc"] for b in searchbacks if b.get("ioc")]
+    by_ioc = {b["ioc"]: b for b in searchbacks if b.get("ioc")}
 
-    def _uncovered_absence(text: str) -> bool:
-        if not ABSENCE_CLAIM_RE.search(text or ""):
-            return False
-        lowered = (text or "").lower()
-        return not any(ioc.lower() in lowered for ioc in searched_iocs)
+    def _absence_problems(where: str, text: str) -> list[str]:
+        """Absence clauses in `text` that no search-back supports.
+
+        Two ways to fail: the clause names no searched artifact, or it names one
+        whose search FOUND something — a search-back that returns hits refutes
+        the claim rather than licensing it.
+        """
+        problems = []
+        for clause in _unscoped_absence_clauses(text):
+            lowered = clause.lower()
+            # Bind on the clause, not the whole field: "X was observed, but there
+            # is no evidence of Y" must not be covered by a search-back for X.
+            named = [b for ioc, b in by_ioc.items() if ioc.lower() in lowered]
+            if not named:
+                problems.append(
+                    f"{where} asserts absence without naming a searched artifact:"
+                    f' "{clause[:120]}"'
+                )
+                continue
+            contradicted = [b for b in named if b["raw_hits"] > 0]
+            if contradicted:
+                names = ", ".join(f"{b['ioc']} ({b['raw_hits']} raw hit(s))"
+                                  for b in contradicted[:3])
+                problems.append(
+                    f"{where} asserts absence but the search-back found it — {names}:"
+                    f' "{clause[:120]}"'
+                )
+        return problems
 
     absence_claims = []
     for rule in triage["rules"]:
-        if _uncovered_absence(rule.get("rationale") or ""):
-            absence_claims.append(f"rule '{rule['rule_title']}' rationale claims absence")
+        absence_claims.extend(
+            _absence_problems(f"rule '{rule['rule_title']}' rationale",
+                              rule.get("rationale") or ""))
     for finding in findings["findings"]:
-        if _uncovered_absence(finding.get("summary") or ""):
-            absence_claims.append(
-                f"finding {finding['id']} ({finding['title']}) summary claims absence"
-            )
+        absence_claims.extend(
+            _absence_problems(f"finding {finding['id']} ({finding['title']}) summary",
+                              finding.get("summary") or ""))
     unreconciled = [
-        f"IOC '{b['ioc']}': {b['raw_hits']} hit(s) in the raw evtx vs"
-        f" {b['timeline_hits']} in the timeline"
-        + (f" on {len(b['raw_hosts'])} host(s)" if b.get("raw_hosts") else "")
-        + " — reconcile the affected findings, then re-record with reconciled=true"
-        for b in searchbacks
-        if b["raw_hits"] > b["timeline_hits"] and not b.get("reconciled")
+        f"IOC '{b['ioc']}': {gap} — reconcile the affected findings,"
+        " then re-record with reconciled=true"
+        for b, gap in ((b, _searchback_gap(b)) for b in searchbacks)
+        if gap and not b.get("reconciled")
     ]
     g12_gaps = list(unreconciled)
     corpus = reach.get("corpus")
     if absence_claims and not reach.get("declared_unavailable"):
         g12_gaps.extend(
-            claim + " without a search-back naming the artifact asserted absent"
-            " — name it in the text and record `reach --ioc <artifact> ...`,"
-            " or `reach --none --reason ...` if the evtx corpus is unavailable"
+            claim + " (name the artifact and record `reach --ioc <artifact> ...`,"
+            " or `reach --none --reason ...` if the evtx corpus is unavailable)"
             for claim in absence_claims
         )
     bits = []
@@ -2202,6 +2255,44 @@ def _print_check(result: dict) -> None:
     print(f"OVERALL: {'PASS' if result['ok'] else 'FAIL'}")
 
 
+def _require_count(ioc: str, name: str, value) -> int:
+    """A hit count must be a real non-negative integer.
+
+    `int()` would silently accept True, 3.9 and "-1"; each of those can license
+    an absence claim or make a host count as evidence, so they are rejected
+    rather than coerced.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        _fail(
+            f"search-back for {ioc}: '{name}' must be a non-negative integer"
+            f" (got {type(value).__name__} {value!r})"
+        )
+    if value < 0:
+        _fail(f"search-back for {ioc}: '{name}' must be >= 0 (got {value})")
+    return value
+
+
+def _searchback_gap(entry: dict) -> str:
+    """Describe what a search-back found that the timeline does not account for.
+
+    Host sets are the primary signal. Raw hit counts and timeline hit counts are
+    NOT directly comparable — Hayabusa emits one timeline row per
+    (event x matching rule), so a raw event that matched no rule and a visible
+    event that matched two rules can cancel out to equal totals while a whole
+    host is missing. Counts are therefore only a secondary trigger.
+    """
+    raw_hosts = set(entry.get("raw_hosts") or [])
+    timeline_hosts = set(entry.get("timeline_hosts") or [])
+    missing_hosts = sorted(raw_hosts - timeline_hosts) if raw_hosts else []
+    if missing_hosts:
+        shown = ", ".join(missing_hosts[:5]) + (" ..." if len(missing_hosts) > 5 else "")
+        return f"{len(missing_hosts)} host(s) seen only in the raw evtx: {shown}"
+    if entry["raw_hits"] > entry.get("timeline_hits", 0):
+        return (f"{entry['raw_hits']} raw hit(s) vs {entry.get('timeline_hits', 0)}"
+                " timeline row(s)")
+    return ""
+
+
 def _load_reachability(state_dir: str) -> dict:
     return _load_optional(state_dir, REACHABILITY, {
         "corpus": None,
@@ -2222,20 +2313,21 @@ def _scan_timeline_pairs(csv_path: str) -> tuple[set, int]:
         reader = csv.DictReader(fh)
         for row in reader:
             rows += 1
-            channel = (row.get("Channel") or "").strip()
+            channel = (row.get("Channel") or "").strip().casefold()
             event_id = (row.get("EventID") or "").strip()
             if channel or event_id:
                 pairs.add((channel, event_id))
     return pairs, rows
 
 
-def _parse_eid_metrics(path: str) -> tuple[dict, int]:
+def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
     """Parse `hayabusa eid-metrics` CSV output into {(channel, eid): events}.
 
     Columns are Total,%,Channel,ID,Event. Channel names are the same
     abbreviations the timeline uses, so the two sides compare directly.
     """
     corpus: dict = {}
+    display: dict = {}
     total = 0
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
         reader = csv.DictReader(fh)
@@ -2253,10 +2345,12 @@ def _parse_eid_metrics(path: str) -> tuple[dict, int]:
                 count = int((row.get("Total") or "0").replace(",", "").strip())
             except ValueError:
                 continue
-            key = ((row.get("Channel") or "").strip(), (row.get("ID") or "").strip())
+            raw_channel = (row.get("Channel") or "").strip()
+            key = (raw_channel.casefold(), (row.get("ID") or "").strip())
             corpus[key] = corpus.get(key, 0) + count
+            display.setdefault(key, raw_channel)
             total += count
-    return corpus, total
+    return corpus, total, display
 
 
 def cmd_reach(args) -> None:
@@ -2311,8 +2405,8 @@ def cmd_reach(args) -> None:
         if backs:
             print(f"\nIOC search-backs ({len(backs)}):")
             for b in backs:
-                open_gap = b["raw_hits"] > b["timeline_hits"] and not b.get("reconciled")
-                flag = "GAP" if open_gap else "OK "
+                gap = _searchback_gap(b)
+                flag = "GAP" if (gap and not b.get("reconciled")) else "OK "
                 print(f"  [{flag}] {b['ioc']}: raw={b['raw_hits']} timeline={b['timeline_hits']}"
                       f" raw_hosts={len(b.get('raw_hosts') or [])}")
         else:
@@ -2328,10 +2422,31 @@ def cmd_reach(args) -> None:
         csv_path = manifest["dataset"]["path"]
         if not os.path.isfile(csv_path):
             _fail(f"timeline CSV missing, cannot compare coverage: {csv_path}")
-        corpus_pairs, corpus_events = _parse_eid_metrics(args.eid_metrics)
+        corpus_pairs, corpus_events, corpus_display = _parse_eid_metrics(args.eid_metrics)
         timeline_pairs, timeline_rows = _scan_timeline_pairs(csv_path)
+        # `hayabusa eid-metrics` writes abbreviated channels ("Sec"); a timeline
+        # generated with -b/--disable-abbreviations writes full names
+        # ("Security"). Comparing those two representations makes every pair look
+        # unreachable, so refuse rather than record a metric that is simply wrong.
+        if timeline_pairs and not (timeline_pairs & set(corpus_pairs)):
+            shared_eids = ({eid for _, eid in timeline_pairs}
+                           & {eid for _, eid in corpus_pairs})
+            hint = (
+                " The two files share event IDs but no channel names, which means"
+                " they use different channel representations: regenerate BOTH with"
+                " the same abbreviation setting (either both default, or both with"
+                " -b/--disable-abbreviations)."
+                if shared_eids else
+                " The two files have nothing in common — check that the eid-metrics"
+                " run covered the evtx this timeline was generated from."
+            )
+            _fail(
+                "refusing to record coverage: not one of the timeline's"
+                f" {len(timeline_pairs):,} (channel, event id) pairs appears in"
+                f" {args.eid_metrics}." + hint
+            )
         uncovered = [
-            {"channel": ch, "event_id": eid, "events": n}
+            {"channel": corpus_display.get((ch, eid), ch), "event_id": eid, "events": n}
             for (ch, eid), n in corpus_pairs.items()
             if (ch, eid) not in timeline_pairs
         ]
@@ -2386,6 +2501,7 @@ def cmd_reach(args) -> None:
             "raw_hits": args.raw_hits,
             "raw_hosts": args.raw_hosts,
             "timeline_hits": args.timeline_hits,
+            "timeline_hosts": args.timeline_hosts,
             "finding": args.finding,
             "tool": args.tool,
             "note": args.note,
@@ -2393,48 +2509,88 @@ def cmd_reach(args) -> None:
         }]
 
     recorded = 0
+    existing = {b.get("ioc"): b for b in reach.get("searchbacks", [])}
+    findings_by_id = {f["id"]: f for f in _load(args.dir, FINDINGS)["findings"]}
     for entry in entries:
         ioc = str(entry.get("ioc") or "").strip()
         if not ioc:
             _fail("each search-back entry requires 'ioc'")
-        if entry.get("raw_hits") is None:
+        # X8: re-recording the documented "--reconciled --note" way must not drop
+        # raw_hosts / finding / tool just because they were not repeated. Start
+        # from the previous record and overlay only what this entry supplies.
+        prior = dict(existing.get(ioc) or {})
+        supplied = {k: v for k, v in entry.items() if v is not None}
+        if "raw_hits" not in supplied and "raw_hits" not in prior:
             _fail(f"search-back for {ioc} requires 'raw_hits' (hits in the ORIGINAL evtx)")
-        raw_hosts = entry.get("raw_hosts") or []
-        if isinstance(raw_hosts, str):
-            raw_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
-        # Reconciliation closes a gap the gate would otherwise hold open, so it
-        # must be an actual JSON boolean: bool("false") is True, and a batch
-        # entry must not be able to clear a gap by writing the string "false".
-        reconciled = entry.get("reconciled", False)
-        if reconciled is None:
-            reconciled = False
+
+        def _hosts(key):
+            value = supplied.get(key, prior.get(key) or [])
+            if isinstance(value, str):
+                return [h.strip() for h in value.split(",") if h.strip()]
+            return list(value or [])
+
+        raw_hosts = sorted(set(_hosts("raw_hosts")))
+        timeline_hosts = sorted(set(_hosts("timeline_hosts")))
+        raw_hits = _require_count(ioc, "raw_hits", supplied.get("raw_hits", prior.get("raw_hits")))
+        timeline_hits = _require_count(
+            ioc, "timeline_hits", supplied.get("timeline_hits", prior.get("timeline_hits") or 0))
+        # X6: hosts and counts must agree. Without this, raw_hits=0 plus a host
+        # list would make that host count as G9 evidence for a search that found
+        # nothing at all.
+        if raw_hosts and raw_hits == 0:
+            _fail(
+                f"search-back for {ioc}: raw_hosts lists {len(raw_hosts)} host(s)"
+                " but raw_hits is 0 — a search that found nothing attributes no host"
+            )
+        reconciled = supplied.get("reconciled", False)
         if not isinstance(reconciled, bool):
             _fail(
                 f"search-back for {ioc}: 'reconciled' must be a JSON boolean"
                 f" (got {type(reconciled).__name__} {reconciled!r})"
             )
-        note = str(entry.get("note") or "").strip()
-        gap = int(entry["raw_hits"]) - int(entry.get("timeline_hits") or 0)
-        # Closing a positive gap is a claim that the findings were updated; make
-        # it say what changed, so the audit trail is not just a boolean.
-        if reconciled and gap > 0 and not note:
-            _fail(
-                f"search-back for {ioc}: reconciling a positive gap"
-                f" ({entry['raw_hits']} raw vs {entry.get('timeline_hits') or 0} timeline)"
-                " requires a note describing what the findings now reflect"
-            )
+        note = str(supplied.get("note", prior.get("note") or "")).strip()
+        finding_id = str(supplied.get("finding", prior.get("finding") or "")).strip()
+        if finding_id and finding_id not in findings_by_id:
+            _fail(f"search-back for {ioc}: finding '{finding_id}' does not exist")
+
+        candidate = {
+            "ioc": ioc, "raw_hits": raw_hits, "raw_hosts": raw_hosts,
+            "timeline_hits": timeline_hits, "timeline_hosts": timeline_hosts,
+            "finding": finding_id,
+            "tool": str(supplied.get("tool", prior.get("tool") or "")).strip(),
+            "note": note, "reconciled": reconciled, "recorded_at": _now(),
+        }
+        gap = _searchback_gap(candidate)
+        if reconciled and gap:
+            # X7: a note is a sentence, not evidence. Closing a gap means the
+            # raw-only hosts are actually carried by a finding now, so check it
+            # structurally instead of trusting the boolean.
+            if not note:
+                _fail(
+                    f"search-back for {ioc}: reconciling a gap ({gap}) requires a"
+                    " note describing what the findings now reflect"
+                )
+            raw_only = sorted(set(raw_hosts) - set(timeline_hosts))
+            if raw_only:
+                if not finding_id:
+                    _fail(
+                        f"search-back for {ioc}: cannot reconcile — {len(raw_only)}"
+                        " host(s) were seen only in the raw evtx"
+                        f" ({', '.join(raw_only[:5])}); link the finding that now"
+                        " carries them with --finding"
+                    )
+                covered = set(findings_by_id[finding_id].get("hosts") or [])
+                missing = [h for h in raw_only if h not in covered]
+                if missing:
+                    _fail(
+                        f"search-back for {ioc}: cannot reconcile — finding"
+                        f" {finding_id} does not list {', '.join(missing[:5])}."
+                        " Add the raw-only host(s) to the finding, or drop them"
+                        " from raw_hosts and say why in the note"
+                    )
         reach["searchbacks"] = [b for b in reach.get("searchbacks", []) if b.get("ioc") != ioc]
-        reach["searchbacks"].append({
-            "ioc": ioc,
-            "raw_hits": int(entry["raw_hits"]),
-            "raw_hosts": sorted(set(raw_hosts)),
-            "timeline_hits": int(entry.get("timeline_hits") or 0),
-            "finding": str(entry.get("finding") or "").strip(),
-            "tool": str(entry.get("tool") or "").strip(),
-            "note": note,
-            "reconciled": reconciled,
-            "recorded_at": _now(),
-        })
+        reach["searchbacks"].append(candidate)
+        existing[ioc] = candidate
         recorded += 1
     if reach.get("declared_unavailable"):
         reach["declared_unavailable"] = False
@@ -2443,10 +2599,10 @@ def cmd_reach(args) -> None:
     _save(args.dir, REACHABILITY, reach)
     print(f"recorded {recorded} IOC search-back(s)")
     for b in reach["searchbacks"][-recorded:]:
-        gap = b["raw_hits"] - b["timeline_hits"]
-        if gap > 0 and not b["reconciled"]:
-            print(f"  GAP {b['ioc']}: {b['raw_hits']} raw vs {b['timeline_hits']} timeline"
-                  f" (+{gap}) — reconcile the findings, then re-record with --reconciled")
+        gap = _searchback_gap(b)
+        if gap and not b["reconciled"]:
+            print(f"  GAP {b['ioc']}: {gap}"
+                  " — reconcile the findings, then re-record with --reconciled")
 
 
 def cmd_check(args) -> None:
@@ -2781,7 +2937,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ioc", help="IOC that was searched back against the raw evtx")
     p.add_argument("--raw-hits", type=int, help="hits for --ioc in the ORIGINAL evtx")
     p.add_argument("--raw-hosts", help="comma-separated hosts the raw hits landed on")
-    p.add_argument("--timeline-hits", type=int, default=0, help="hits for --ioc in the timeline CSV")
+    p.add_argument("--timeline-hits", type=int, help="hits for --ioc in the timeline CSV")
+    p.add_argument("--timeline-hosts", help="comma-separated hosts the TIMELINE already attributes to --ioc")
     p.add_argument("--finding", help="finding id this search-back belongs to (its raw hosts then satisfy G9)")
     p.add_argument("--tool", help="command used (e.g. 'hayabusa search -d ... -k ...')")
     p.add_argument("--note", help="what the reconciliation changed")
