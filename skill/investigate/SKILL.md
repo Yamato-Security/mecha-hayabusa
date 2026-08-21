@@ -406,7 +406,7 @@ hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
 ```
 
-This records how many corpus events reach the timeline and which `(channel, event id)` pairs no rule ever matched — the blind spots for this dataset. Review the largest ones before writing conclusions; that list is where unreachable evidence lives.
+This records what share of corpus events are of a type **no rule ever matched**, and which `(channel, event id)` pairs those are — the blind spots for this dataset. Review the largest ones before writing conclusions; that list is where unreachable evidence lives.
 
 **Search known IOCs back against the raw evtx.** Once findings and `iocs.json` exist, take each significant IOC and look for it in the original evtx, not just the CSV:
 
@@ -414,10 +414,12 @@ This records how many corpus events reach the timeline and which `(channel, even
 hayabusa search -d /path/to/evtx -i -k "<ioc>" -o "$STATE_DIR/work/searchback.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
     --raw-hits 504 --timeline-hits 1 --raw-hosts "HOST-A,HOST-B,HOST-C" \
-    --tool "hayabusa search -d ... -k <ioc>"
+    --finding f7 --tool "hayabusa search -d ... -k <ioc>"
 ```
 
-**If the raw hit count exceeds the timeline count, the finding is incomplete** — that difference is exactly where missed hosts and missed C2 hide. Update the affected findings first, then re-record the same IOC with `--reconciled` and a `--note` saying what changed. G12 FAILs on any unreconciled gap.
+**`--finding` matters when the search-back found hosts the timeline never saw.** Those hosts have no timeline row to cite, so adding them to the finding's `hosts` would otherwise make **G9** fail. Linking the search-back to the finding lets its raw hosts back that claim — raw-evtx evidence is still evidence.
+
+**If the raw hit count exceeds the timeline count, the finding is incomplete** — that difference is exactly where missed hosts and missed C2 hide. Update the affected findings first, then re-record the same IOC with `--reconciled` and a `--note` saying what changed; **the note is mandatory when closing a positive gap**, so the audit trail says what the findings now reflect rather than just carrying a boolean. G12 FAILs on any unreconciled gap.
 
 **If the original evtx is not available to you**, say so explicitly rather than quietly reasoning as if the CSV were complete:
 
@@ -425,7 +427,9 @@ python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "only the CSV was provided"
 ```
 
-**Absence language is gated.** Phrases such as "no evidence of", "no trace of", "left no trace", "absent from the logs" (and their Japanese equivalents) in a triage rationale or finding summary make **G12 FAIL** unless a search-back is recorded or the corpus is declared unavailable. Without one of those, the honest wording is *"did not match any rule"* — which is what the CSV actually supports.
+**Absence language is gated.** Phrases such as "no evidence of", "no trace of", "left no trace", "absent from the logs" (and their Japanese equivalents) in a triage rationale or finding summary make **G12 FAIL** unless the corpus is declared unavailable — or a search-back exists **for the artifact that claim names**. Name the artifact in the text (`"no evidence of beaconing to evil.example.com"`) and record `reach --ioc evil.example.com ...`; one unrelated IOC lookup does not license every absence claim in the investigation.
+
+Note that **"absent from the timeline" is deliberately NOT gated** — that is the weaker, accurate claim the CSV alone supports, and it is the wording to use when you have not gone back to the evtx. The honest alternative is *"did not match any rule"*.
 
 ### Step 6: Visualization Chart Generation
 

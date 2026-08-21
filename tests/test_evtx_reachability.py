@@ -101,6 +101,11 @@ class ReachabilityTests(unittest.TestCase):
         # Sys/1014 (9000) and Shell-Core/9707 (1500) matched no rule.
         self.assertEqual(corpus["uncovered_pairs"], 2)
         self.assertEqual(corpus["uncovered_events"], 10500)
+        # Exact: 10,500 of 15,000 corpus events are of an unmatched type. Uses
+        # corpus events on both sides, so it can never exceed 100% the way a
+        # rows/events ratio can (Hayabusa emits one row per event x rule).
+        self.assertEqual(corpus["unreachable_pct"], 70.0)
+        self.assertLessEqual(corpus["unreachable_pct"], 100.0)
         # Largest unreachable pair is surfaced first.
         self.assertEqual(corpus["uncovered"][0]["channel"], "Sys")
         self.assertEqual(corpus["uncovered"][0]["event_id"], "1014")
@@ -116,13 +121,27 @@ class ReachabilityTests(unittest.TestCase):
         self.claim_absence()
         g12 = self.gate("G12")
         self.assertEqual(g12["status"], "FAIL")
-        self.assertTrue(any("no evtx search-back" in gap for gap in g12["gaps"]))
+        self.assertTrue(any("without a search-back naming the artifact" in gap
+                            for gap in g12["gaps"]))
 
-    def test_absence_claim_with_searchback_passes_g12(self) -> None:
-        self.claim_absence()
+    def test_absence_claim_naming_a_searched_artifact_passes_g12(self) -> None:
+        self.claim_absence("No evidence of beaconing to evil.example.com.")
         r = self.reach("--ioc", "evil.example.com", "--raw-hits", "0",
                        "--timeline-hits", "0", "--tool", "hayabusa search -k evil.example.com")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.gate("G12")["status"], "PASS")
+
+    def test_unrelated_searchback_does_not_license_an_absence_claim(self) -> None:
+        # One IOC lookup must not blanket-permit every absence claim: the
+        # search-back has to cover the artifact THAT claim names.
+        self.claim_absence("There is no evidence of data exfiltration.")
+        self.reach("--ioc", "evil.example.com", "--raw-hits", "0", "--timeline-hits", "0")
+        self.assertEqual(self.gate("G12")["status"], "FAIL")
+
+    def test_timeline_scoped_wording_is_permitted(self) -> None:
+        # "absent from the timeline" is the weaker claim the CSV alone supports,
+        # and is exactly the wording Step 5.8 recommends -- it must not be gated.
+        self.claim_absence("This rule is absent from the timeline; it matched no rule.")
         self.assertEqual(self.gate("G12")["status"], "PASS")
 
     def test_absence_claim_with_corpus_declared_unavailable_passes_g12(self) -> None:
@@ -173,7 +192,8 @@ class ReachabilityTests(unittest.TestCase):
     def test_batch_search_backs(self) -> None:
         batch = [
             {"ioc": "a.example", "raw_hits": 3, "timeline_hits": 3, "reconciled": False},
-            {"ioc": "b.example", "raw_hits": 9, "timeline_hits": 2, "reconciled": True},
+            {"ioc": "b.example", "raw_hits": 9, "timeline_hits": 2, "reconciled": True,
+             "note": "added HOST-D to f1"},
         ]
         r = self.reach("--batch", stdin_data=json.dumps(batch))
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -187,6 +207,51 @@ class ReachabilityTests(unittest.TestCase):
 
     # -- reporting -------------------------------------------------------
 
+    def test_string_false_is_rejected_as_reconciled(self) -> None:
+        # bool("false") is True -- a batch entry must not close a gap that way.
+        r = self.reach("--batch", stdin_data=json.dumps(
+            [{"ioc": "a.example", "raw_hits": 9, "timeline_hits": 1, "reconciled": "false"}]))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("must be a JSON boolean", r.stderr + r.stdout)
+
+    def test_reconciling_a_positive_gap_requires_a_note(self) -> None:
+        r = self.reach("--ioc", "a.example", "--raw-hits", "9", "--timeline-hits", "1",
+                       "--reconciled")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("requires a note", r.stderr + r.stdout)
+
+    def test_equal_hit_counts_are_not_labelled_a_gap(self) -> None:
+        self.reach("--ioc", "a.example", "--raw-hits", "3", "--timeline-hits", "3")
+        out = self.reach("--list")
+        self.assertIn("[OK ]", out.stdout)
+        self.assertNotIn("[GAP]", out.stdout)
+
+    def test_recording_evidence_clears_a_prior_unavailable_declaration(self) -> None:
+        self.reach("--none", "--reason", "corpus not shipped yet")
+        self.reach("--eid-metrics", str(self.metrics_path))
+        state = json.loads((self.state_dir / "reachability.json").read_text())
+        self.assertFalse(state["declared_unavailable"])
+        # The measured coverage must now reach the appendix.
+        out = run_state("appendix", "--dir", str(self.state_dir))
+        self.assertIn("no rule ever matched", out.stdout)
+
+    def test_searchback_hosts_can_back_a_finding_host(self) -> None:
+        # A host found only in the RAW evtx cannot have a timeline ref by
+        # definition; linking the search-back to the finding must satisfy G9.
+        finding = [{
+            "id": "f1", "title": "C2 beacon", "summary": "Implant beaconing out.",
+            "hosts": ["HOST-A", "HOST-Z"], "rule_titles": ["Alpha"],
+            "refs": [{"record_id": "1", "computer": "HOST-A", "channel": "Sec"}],
+        }]
+        r = run_state("finding", "--dir", str(self.state_dir), "--batch",
+                      stdin_data=json.dumps(finding))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # HOST-Z appears in no timeline row -> G9 FAILs.
+        self.assertEqual(self.gate("G9")["status"], "FAIL")
+        self.reach("--ioc", "c2.example", "--raw-hits", "40", "--timeline-hits", "0",
+                   "--raw-hosts", "HOST-A,HOST-Z", "--finding", "f1")
+        self.assertEqual(self.gate("G9")["status"], "PASS")
+
     def test_appendix_states_reachability_was_not_measured(self) -> None:
         out = run_state("appendix", "--dir", str(self.state_dir))
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -195,7 +260,7 @@ class ReachabilityTests(unittest.TestCase):
     def test_appendix_reports_measured_coverage(self) -> None:
         self.reach("--eid-metrics", str(self.metrics_path))
         out = run_state("appendix", "--dir", str(self.state_dir))
-        self.assertIn("reach the timeline", out.stdout)
+        self.assertIn("no rule ever matched", out.stdout)
 
     def test_g12_present_and_passing_on_a_clean_investigation(self) -> None:
         g12 = self.gate("G12")

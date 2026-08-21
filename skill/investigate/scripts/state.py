@@ -116,7 +116,7 @@ ABSENCE_CLAIM_RE = re.compile(
     r"|no (?:trace|traces|sign|signs|indication|record|records) of"
     r"|(?:not|never) (?:observed|detected|recorded) in the (?:log|logs|evtx|data|dataset)"
     r"|nothing in the (?:log|logs|evtx|data|dataset)"
-    r"|absent from the (?:log|logs|evtx|timeline|data|dataset)"
+    r"|absent from the (?:log|logs|evtx|data|dataset)"
     r"|left no (?:trace|traces|evidence)"
     r"|痕跡(?:は|が)(?:ない|無い|見つから|残っ(?:ていない|ておらず))"
     r"|証拠(?:は|が)(?:ない|無い|見つから)"
@@ -1905,6 +1905,18 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         )
     gate("G8", "finding-cited rules triaged", not g8_gaps, g8_detail, g8_gaps)
 
+    # Search-backs may be linked to a finding (reach --ioc ... --finding fN). The
+    # hosts they found in the RAW evtx are real evidence that by definition cannot
+    # appear in the timeline, so G9 accepts them alongside timeline-derived hosts —
+    # otherwise reconciling a search-back (Step 5.8) would be blocked by G9.
+    reach = _load_reachability(state_dir)
+    searchbacks = reach.get("searchbacks") or []
+    searchback_hosts: dict = {}
+    for _b in searchbacks:
+        fid = str(_b.get("finding") or "").strip()
+        if fid:
+            searchback_hosts.setdefault(fid, set()).update(_b.get("raw_hosts") or [])
+
     # G9: every host a finding names is backed by at least one cited event on
     # that host. Prevents narrative host attribution the evidence rows do not
     # support (e.g. citing HOST-A events for a claim about HOST-B). Uses the
@@ -1915,7 +1927,8 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         g9_gaps = []
         total_host_claims = 0
         for finding in findings["findings"]:
-            evidence_computers = finding_evidence_computers.get(finding["id"], set())
+            evidence_computers = set(finding_evidence_computers.get(finding["id"], set()))
+            evidence_computers |= searchback_hosts.get(finding["id"], set())
             uncited = (not finding_refs[finding["id"]]
                        and finding.get("refs_unavailable") is True)
             if uncited:
@@ -1930,7 +1943,9 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
                 if host not in evidence_computers:
                     hint = (" — the finding's rules did not fire on that host"
                             if uncited else
-                            " — add a ref to an event on that host")
+                            " — add a ref to an event on that host, or link a raw-evtx"
+                            " search-back that found it (reach --ioc ... --finding"
+                            f" {finding['id']})")
                     g9_gaps.append(
                         f"finding {finding['id']} ({finding['title']}): host {host} is not"
                         " backed by any cited event" + hint
@@ -2076,16 +2091,23 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     #   (b) a recorded search-back that found MORE in the raw corpus than the
     #       timeline holds must be reconciled into the findings before the
     #       report renders — that gap is where missed hosts and missed C2 live.
-    reach = _load_reachability(state_dir)
-    searchbacks = reach.get("searchbacks") or []
+    # An absence claim is only covered when a search-back exists for the artifact
+    # THAT claim names. Accepting any non-empty search-back list would let one
+    # unrelated IOC lookup license every absence claim in the investigation.
+    searched_iocs = [b["ioc"] for b in searchbacks if b.get("ioc")]
+
+    def _uncovered_absence(text: str) -> bool:
+        if not ABSENCE_CLAIM_RE.search(text or ""):
+            return False
+        lowered = (text or "").lower()
+        return not any(ioc.lower() in lowered for ioc in searched_iocs)
+
     absence_claims = []
     for rule in triage["rules"]:
-        text = rule.get("rationale") or ""
-        if ABSENCE_CLAIM_RE.search(text):
+        if _uncovered_absence(rule.get("rationale") or ""):
             absence_claims.append(f"rule '{rule['rule_title']}' rationale claims absence")
     for finding in findings["findings"]:
-        text = finding.get("summary") or ""
-        if ABSENCE_CLAIM_RE.search(text):
+        if _uncovered_absence(finding.get("summary") or ""):
             absence_claims.append(
                 f"finding {finding['id']} ({finding['title']}) summary claims absence"
             )
@@ -2099,18 +2121,19 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
     ]
     g12_gaps = list(unreconciled)
     corpus = reach.get("corpus")
-    if absence_claims and not searchbacks and not reach.get("declared_unavailable"):
+    if absence_claims and not reach.get("declared_unavailable"):
         g12_gaps.extend(
-            claim + " but no evtx search-back was recorded (run: reach --ioc ...,"
-            " or reach --none --reason ... if the corpus is unavailable)"
+            claim + " without a search-back naming the artifact asserted absent"
+            " — name it in the text and record `reach --ioc <artifact> ...`,"
+            " or `reach --none --reason ...` if the evtx corpus is unavailable"
             for claim in absence_claims
         )
     bits = []
     if corpus:
         bits.append(
-            f"{corpus['coverage_pct']}% of {corpus['corpus_events']:,} evtx events reach"
-            f" the timeline; {corpus['uncovered_pairs']:,} (channel, event id) pair(s)"
-            " never matched any rule"
+            f"{corpus['unreachable_pct']}% of {corpus['corpus_events']:,} evtx events are"
+            f" of a type no rule ever matched ({corpus['uncovered_pairs']:,} of"
+            f" {corpus['corpus_pairs']:,} (channel, event id) pair(s))"
         )
     else:
         bits.append("no corpus coverage recorded")
@@ -2274,7 +2297,7 @@ def cmd_reach(args) -> None:
                   f" across {corpus['corpus_pairs']:,} (channel, event id) pairs")
             print(f"  timeline     : {corpus['timeline_rows']:,} rows"
                   f" across {corpus['timeline_pairs']:,} pairs")
-            print(f"  reachable    : {corpus['coverage_pct']}% of corpus events")
+            print(f"  unreachable  : {corpus['unreachable_pct']}% of corpus events")
             uncovered = corpus.get("uncovered") or []
             print(f"  no rule ever fired on {corpus['uncovered_pairs']:,} pair(s)"
                   f" = {corpus['uncovered_events']:,} events")
@@ -2288,7 +2311,8 @@ def cmd_reach(args) -> None:
         if backs:
             print(f"\nIOC search-backs ({len(backs)}):")
             for b in backs:
-                flag = "OK " if b.get("reconciled") else "GAP"
+                open_gap = b["raw_hits"] > b["timeline_hits"] and not b.get("reconciled")
+                flag = "GAP" if open_gap else "OK "
                 print(f"  [{flag}] {b['ioc']}: raw={b['raw_hits']} timeline={b['timeline_hits']}"
                       f" raw_hosts={len(b.get('raw_hosts') or [])}")
         else:
@@ -2313,7 +2337,11 @@ def cmd_reach(args) -> None:
         ]
         uncovered.sort(key=lambda e: -e["events"])
         uncovered_events = sum(e["events"] for e in uncovered)
-        coverage = round(100.0 * timeline_rows / corpus_events, 2) if corpus_events else 0.0
+        # Exact and dedup-free: every corpus event of an uncovered (channel,
+        # event id) pair is unreachable by construction. Deliberately NOT
+        # timeline_rows/corpus_events -- Hayabusa emits one row per
+        # (event x matching rule), so that ratio double-counts and can exceed 100%.
+        unreachable_pct = round(100.0 * uncovered_events / corpus_events, 2) if corpus_events else 0.0
         reach["corpus"] = {
             "source": "hayabusa eid-metrics",
             "source_path": os.path.abspath(args.eid_metrics),
@@ -2321,7 +2349,7 @@ def cmd_reach(args) -> None:
             "corpus_pairs": len(corpus_pairs),
             "timeline_rows": timeline_rows,
             "timeline_pairs": len(timeline_pairs),
-            "coverage_pct": coverage,
+            "unreachable_pct": unreachable_pct,
             "uncovered_pairs": len(uncovered),
             "uncovered_events": uncovered_events,
             # Bounded: the tail is a long list of one-off pairs, and the top
@@ -2329,11 +2357,20 @@ def cmd_reach(args) -> None:
             "uncovered": uncovered[:200],
             "recorded_at": _now(),
         }
+        # Real corpus evidence supersedes an earlier "unavailable" declaration:
+        # leaving it set would hide this measurement in the appendix and let G12
+        # keep honouring a stale claim.
+        if reach.get("declared_unavailable"):
+            reach["declared_unavailable"] = False
+            reach["unavailable_reason"] = ""
+            print("note: cleared the earlier 'evtx corpus unavailable' declaration")
         _save(args.dir, REACHABILITY, reach)
-        print(f"recorded corpus coverage: {coverage}% of {corpus_events:,} evtx events"
-              f" reach the timeline")
+        print(f"recorded corpus coverage: {unreachable_pct}% of {corpus_events:,} evtx"
+              f" events are of a type no rule ever matched")
         print(f"  {len(uncovered):,} of {len(corpus_pairs):,} (channel, event id) pairs"
               f" never matched any rule = {uncovered_events:,} events")
+        print(f"  timeline holds {timeline_rows:,} rule-match rows"
+              f" across {len(timeline_pairs):,} pair(s)")
         if uncovered:
             print("  largest unreachable pairs:")
             for entry in uncovered[:5]:
@@ -2349,6 +2386,7 @@ def cmd_reach(args) -> None:
             "raw_hits": args.raw_hits,
             "raw_hosts": args.raw_hosts,
             "timeline_hits": args.timeline_hits,
+            "finding": args.finding,
             "tool": args.tool,
             "note": args.note,
             "reconciled": args.reconciled,
@@ -2364,18 +2402,44 @@ def cmd_reach(args) -> None:
         raw_hosts = entry.get("raw_hosts") or []
         if isinstance(raw_hosts, str):
             raw_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+        # Reconciliation closes a gap the gate would otherwise hold open, so it
+        # must be an actual JSON boolean: bool("false") is True, and a batch
+        # entry must not be able to clear a gap by writing the string "false".
+        reconciled = entry.get("reconciled", False)
+        if reconciled is None:
+            reconciled = False
+        if not isinstance(reconciled, bool):
+            _fail(
+                f"search-back for {ioc}: 'reconciled' must be a JSON boolean"
+                f" (got {type(reconciled).__name__} {reconciled!r})"
+            )
+        note = str(entry.get("note") or "").strip()
+        gap = int(entry["raw_hits"]) - int(entry.get("timeline_hits") or 0)
+        # Closing a positive gap is a claim that the findings were updated; make
+        # it say what changed, so the audit trail is not just a boolean.
+        if reconciled and gap > 0 and not note:
+            _fail(
+                f"search-back for {ioc}: reconciling a positive gap"
+                f" ({entry['raw_hits']} raw vs {entry.get('timeline_hits') or 0} timeline)"
+                " requires a note describing what the findings now reflect"
+            )
         reach["searchbacks"] = [b for b in reach.get("searchbacks", []) if b.get("ioc") != ioc]
         reach["searchbacks"].append({
             "ioc": ioc,
             "raw_hits": int(entry["raw_hits"]),
             "raw_hosts": sorted(set(raw_hosts)),
             "timeline_hits": int(entry.get("timeline_hits") or 0),
+            "finding": str(entry.get("finding") or "").strip(),
             "tool": str(entry.get("tool") or "").strip(),
-            "note": str(entry.get("note") or "").strip(),
-            "reconciled": bool(entry.get("reconciled")),
+            "note": note,
+            "reconciled": reconciled,
             "recorded_at": _now(),
         })
         recorded += 1
+    if reach.get("declared_unavailable"):
+        reach["declared_unavailable"] = False
+        reach["unavailable_reason"] = ""
+        print("note: cleared the earlier 'evtx corpus unavailable' declaration")
     _save(args.dir, REACHABILITY, reach)
     print(f"recorded {recorded} IOC search-back(s)")
     for b in reach["searchbacks"][-recorded:]:
@@ -2446,7 +2510,7 @@ APPENDIX_LABELS = {
         "reach": "Evtx reachability",
         "reach_missing": "not measured — the timeline holds only rule matches, so absence of an event here does not mean absence in the evtx",
         "reach_unavailable": "original evtx corpus unavailable ({reason}) — absence claims are timeline-only",
-        "reach_coverage": "{pct}% of {events} evtx events reach the timeline; {pairs} (channel, event id) pair(s) matched no rule",
+        "reach_coverage": "{pct}% of {events} evtx events are of a type no rule ever matched ({pairs} (channel, event id) pair(s))",
         "reach_searchbacks": "{n} IOC search-back(s) against the original evtx",
     },
     "ja": {
@@ -2470,7 +2534,7 @@ APPENDIX_LABELS = {
         "reach": "Evtx 到達性",
         "reach_missing": "未計測 — タイムラインにはルール一致イベントのみが含まれるため、ここに無いことは evtx に無いことを意味しません",
         "reach_unavailable": "元の evtx コーパスが利用不可 ({reason}) — 不在の主張はタイムライン範囲に限られます",
-        "reach_coverage": "evtx {events} 件のうち {pct}% がタイムラインに到達。{pairs} 個の (チャネル, イベントID) はどのルールにも一致していません",
+        "reach_coverage": "evtx {events} 件のうち {pct}% はどのルールも一致しない種別のイベント（{pairs} 個の (チャネル, イベントID)）",
         "reach_searchbacks": "元の evtx に対する IOC 再検索: {n} 件",
     },
 }
@@ -2563,7 +2627,7 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
         corpus = reach.get("corpus")
         if corpus:
             parts.append(labels["reach_coverage"].format(
-                pct=corpus["coverage_pct"],
+                pct=corpus["unreachable_pct"],
                 events=f"{corpus['corpus_events']:,}",
                 pairs=f"{corpus['uncovered_pairs']:,}"))
         backs = reach.get("searchbacks") or []
@@ -2718,6 +2782,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--raw-hits", type=int, help="hits for --ioc in the ORIGINAL evtx")
     p.add_argument("--raw-hosts", help="comma-separated hosts the raw hits landed on")
     p.add_argument("--timeline-hits", type=int, default=0, help="hits for --ioc in the timeline CSV")
+    p.add_argument("--finding", help="finding id this search-back belongs to (its raw hosts then satisfy G9)")
     p.add_argument("--tool", help="command used (e.g. 'hayabusa search -d ... -k ...')")
     p.add_argument("--note", help="what the reconciliation changed")
     p.add_argument("--reconciled", action="store_true",

@@ -406,7 +406,7 @@ hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
 ```
 
-コーパスのイベントのうち何%がタイムラインに到達しているか、そしてどの `(チャネル, イベントID)` がどのルールにも一致しなかったかが記録される。これがこのデータセットの盲点であり、結論を書く前に上位の項目を必ず確認すること。
+コーパスのイベントのうち何%が**どのルールにも一致しない種別**であるか、そしてそれがどの `(チャネル, イベントID)` かが記録される。これがこのデータセットの盲点であり、結論を書く前に上位の項目を必ず確認すること。
 
 **判明した IOC は生の evtx に対して再検索する。** finding と `iocs.json` が揃ったら、主要な IOC を CSV だけでなく元の evtx でも探す:
 
@@ -414,10 +414,12 @@ python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-
 hayabusa search -d /path/to/evtx -i -k "<ioc>" -o "$STATE_DIR/work/searchback.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
     --raw-hits 504 --timeline-hits 1 --raw-hosts "HOST-A,HOST-B,HOST-C" \
-    --tool "hayabusa search -d ... -k <ioc>"
+    --finding f7 --tool "hayabusa search -d ... -k <ioc>"
 ```
 
-**生のヒット数がタイムラインのヒット数を上回る場合、その finding は不完全である** — 差分こそが見落とされたホストや C2 が潜む場所である。まず該当 finding を更新し、その後で同じ IOC を `--reconciled` と変更内容を書いた `--note` 付きで再登録する。未解消の差分があると G12 は FAIL する。
+**再検索でタイムラインに存在しないホストが見つかった場合は `--finding` を指定する。** それらのホストには引用できるタイムライン行が存在しないため、そのまま finding の `hosts` に追加すると **G9** が FAIL する。再検索を finding に紐付けることで、その生ホストが当該主張の裏付けとして認められる（生の evtx の証拠も証拠である）。
+
+**生のヒット数がタイムラインのヒット数を上回る場合、その finding は不完全である** — 差分こそが見落とされたホストや C2 が潜む場所である。まず該当 finding を更新し、その後で同じ IOC を `--reconciled` と変更内容を書いた `--note` 付きで再登録する。**差分がプラスの場合 `--note` は必須**であり、真偽値だけでなく finding に何が反映されたかが監査証跡として残る。未解消の差分があると G12 は FAIL する。
 
 **元の evtx を参照できない場合**は、CSV が完全であるかのように黙って推論せず、明示的に宣言する:
 
@@ -425,7 +427,9 @@ python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "CSVのみ提供された"
 ```
 
-**不在を断定する表現はゲート対象。** トリアージの rationale や finding の summary に「痕跡はない」「証拠がない」「確認されなかった」「ログに記録されていない」（および英語の "no evidence of" 等）が含まれる場合、再検索の記録もコーパス不可の宣言も無ければ **G12 が FAIL** する。どちらも無い場合の正確な表現は「どのルールにも一致しなかった」であり、これが CSV から実際に言えることである。
+**不在を断定する表現はゲート対象。** トリアージの rationale や finding の summary に「痕跡はない」「証拠がない」「確認されなかった」「ログに記録されていない」（および英語の "no evidence of" 等）が含まれる場合、コーパス不可の宣言が無く、かつ**その主張が名指ししている対象に対する再検索**が無ければ **G12 が FAIL** する。対象を本文中に明記し（例:「evil.example.com への通信の痕跡はない」）、`reach --ioc evil.example.com ...` を記録すること。無関係な IOC を1件検索しただけで調査中のあらゆる不在主張が許可されるわけではない。
+
+なお**「タイムラインに存在しない」という表現はゲート対象外**である。これは CSV だけから言える弱い（そして正確な）主張であり、evtx まで遡っていない段階ではこの表現を使うこと。同義の正確な表現は「どのルールにも一致しなかった」である。
 
 ### Step 6: 可視化グラフ生成
 
