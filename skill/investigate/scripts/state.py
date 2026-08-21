@@ -108,6 +108,14 @@ VARIANT_KEY_DIVERSITY_CAP = 3
 # the float conversion in the percentage.
 MAX_EVENT_COUNT = 2 ** 53
 
+# Hayabusa joins aggregated values with " ¦ " by default, with CRLF under -M
+# (multiline) and TAB under -S (tab-separated).
+_MULTIVALUE_SPLIT_RE = re.compile(r" ¦ |\r\n|\n|\t")
+
+# eid-metrics Totals are plain positive decimals. Accepting anything else meant
+# a quoted "1,2" was silently read as 12.
+_POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*")
+
 # Hayabusa detail-field separator (" ¦ ", broken bar U+00A6).
 DETAILS_SEPARATOR = " ¦ "
 
@@ -2117,21 +2125,30 @@ def _load_reachability(state_dir: str) -> dict:
     })
 
 
-def _scan_timeline_pairs(csv_path: str) -> tuple[set, int]:
-    """Return the (Channel, EventID) pairs present in the timeline CSV and the
-    count, and the number of correlation rows skipped. The timeline is the
-    rule-match projection of the evtx corpus;
-    comparing its pairs against `hayabusa eid-metrics` output over the ORIGINAL
-    evtx shows how much of the corpus no rule can ever surface."""
+def _scan_timeline_pairs(csv_path: str) -> tuple[set, list, int, int]:
+    """Extract the (Channel, EventID) pairs a timeline attests to.
+
+    Returns (definite pairs, ambiguous groups, row count, aggregate rows).
+
+    Correlation/count rules emit ONE derived row covering many events, with
+    every constituent Channel and EventID deduplicated and joined (" ¦ ", or
+    CRLF/TAB under -M/-S). Because those two lists are built independently,
+    a row with several of each does not say which id belongs to which channel.
+    But a row with ONE channel and several ids -- or one id and several
+    channels -- is unambiguous, and dropping it invents blind spots: Hayabusa
+    correlation references default to `generate: false`, so the aggregate can
+    be the only detection emitted for those events.
+
+    Genuinely ambiguous groups are returned for the caller to resolve against
+    the corpus, rather than guessed at here.
+    """
     pairs: set = set()
+    ambiguous: list = []
     rows = 0
-    aggregated = 0
+    aggregate_rows = 0
     try:
-        with open(csv_path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+        with open(csv_path, newline="", encoding="utf-8-sig", errors="strict") as fh:
             reader = csv.DictReader(fh)
-            # Without these columns every pair looks absent and the import would
-            # record 100% of the corpus as unreachable. An incompatible CSV is
-            # an error, not an empty detection set.
             missing = sorted({"Channel", "EventID"} - set(reader.fieldnames or []))
             if missing:
                 _fail(
@@ -2140,77 +2157,99 @@ def _scan_timeline_pairs(csv_path: str) -> tuple[set, int]:
                 )
             for row in reader:
                 rows += 1
-                channel = (row.get("Channel") or "").strip()
-                event_id = (row.get("EventID") or "").strip()
-                # Correlation/count rules emit ONE derived row summarising many
-                # events: Channel and EventID hold every constituent value,
-                # deduplicated and joined with DETAILS_SEPARATOR, and EventID is
-                # "-" when there is no single id. Those lists are built
-                # independently, so their positions are unrelated and no real
-                # pair can be recovered from them -- pairing them up would
-                # invent pairs (Sec/7045) that never occurred. eid-metrics
-                # carries one row per real (channel, id) and can never hold the
-                # joined form, so these rows are skipped: the underlying events
-                # are counted on the corpus side regardless.
-                if (DETAILS_SEPARATOR in channel or DETAILS_SEPARATOR in event_id
-                        or event_id in ("", "-")):
-                    aggregated += 1
+                where = f"{csv_path}:{reader.line_num}"
+                raw_channel = (row.get("Channel") or "").strip()
+                raw_id = (row.get("EventID") or "").strip()
+                channels = [c.strip().casefold()
+                            for c in _MULTIVALUE_SPLIT_RE.split(raw_channel) if c.strip()]
+                ids = [i.strip() for i in _MULTIVALUE_SPLIT_RE.split(raw_id)
+                       if i.strip() and i.strip() != "-"]
+                is_aggregate = (len(channels) > 1 or len(ids) > 1
+                                or raw_id == "-" or _MULTIVALUE_SPLIT_RE.search(raw_id))
+                if not is_aggregate:
+                    # A plain detection row must identify its event type. A
+                    # half-filled one would silently shift the measurement.
+                    if not channels or not ids:
+                        _fail(
+                            f"{where}: incomplete event identity"
+                            f" (Channel={raw_channel!r}, EventID={raw_id!r})"
+                        )
+                    pairs.add((channels[0], ids[0]))
                     continue
-                if channel:
-                    pairs.add((channel.casefold(), event_id))
-    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+                aggregate_rows += 1
+                if not channels or not ids:
+                    continue
+                if len(channels) == 1 or len(ids) == 1:
+                    for channel in channels:
+                        for event_id in ids:
+                            pairs.add((channel, event_id))
+                else:
+                    ambiguous.append((tuple(channels), tuple(ids)))
+    except UnicodeDecodeError as exc:
+        _fail(f"{csv_path} is not valid UTF-8: {exc}")
+    except (OSError, csv.Error) as exc:
         _fail(f"cannot read timeline CSV {csv_path}: {exc}")
-    return pairs, rows, aggregated
+    return pairs, ambiguous, rows, aggregate_rows
 
 
 def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
     """Parse `hayabusa eid-metrics` CSV output into {(channel, eid): events}.
 
-    Columns are Total,%,Channel,ID,Event. Channels are compared casefolded
-    because Hayabusa's own subcommands disagree on capitalisation, while the
-    original spelling is kept for display.
+    Validated against what the exporter actually emits rather than repaired:
+    the five-column header, one row per (Channel, ID), and a plain positive
+    decimal Total. Anything else means the file is not eid-metrics output, and
+    guessing at it would silently change the measurement -- a stray byte became
+    a channel name, and a quoted "1,2" became 12.
 
-    Every row is validated: a malformed row is evidence that the file is not
-    what it claims to be, so the import fails rather than skipping it.
+    Channels are compared casefolded because Hayabusa's own subcommands
+    disagree on capitalisation; the original spelling is kept for display.
     """
     corpus: dict = {}
     display: dict = {}
     total = 0
     try:
-        with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+        # Strict: errors="replace" turns corrupt bytes into U+FFFD and invents a
+        # channel, which then counts as a blind spot.
+        with open(path, newline="", encoding="utf-8-sig", errors="strict") as fh:
             reader = csv.DictReader(fh)
-            required = {"Total", "Channel", "ID"}
-            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            if reader.fieldnames != ["Total", "%", "Channel", "ID", "Event"]:
                 _fail(
                     f"{path} does not look like `hayabusa eid-metrics` output"
-                    " (expected columns: Total,%,Channel,ID,Event)"
+                    " (expected header: Total,%,Channel,ID,Event; got "
+                    + ",".join(reader.fieldnames or []) + ")"
                 )
             for row in reader:
                 where = f"{path}:{reader.line_num}"
-                raw_total = (row.get("Total") or "").replace(",", "").strip()
+                raw_total = (row.get("Total") or "").strip()
                 raw_channel = (row.get("Channel") or "").strip()
                 event_id = (row.get("ID") or "").strip()
-                try:
-                    count = int(raw_total)
-                except ValueError:
-                    _fail(f"{where}: Total must be an integer (got {raw_total!r})")
-                if count < 0:
-                    _fail(f"{where}: Total must be >= 0 (got {count})")
+                if not _POSITIVE_INT_RE.fullmatch(raw_total):
+                    _fail(
+                        f"{where}: Total must be a positive decimal integer"
+                        f" (got {raw_total!r})"
+                    )
+                count = int(raw_total)
                 if count > MAX_EVENT_COUNT:
                     _fail(f"{where}: Total {count} exceeds the plausible maximum"
                           f" ({MAX_EVENT_COUNT:,}) — this is not an event count")
                 if not raw_channel or not event_id:
                     _fail(f"{where}: Channel and ID must both be non-empty")
                 key = (raw_channel.casefold(), event_id)
-                corpus[key] = corpus.get(key, 0) + count
-                display.setdefault(key, raw_channel)
+                if key in corpus:
+                    _fail(
+                        f"{where}: duplicate (Channel, ID) {raw_channel}/{event_id}"
+                        " — eid-metrics emits one row per pair, so this file has"
+                        " been edited or merged"
+                    )
+                corpus[key] = count
+                display[key] = raw_channel
                 total += count
-    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+    except UnicodeDecodeError as exc:
+        _fail(f"{path} is not valid UTF-8: {exc}")
+    except (OSError, csv.Error) as exc:
         _fail(f"cannot read eid-metrics CSV {path}: {exc}")
     if not corpus:
         _fail(f"{path} has no data rows")
-    if total <= 0:
-        _fail(f"{path} totals {total} events — nothing to compare against")
     return corpus, total, display
 
 
@@ -2295,14 +2334,34 @@ def cmd_reach(args) -> None:
                 " investigation records. Re-run init, or restore the original CSV."
             )
         corpus_pairs, corpus_events, corpus_display = _parse_eid_metrics(args.eid_metrics)
-        timeline_pairs, timeline_rows, aggregated_rows = _scan_timeline_pairs(csv_path)
+        timeline_pairs, ambiguous, timeline_rows, aggregate_rows = _scan_timeline_pairs(csv_path)
         # Columns can be present and still carry nothing usable; comparing
         # against an empty pair set would record the whole corpus as absent.
-        if timeline_rows and not timeline_pairs:
+        if timeline_rows > aggregate_rows and not timeline_pairs:
             _fail(
-                f"{csv_path} has {timeline_rows:,} row(s) but no usable"
-                " (channel, event id) pair — the columns are present but empty"
+                f"{csv_path} has {timeline_rows - aggregate_rows:,} plain detection"
+                " row(s) but no usable (channel, event id) pair — the columns are"
+                " present but empty"
             )
+        # A multi-channel AND multi-id aggregate row does not say which id
+        # belongs to which channel. Where the corpus admits exactly one channel
+        # per id, the mapping is forced and can be recovered; where more than
+        # one remains possible, the group stays unresolved and is reported, so
+        # the percentage carries its uncertainty instead of hiding it.
+        unresolved_groups = 0
+        for channels, ids in ambiguous:
+            forced = {}
+            for event_id in ids:
+                candidates = [c for c in channels if (c, event_id) in corpus_pairs]
+                if len(candidates) != 1:
+                    forced = None
+                    break
+                forced[event_id] = candidates[0]
+            if forced:
+                timeline_pairs |= {(c, i) for i, c in forced.items()}
+            else:
+                unresolved_groups += 1
+
         # `hayabusa eid-metrics` writes abbreviated channels ("Sec"); a timeline
         # generated with -b/--disable-abbreviations writes full names
         # ("Security"). Comparing those two representations makes every pair look
@@ -2360,6 +2419,8 @@ def cmd_reach(args) -> None:
             "source": "hayabusa eid-metrics",
             "source_path": os.path.abspath(args.eid_metrics),
             "timeline_sha256": timeline_sha,
+            "aggregate_rows": aggregate_rows,
+            "unresolved_aggregate_groups": unresolved_groups,
             "corpus_events": corpus_events,
             "corpus_pairs": len(corpus_pairs),
             "timeline_rows": timeline_rows,
@@ -2388,9 +2449,13 @@ def cmd_reach(args) -> None:
               " these were excluded by that filter rather than by rule coverage")
         print(f"  timeline holds {timeline_rows:,} rule-match rows"
               f" across {len(timeline_pairs):,} pair(s)")
-        if aggregated_rows:
-            print(f"  {aggregated_rows:,} correlation row(s) skipped — they summarise"
-                  " many events and carry no single (channel, event id)")
+        if aggregate_rows:
+            print(f"  {aggregate_rows:,} correlation row(s) covered many events each;"
+                  f" {unresolved_groups:,} could not be mapped to a single"
+                  " (channel, event id)")
+        if unresolved_groups:
+            print("  those unresolved group(s) may make the absent count an"
+                  " OVER-estimate — their event types cannot be attributed")
         if uncovered:
             print("  largest unreachable pairs:")
             for entry in uncovered[:5]:
@@ -2462,7 +2527,7 @@ APPENDIX_LABELS = {
         "reach_missing": "not measured — the timeline holds only rule matches, so absence of an event here does not mean absence in the evtx",
         "reach_unavailable": "original evtx corpus unavailable ({reason}) — absence claims are timeline-only",
         "reach_coverage": "{pct}% of {events} evtx events are of a (channel, event id) absent from the supplied timeline ({pairs} pair(s)); a filtered timeline understates coverage",
-        "reach_searchbacks": "{n} IOC search-back(s) against the original evtx",
+        "reach_ambiguous": "{n} correlation row(s) could not be attributed to a single (channel, event id), so the absent count may be an over-estimate",
     },
     "ja": {
         "title": "## 付録: カバレッジと再現性",
@@ -2486,7 +2551,7 @@ APPENDIX_LABELS = {
         "reach_missing": "未計測 — タイムラインにはルール一致イベントのみが含まれるため、ここに無いことは evtx に無いことを意味しません",
         "reach_unavailable": "元の evtx コーパスが利用不可 ({reason}) — 不在の主張はタイムライン範囲に限られます",
         "reach_coverage": "evtx {events} 件のうち {pct}% は、提供されたタイムラインに存在しない (チャネル, イベントID) のイベント（{pairs} 個）。絞り込まれたタイムラインではカバレッジを過小評価する",
-        "reach_searchbacks": "元の evtx に対する IOC 再検索: {n} 件",
+        "reach_ambiguous": "{n} 件の相関行を単一の (チャネル, イベントID) に帰属できなかったため、存在しない件数は過大評価の可能性がある",
     },
 }
 
@@ -2568,7 +2633,7 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
     lines += ["", f"- **{labels['environment']}**: {env_line}"]
 
     reach = _load_optional(state_dir, REACHABILITY, None)
-    if not isinstance(reach, dict) or not (reach.get("corpus") or reach.get("searchbacks")
+    if not isinstance(reach, dict) or not (reach.get("corpus")
                                            or reach.get("declared_unavailable")):
         reach_line = labels["reach_missing"]
     elif reach.get("declared_unavailable"):
@@ -2581,9 +2646,9 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
                 pct=corpus["unreachable_pct"],
                 events=f"{corpus['corpus_events']:,}",
                 pairs=f"{corpus['uncovered_pairs']:,}"))
-        backs = reach.get("searchbacks") or []
-        if backs:
-            parts.append(labels["reach_searchbacks"].format(n=len(backs)))
+        unresolved = (corpus or {}).get("unresolved_aggregate_groups") or 0
+        if unresolved:
+            parts.append(labels["reach_ambiguous"].format(n=unresolved))
         reach_line = "; ".join(parts) or labels["reach_missing"]
     lines += [f"- **{labels['reach']}**: {reach_line}"]
 

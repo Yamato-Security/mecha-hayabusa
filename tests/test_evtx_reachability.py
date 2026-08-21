@@ -109,6 +109,79 @@ class ReachabilityTests(unittest.TestCase):
         self.assertIn("MS-Win-Shell-Core/Op",
                       [e["channel"] for e in corpus["uncovered"]])
 
+    def make_timeline(self, name: str, rows: list[list[str]]) -> pathlib.Path:
+        path = self.state_dir.parent / name
+        with path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADER)
+            w.writerows(rows)
+        return path
+
+    def measure(self, timeline: pathlib.Path, metrics: pathlib.Path, tag: str):
+        state = self.state_dir.parent / f"st_{tag}"
+        self.assertEqual(run_state("init", "--csv", str(timeline), "--dir", str(state)).returncode, 0)
+        r = run_state("reach", "--dir", str(state), "--eid-metrics", str(metrics))
+        return r, state
+
+    def test_forced_aggregate_mapping_is_recovered(self) -> None:
+        # Two channels and two ids, but the corpus admits only one mapping, so
+        # the row's pairs are determined and must not count as blind spots.
+        tl = self.make_timeline("forced.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec ¦ Sys", "4624 ¦ 7045", "", "Count:9"]])
+        m = self.write_metrics("forced_m.csv", [["1", "50", "Sec", "4624", "a"],
+                                                ["1", "50", "Sys", "7045", "b"]])
+        r, state = self.measure(tl, m, "forced")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 0)
+        self.assertEqual(corpus["unresolved_aggregate_groups"], 0)
+
+    def test_ambiguous_aggregate_is_reported_not_guessed(self) -> None:
+        # The corpus admits both mappings, so the row cannot be attributed. The
+        # count may over-estimate, and that must be said rather than hidden.
+        tl = self.make_timeline("amb.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec ¦ Sys", "4624 ¦ 7045", "", "Count:9"]])
+        m = self.write_metrics("amb_m.csv", [["1", "25", "Sec", "4624", "a"],
+                                             ["1", "25", "Sec", "7045", "b"],
+                                             ["1", "25", "Sys", "4624", "c"],
+                                             ["1", "25", "Sys", "7045", "d"]])
+        r, state = self.measure(tl, m, "amb")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("OVER-estimate", r.stdout)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["unresolved_aggregate_groups"], 1)
+        out = run_state("appendix", "--dir", str(state))
+        self.assertIn("over-estimate", out.stdout)
+
+    def test_tab_separated_aggregate_values_are_understood(self) -> None:
+        # hayabusa -S joins aggregated values with TAB instead of " ¦ ".
+        tl = self.make_timeline("tabbed.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec", "4688\t4624", "", "Count:9"]])
+        r, state = self.measure(tl, self.metrics_path, "tabbed")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 2)  # only Sys/1014 and Shell-Core
+
+    def test_duplicate_metrics_pairs_are_refused(self) -> None:
+        m = self.write_metrics("dupe.csv", [["1", "50", "Sec", "4688", "a"],
+                                            ["1", "50", "SEC", "4688", "b"]])
+        r = self.reach("--eid-metrics", str(m))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("duplicate", r.stderr + r.stdout)
+
+    def test_non_utf8_metrics_are_refused(self) -> None:
+        m = self.state_dir.parent / "latin.csv"
+        m.write_bytes(b"Total,%,Channel,ID,Event\n1,100,Bad\xffChan,9999,x\n")
+        r = self.reach("--eid-metrics", str(m))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not valid UTF-8", r.stderr + r.stdout)
+
+    def test_quoted_decimal_comma_total_is_refused(self) -> None:
+        m = self.write_metrics("comma.csv", [["1,2", "100", "Sec", "4688", "a"]])
+        r = self.reach("--eid-metrics", str(m))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("positive decimal integer", r.stderr + r.stdout)
+
     # -- guards ----------------------------------------------------------
 
     def test_a_timeline_csv_is_not_accepted_as_metrics(self) -> None:
@@ -182,7 +255,7 @@ class ReachabilityTests(unittest.TestCase):
         out = self.reach("--list")
         self.assertIn("240 more", out.stdout)
 
-    def test_correlation_rows_are_skipped_not_cross_producted(self) -> None:
+    def test_unambiguous_correlation_rows_are_recovered(self) -> None:
         # A hayabusa count rule emits one derived row whose Channel and EventID
         # hold every constituent joined by " ¦ ". Those lists are built
         # independently, so pairing them up would invent pairs that never
@@ -195,12 +268,18 @@ class ReachabilityTests(unittest.TestCase):
             w.writerow(["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "HOST-A",
                         "Sec", "4688", "1", "x"])
             w.writerow(["2024-01-01 00:01:00.000 +00:00", "Corr", "high", "HOST-A ¦ HOST-B",
-                        "Sec ¦ Sys", "4624 ¦ 1014", "", "Count:12"])
+                        "Sec", "4688 ¦ 4624", "", "Count:12"])
         state2 = self.state_dir.parent / "agg_state"
         self.assertEqual(run_state("init", "--csv", str(agg), "--dir", str(state2)).returncode, 0)
         r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("1 correlation row(s) skipped", r.stdout)
+        # One channel with several ids is unambiguous: both pairs belong to Sec.
+        # Dropping the row would invent blind spots, since correlation
+        # references default to generate:false and the aggregate may be the
+        # only detection emitted for those events.
+        self.assertIn("1 correlation row(s)", r.stdout)
+        corpus = json.loads((state2 / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["unresolved_aggregate_groups"], 0)
 
     def test_reason_may_not_forge_appendix_content(self) -> None:
         # --reason is rendered verbatim into the appendix; a newline would let
@@ -218,7 +297,7 @@ class ReachabilityTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("sha256 mismatch", r.stderr + r.stdout)
 
-    def test_rows_without_usable_pairs_are_refused(self) -> None:
+    def test_incomplete_event_identity_is_refused(self) -> None:
         blank = self.state_dir.parent / "blank.csv"
         with blank.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -228,7 +307,7 @@ class ReachabilityTests(unittest.TestCase):
         self.assertEqual(run_state("init", "--csv", str(blank), "--dir", str(state2)).returncode, 0)
         r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("no usable", r.stderr + r.stdout)
+        self.assertIn("incomplete event identity", r.stderr + r.stdout)
 
     def test_implausible_totals_are_refused(self) -> None:
         metrics = self.write_metrics("huge.csv", [["1" + "0" * 400, "0", "Sec", "9999", "x"]])
