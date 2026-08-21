@@ -103,6 +103,11 @@ VARIANT_PROBE_FIELDS = (
 # behaviors that were never individually judged.
 VARIANT_KEY_DIVERSITY_CAP = 3
 
+# Upper bound for a plausible per-(channel, event id) event count. Python ints
+# are unbounded, and a hand-edited metrics file with a 400-digit Total overflows
+# the float conversion in the percentage.
+MAX_EVENT_COUNT = 2 ** 53
+
 # Hayabusa detail-field separator (" ¦ ", broken bar U+00A6).
 DETAILS_SEPARATOR = " ¦ "
 
@@ -2114,52 +2119,98 @@ def _load_reachability(state_dir: str) -> dict:
 
 def _scan_timeline_pairs(csv_path: str) -> tuple[set, int]:
     """Return the (Channel, EventID) pairs present in the timeline CSV and the
-    row count. The timeline is the rule-match projection of the evtx corpus;
+    count, and the number of correlation rows skipped. The timeline is the
+    rule-match projection of the evtx corpus;
     comparing its pairs against `hayabusa eid-metrics` output over the ORIGINAL
     evtx shows how much of the corpus no rule can ever surface."""
     pairs: set = set()
     rows = 0
-    with open(csv_path, newline="", encoding="utf-8-sig", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            rows += 1
-            channel = (row.get("Channel") or "").strip().casefold()
-            event_id = (row.get("EventID") or "").strip()
-            if channel or event_id:
-                pairs.add((channel, event_id))
-    return pairs, rows
+    aggregated = 0
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+            reader = csv.DictReader(fh)
+            # Without these columns every pair looks absent and the import would
+            # record 100% of the corpus as unreachable. An incompatible CSV is
+            # an error, not an empty detection set.
+            missing = sorted({"Channel", "EventID"} - set(reader.fieldnames or []))
+            if missing:
+                _fail(
+                    f"{csv_path} is missing timeline column(s) needed to compare"
+                    f" coverage: {', '.join(missing)}"
+                )
+            for row in reader:
+                rows += 1
+                channel = (row.get("Channel") or "").strip()
+                event_id = (row.get("EventID") or "").strip()
+                # Correlation/count rules emit ONE derived row summarising many
+                # events: Channel and EventID hold every constituent value,
+                # deduplicated and joined with DETAILS_SEPARATOR, and EventID is
+                # "-" when there is no single id. Those lists are built
+                # independently, so their positions are unrelated and no real
+                # pair can be recovered from them -- pairing them up would
+                # invent pairs (Sec/7045) that never occurred. eid-metrics
+                # carries one row per real (channel, id) and can never hold the
+                # joined form, so these rows are skipped: the underlying events
+                # are counted on the corpus side regardless.
+                if (DETAILS_SEPARATOR in channel or DETAILS_SEPARATOR in event_id
+                        or event_id in ("", "-")):
+                    aggregated += 1
+                    continue
+                if channel:
+                    pairs.add((channel.casefold(), event_id))
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        _fail(f"cannot read timeline CSV {csv_path}: {exc}")
+    return pairs, rows, aggregated
 
 
 def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
     """Parse `hayabusa eid-metrics` CSV output into {(channel, eid): events}.
 
-    Columns are Total,%,Channel,ID,Event. Channel names are the same
-    abbreviations the timeline uses, so the two sides compare directly.
+    Columns are Total,%,Channel,ID,Event. Channels are compared casefolded
+    because Hayabusa's own subcommands disagree on capitalisation, while the
+    original spelling is kept for display.
+
+    Every row is validated: a malformed row is evidence that the file is not
+    what it claims to be, so the import fails rather than skipping it.
     """
     corpus: dict = {}
     display: dict = {}
     total = 0
-    with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        # Require the full eid-metrics signature: a Hayabusa TIMELINE csv also
-        # has a Channel column, and importing one as the corpus side would
-        # silently compare the timeline against itself (100% coverage, no gaps).
-        required = {"Total", "Channel", "ID"}
-        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-            _fail(
-                f"{path} does not look like `hayabusa eid-metrics` output"
-                " (expected columns: Total,%,Channel,ID,Event)"
-            )
-        for row in reader:
-            try:
-                count = int((row.get("Total") or "0").replace(",", "").strip())
-            except ValueError:
-                continue
-            raw_channel = (row.get("Channel") or "").strip()
-            key = (raw_channel.casefold(), (row.get("ID") or "").strip())
-            corpus[key] = corpus.get(key, 0) + count
-            display.setdefault(key, raw_channel)
-            total += count
+    try:
+        with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+            reader = csv.DictReader(fh)
+            required = {"Total", "Channel", "ID"}
+            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+                _fail(
+                    f"{path} does not look like `hayabusa eid-metrics` output"
+                    " (expected columns: Total,%,Channel,ID,Event)"
+                )
+            for row in reader:
+                where = f"{path}:{reader.line_num}"
+                raw_total = (row.get("Total") or "").replace(",", "").strip()
+                raw_channel = (row.get("Channel") or "").strip()
+                event_id = (row.get("ID") or "").strip()
+                try:
+                    count = int(raw_total)
+                except ValueError:
+                    _fail(f"{where}: Total must be an integer (got {raw_total!r})")
+                if count < 0:
+                    _fail(f"{where}: Total must be >= 0 (got {count})")
+                if count > MAX_EVENT_COUNT:
+                    _fail(f"{where}: Total {count} exceeds the plausible maximum"
+                          f" ({MAX_EVENT_COUNT:,}) — this is not an event count")
+                if not raw_channel or not event_id:
+                    _fail(f"{where}: Channel and ID must both be non-empty")
+                key = (raw_channel.casefold(), event_id)
+                corpus[key] = corpus.get(key, 0) + count
+                display.setdefault(key, raw_channel)
+                total += count
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        _fail(f"cannot read eid-metrics CSV {path}: {exc}")
+    if not corpus:
+        _fail(f"{path} has no data rows")
+    if total <= 0:
+        _fail(f"{path} totals {total} events — nothing to compare against")
     return corpus, total, display
 
 
@@ -2183,6 +2234,19 @@ def cmd_reach(args) -> None:
         reason = (args.reason or "").strip()
         if not reason:
             _fail("--none requires --reason (why the original evtx corpus is unavailable)")
+        if any(ord(ch) < 32 for ch in reason):
+            _fail(
+                "--reason must be a single line without control characters:"
+                " it is rendered verbatim into the report appendix, where a"
+                " newline would forge an additional bullet"
+            )
+        if reach.get("corpus"):
+            _fail(
+                "coverage has already been measured for this investigation"
+                f" (from {reach['corpus'].get('source_path')}); losing access to"
+                " the evtx afterwards does not invalidate that measurement."
+                " Keep the recorded result rather than replacing it."
+            )
         reach["declared_unavailable"] = True
         reach["unavailable_reason"] = reason
         reach["recorded_at"] = _now()
@@ -2205,8 +2269,8 @@ def cmd_reach(args) -> None:
                   f" = {corpus['uncovered_events']:,} events")
             for entry in uncovered[:10]:
                 print(f"    {entry['events']:>12,}  {entry['channel']} / {entry['event_id']}")
-            if len(uncovered) > 10:
-                print(f"    ... and {len(uncovered) - 10} more")
+            if corpus["uncovered_pairs"] > 10:
+                print(f"    ... and {corpus['uncovered_pairs'] - 10:,} more")
         else:
             print("no corpus coverage recorded (run: reach --eid-metrics <csv>)")
         if reach.get("declared_unavailable"):
@@ -2220,8 +2284,25 @@ def cmd_reach(args) -> None:
         csv_path = manifest["dataset"]["path"]
         if not os.path.isfile(csv_path):
             _fail(f"timeline CSV missing, cannot compare coverage: {csv_path}")
+        # The appendix prints coverage beside the manifest's dataset identity,
+        # so measuring a file that has since been rewritten would attribute the
+        # figure to a dataset it was never taken from.
+        timeline_sha = _sha256(csv_path)
+        if timeline_sha != manifest["dataset"].get("sha256"):
+            _fail(
+                f"{csv_path} has changed since init (sha256 mismatch): a coverage"
+                " figure taken from it would not describe the dataset this"
+                " investigation records. Re-run init, or restore the original CSV."
+            )
         corpus_pairs, corpus_events, corpus_display = _parse_eid_metrics(args.eid_metrics)
-        timeline_pairs, timeline_rows = _scan_timeline_pairs(csv_path)
+        timeline_pairs, timeline_rows, aggregated_rows = _scan_timeline_pairs(csv_path)
+        # Columns can be present and still carry nothing usable; comparing
+        # against an empty pair set would record the whole corpus as absent.
+        if timeline_rows and not timeline_pairs:
+            _fail(
+                f"{csv_path} has {timeline_rows:,} row(s) but no usable"
+                " (channel, event id) pair — the columns are present but empty"
+            )
         # `hayabusa eid-metrics` writes abbreviated channels ("Sec"); a timeline
         # generated with -b/--disable-abbreviations writes full names
         # ("Security"). Comparing those two representations makes every pair look
@@ -2269,10 +2350,16 @@ def cmd_reach(args) -> None:
         # is legitimately a subset of full-corpus eid-metrics. So this reports
         # what is verifiable ("absent from the supplied timeline") rather than
         # what is not ("no rule ever matched").
+        if not 0 <= uncovered_events <= corpus_events:
+            _fail(
+                f"internal consistency check failed: {uncovered_events:,} absent"
+                f" events out of {corpus_events:,} corpus events"
+            )
         unreachable_pct = round(100.0 * uncovered_events / corpus_events, 2) if corpus_events else 0.0
         reach["corpus"] = {
             "source": "hayabusa eid-metrics",
             "source_path": os.path.abspath(args.eid_metrics),
+            "timeline_sha256": timeline_sha,
             "corpus_events": corpus_events,
             "corpus_pairs": len(corpus_pairs),
             "timeline_rows": timeline_rows,
@@ -2280,9 +2367,9 @@ def cmd_reach(args) -> None:
             "unreachable_pct": unreachable_pct,
             "uncovered_pairs": len(uncovered),
             "uncovered_events": uncovered_events,
-            # Bounded: the tail is a long list of one-off pairs, and the top
-            # entries are what an analyst actually needs to review.
-            "uncovered": uncovered[:200],
+            # Stored in full: the long tail is where rare, security-relevant
+            # channels live, and a few thousand small objects cost nothing.
+            "uncovered": uncovered,
             "recorded_at": _now(),
         }
         # Real corpus evidence supersedes an earlier "unavailable" declaration:
@@ -2301,6 +2388,9 @@ def cmd_reach(args) -> None:
               " these were excluded by that filter rather than by rule coverage")
         print(f"  timeline holds {timeline_rows:,} rule-match rows"
               f" across {len(timeline_pairs):,} pair(s)")
+        if aggregated_rows:
+            print(f"  {aggregated_rows:,} correlation row(s) skipped — they summarise"
+                  " many events and carry no single (channel, event id)")
         if uncovered:
             print("  largest unreachable pairs:")
             for entry in uncovered[:5]:
@@ -2638,10 +2728,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("reach", help="record raw-evtx reachability (coverage + IOC search-backs)")
     p.add_argument("--dir", required=True)
-    p.add_argument("--eid-metrics", help="`hayabusa eid-metrics` CSV over the ORIGINAL evtx corpus")
-    p.add_argument("--none", action="store_true", help="declare the original evtx corpus unavailable")
+    action = p.add_mutually_exclusive_group(required=True)
+    action.add_argument("--eid-metrics", help="`hayabusa eid-metrics` CSV over the ORIGINAL evtx corpus")
+    action.add_argument("--none", action="store_true", help="declare the original evtx corpus unavailable")
     p.add_argument("--reason", help="why the corpus is unavailable (required with --none)")
-    p.add_argument("--list", action="store_true")
+    action.add_argument("--list", action="store_true")
     p.set_defaults(func=cmd_reach)
 
     p = sub.add_parser("check", help="run coverage gates (exit 0=PASS, 1=FAIL)")

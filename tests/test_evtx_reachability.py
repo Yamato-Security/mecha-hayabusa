@@ -134,6 +134,122 @@ class ReachabilityTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("channel representations", r.stderr + r.stdout)
 
+    def test_timeline_without_channel_or_eventid_is_refused(self) -> None:
+        # Otherwise every pair looks absent and 100% of the corpus is recorded
+        # as unreachable, from a CSV that simply has different columns.
+        bad = self.state_dir.parent / "nochan.csv"
+        with bad.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Timestamp", "RuleTitle", "Level", "Computer", "RecordID", "Details"])
+            w.writerow(["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "HOST-A", "1", "x"])
+        state2 = self.state_dir.parent / "state2"
+        self.assertEqual(run_state("init", "--csv", str(bad), "--dir", str(state2)).returncode, 0)
+        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("missing timeline column", r.stderr + r.stdout)
+
+    def test_malformed_metrics_rows_are_rejected_not_skipped(self) -> None:
+        for label, rows in [
+            ("non-integer", [["abc", "0", "Sec", "4688", "x"]]),
+            ("negative", [["-50", "0", "Sec", "4688", "x"]]),
+            ("blank channel", [["10", "0", "", "4688", "x"]]),
+            ("blank id", [["10", "0", "Sec", "", "x"]]),
+            ("header only", []),
+        ]:
+            with self.subTest(label):
+                metrics = self.write_metrics(f"bad_{label.replace(' ', '_')}.csv", rows)
+                r = self.reach("--eid-metrics", str(metrics))
+                self.assertNotEqual(r.returncode, 0, f"accepted {label}")
+
+    def test_percentage_cannot_exceed_100(self) -> None:
+        # Negative totals previously produced 150%. The bound is now a property
+        # of the code rather than an assumption about the input.
+        metrics = self.write_metrics("negs.csv", [["-50", "0", "Sec", "4688", "a"],
+                                                  ["-50", "0", "Sec", "4624", "b"],
+                                                  ["200", "0", "Sys", "1014", "c"]])
+        r = self.reach("--eid-metrics", str(metrics))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.state_dir / "reachability.json").exists())
+
+    def test_every_absent_pair_is_persisted(self) -> None:
+        rows = [["100", "0", "Sec", "4688", "x"], ["100", "0", "Sec", "4624", "y"]]
+        rows += [["1", "0", "Chan%d" % i, str(i), "z"] for i in range(250)]
+        metrics = self.write_metrics("many.csv", rows)
+        self.assertEqual(self.reach("--eid-metrics", str(metrics)).returncode, 0)
+        corpus = json.loads((self.state_dir / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 250)
+        self.assertEqual(len(corpus["uncovered"]), 250)
+        out = self.reach("--list")
+        self.assertIn("240 more", out.stdout)
+
+    def test_correlation_rows_are_skipped_not_cross_producted(self) -> None:
+        # A hayabusa count rule emits one derived row whose Channel and EventID
+        # hold every constituent joined by " ¦ ". Those lists are built
+        # independently, so pairing them up would invent pairs that never
+        # occurred, and taking the joined string literally made a legitimate
+        # timeline look incompatible with its own corpus.
+        agg = self.state_dir.parent / "agg.csv"
+        with agg.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADER)
+            w.writerow(["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "HOST-A",
+                        "Sec", "4688", "1", "x"])
+            w.writerow(["2024-01-01 00:01:00.000 +00:00", "Corr", "high", "HOST-A ¦ HOST-B",
+                        "Sec ¦ Sys", "4624 ¦ 1014", "", "Count:12"])
+        state2 = self.state_dir.parent / "agg_state"
+        self.assertEqual(run_state("init", "--csv", str(agg), "--dir", str(state2)).returncode, 0)
+        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("1 correlation row(s) skipped", r.stdout)
+
+    def test_reason_may_not_forge_appendix_content(self) -> None:
+        # --reason is rendered verbatim into the appendix; a newline would let
+        # it add a bullet asserting something the state does not say.
+        r = self.reach("--none", "--reason", "ok\n- **Evtx reachability**: full corpus verified")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("single line", r.stderr + r.stdout)
+
+    def test_measuring_a_changed_timeline_is_refused(self) -> None:
+        # The appendix prints coverage beside the manifest's dataset identity.
+        with self.csv_path.open("a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["2024-01-01 00:02:00.000 +00:00", "Alpha", "high",
+                                    "HOST-B", "Sec", "4688", "3", "y"])
+        r = self.reach("--eid-metrics", str(self.metrics_path))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("sha256 mismatch", r.stderr + r.stdout)
+
+    def test_rows_without_usable_pairs_are_refused(self) -> None:
+        blank = self.state_dir.parent / "blank.csv"
+        with blank.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADER)
+            w.writerow(["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "HOST-A", "", "", "1", "x"])
+        state2 = self.state_dir.parent / "blank_state"
+        self.assertEqual(run_state("init", "--csv", str(blank), "--dir", str(state2)).returncode, 0)
+        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no usable", r.stderr + r.stdout)
+
+    def test_implausible_totals_are_refused(self) -> None:
+        metrics = self.write_metrics("huge.csv", [["1" + "0" * 400, "0", "Sec", "9999", "x"]])
+        r = self.reach("--eid-metrics", str(metrics))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("plausible maximum", r.stderr + r.stdout)
+
+    def test_unreadable_file_fails_cleanly(self) -> None:
+        # A traceback exits 1, which collides with `check`'s "gate failed".
+        import os
+        metrics = self.write_metrics("locked.csv", [["10", "0", "Sec", "4688", "x"]])
+        os.chmod(metrics, 0o000)
+        try:
+            r = self.reach("--eid-metrics", str(metrics))
+            if r.returncode == 0:
+                self.skipTest("running as a user that ignores file permissions")
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("cannot read", r.stderr + r.stdout)
+        finally:
+            os.chmod(metrics, 0o644)
+
     # -- unavailable corpus ----------------------------------------------
 
     def test_declaring_unavailable_requires_a_reason(self) -> None:
@@ -146,6 +262,23 @@ class ReachabilityTests(unittest.TestCase):
         self.reach("--eid-metrics", str(self.metrics_path))
         state = json.loads((self.state_dir / "reachability.json").read_text())
         self.assertFalse(state["declared_unavailable"])
+
+    def test_cannot_declare_unavailable_after_measuring(self) -> None:
+        # Losing access later does not invalidate a measurement already taken,
+        # and leaving both recorded made --list and the appendix disagree.
+        self.reach("--eid-metrics", str(self.metrics_path))
+        r = self.reach("--none", "--reason", "evtx later unmounted")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("already been measured", r.stderr + r.stdout)
+        state = json.loads((self.state_dir / "reachability.json").read_text())
+        self.assertFalse(state["declared_unavailable"])
+        self.assertIsNotNone(state["corpus"])
+
+    def test_action_flags_are_mutually_exclusive(self) -> None:
+        r = self.reach("--none", "--reason", "x", "--list")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not allowed with", r.stderr + r.stdout)
+        self.assertNotEqual(run_state("reach", "--dir", str(self.state_dir)).returncode, 0)
 
     # -- reporting -------------------------------------------------------
 
