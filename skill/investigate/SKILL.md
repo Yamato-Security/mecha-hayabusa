@@ -395,6 +395,38 @@ python3 "$STATE_PY" verify --dir "$STATE_DIR" --target-type rule --target "[exac
 - `cannot_verify` never confirms anything
 - Note: this is a **procedural** guarantee — state.py cannot prove the subagent's context isolation; it depends on honoring the packet-neutrality rules
 
+### Step 5.8: Evtx reachability — required before any claim of absence
+
+A Hayabusa CSV is a **detection** artifact, not an **evidence** artifact: it contains only events that matched a rule. Everything no rule matched is missing from the timeline while still sitting in the evtx. So "not in the timeline" and "not in the logs" are different statements, and only the first one is yours to make from the CSV alone.
+
+**Measure the gap once, at the start of the report phase.** Run `hayabusa eid-metrics` over the ORIGINAL evtx corpus and import it:
+
+```bash
+hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
+python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
+```
+
+This records how many corpus events reach the timeline and which `(channel, event id)` pairs no rule ever matched — the blind spots for this dataset. Review the largest ones before writing conclusions; that list is where unreachable evidence lives.
+
+**Search known IOCs back against the raw evtx.** Once findings and `iocs.json` exist, take each significant IOC and look for it in the original evtx, not just the CSV:
+
+```bash
+hayabusa search -d /path/to/evtx -i -k "<ioc>" -o "$STATE_DIR/work/searchback.csv"
+python3 "$STATE_PY" reach --dir "$STATE_DIR" --ioc "<ioc>" \
+    --raw-hits 504 --timeline-hits 1 --raw-hosts "HOST-A,HOST-B,HOST-C" \
+    --tool "hayabusa search -d ... -k <ioc>"
+```
+
+**If the raw hit count exceeds the timeline count, the finding is incomplete** — that difference is exactly where missed hosts and missed C2 hide. Update the affected findings first, then re-record the same IOC with `--reconciled` and a `--note` saying what changed. G12 FAILs on any unreconciled gap.
+
+**If the original evtx is not available to you**, say so explicitly rather than quietly reasoning as if the CSV were complete:
+
+```bash
+python3 "$STATE_PY" reach --dir "$STATE_DIR" --none --reason "only the CSV was provided"
+```
+
+**Absence language is gated.** Phrases such as "no evidence of", "no trace of", "left no trace", "absent from the logs" (and their Japanese equivalents) in a triage rationale or finding summary make **G12 FAIL** unless a search-back is recorded or the corpus is declared unavailable. Without one of those, the honest wording is *"did not match any rule"* — which is what the CSV actually supports.
+
 ### Step 6: Visualization Chart Generation
 
 Generate timeline charts and MITRE ATT&CK flow diagrams from investigation data and embed them in the report.
@@ -528,7 +560,7 @@ Run the coverage check and make it PASS before assembling the report:
 python3 "$STATE_PY" check --dir "$STATE_DIR"
 ```
 
-- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack/mixed-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs — unless they declare `refs_unavailable` AND the dataset confirms the rule genuinely has no row with a RecordID — or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event, G10 false_positive/mixed verdicts over high-volume rules (>20 events) without variant evidence, or declared variants that do not match the CSV recount, G11 findings or high-volume FP/mixed verdicts without a consistent independent verification vote (Step 5.7). Go back to the corresponding step, close the gaps, and re-run
+- **FAIL** → the output lists exactly what is missing per gate: G1 pending rules, G2 uncovered hosts, G3 unjudged clusters, G4 attack/mixed-verdict rules not referenced by any finding, G5 unresolved pagination, G6 unresolvable evidence refs (non-existent/ambiguous RecordIDs, refs to another rule's events, non-verbatim excerpts), G7 verdicts (attack/false_positive/indeterminate alike) or findings citing no refs — unless they declare `refs_unavailable` AND the dataset confirms the rule genuinely has no row with a RecordID — or false positives without an excerpt, G8 finding-cited rules that are untriaged or **triaged false_positive**, G9 finding hosts not backed by any cited event, G10 false_positive/mixed verdicts over high-volume rules (>20 events) without variant evidence, or declared variants that do not match the CSV recount, G11 findings or high-volume FP/mixed verdicts without a consistent independent verification vote (Step 5.7), G12 absence claims with no recorded evtx search-back, or a search-back whose raw-corpus hit count still exceeds what the timeline holds (Step 5.8). Go back to the corresponding step, close the gaps, and re-run
 - **G6 ambiguity FAIL**: "RecordID X is ambiguous" means that RecordID denotes different events on several hosts/channels. `get_event_detail(record_id=...)` returns the candidate list too (status=ambiguous); pass `computer` (and `channel` if needed) to pin the event, then re-record the refs in qualified form
 - **G3 timestamp warning**: if the G3 detail warns that some rows have unparseable Timestamps, they were excluded from the auto-derived clusters (this is a visible warning, not a failure; when NO timestamps parsed at all, G3 hard-fails until windows are added). If you know a distinct activity wave was missed, add it manually and judge it: `python3 "$STATE_PY" cluster --add --dir "$STATE_DIR" --start YYYY-MM-DD --end YYYY-MM-DD --verdict attack|benign|indeterminate --note "..."`
 - Report generation also re-runs this gate: `report.py` auto-detects `$STATE_DIR` from the output directory (where `manifest.json` sits) even if you forget to pass `state_dir`, so the gate cannot be silently skipped

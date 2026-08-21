@@ -38,6 +38,7 @@ Commands (all stdlib, no external dependencies):
   cluster   record a verdict for an activity cluster
   env       record environment facts with provenance (or --none / --list)
   verify    record an independent verification vote for a finding/rule verdict
+  reach     record raw-evtx reachability: corpus coverage and IOC search-backs
   log-query append a query audit entry (tracks unresolved has_more)
   status    human-readable progress summary (for resuming)
   check     run coverage gates; exit 0 = PASS, 1 = FAIL
@@ -105,6 +106,25 @@ VARIANT_KEY_DIVERSITY_CAP = 3
 # Hayabusa detail-field separator (" ¦ ", broken bar U+00A6).
 DETAILS_SEPARATOR = " ¦ "
 
+# A Hayabusa timeline holds ONLY events that matched a rule, so "absent from the
+# timeline" is not "absent from the logs". These phrases assert the latter, and
+# gate G12 will not let them stand without a recorded search-back against the
+# original evtx corpus. Kept deliberately narrow: it must catch a claim of
+# absence, not ordinary hedging ("little evidence", "unclear whether").
+ABSENCE_CLAIM_RE = re.compile(
+    r"no evidence (?:of|that|for|was|were)"
+    r"|no (?:trace|traces|sign|signs|indication|record|records) of"
+    r"|(?:not|never) (?:observed|detected|recorded) in the (?:log|logs|evtx|data|dataset)"
+    r"|nothing in the (?:log|logs|evtx|data|dataset)"
+    r"|absent from the (?:log|logs|evtx|timeline|data|dataset)"
+    r"|left no (?:trace|traces|evidence)"
+    r"|痕跡(?:は|が)(?:ない|無い|見つから|残っ(?:ていない|ておらず))"
+    r"|証拠(?:は|が)(?:ない|無い|見つから)"
+    r"|ログ(?:に|には)(?:存在しない|記録されていない|残っていない)"
+    r"|(?:確認|観測|検出)(?:されなかった|できなかった)",
+    re.IGNORECASE,
+)
+
 # Rationales that carry no information get rejected at record time: an
 # unauditable verdict ("reviewed") over thousands of events is exactly the
 # failure mode the evidence gates exist to prevent.
@@ -127,6 +147,7 @@ HOSTS = "hosts.json"
 QUERIES = "queries.jsonl"
 ENVIRONMENT = "environment.json"
 VOTES = "verification_votes.jsonl"
+REACHABILITY = "reachability.json"
 
 ENV_STATUSES = ("operator_confirmed", "observed", "inferred")
 VOTE_TARGET_TYPES = ("rule", "finding")
@@ -2045,6 +2066,62 @@ def run_check(state_dir: str, verify_hash: bool = True) -> dict:
         g11_detail += f" (warning: {corrupt_votes} unparseable line(s) in {VOTES} ignored)"
     gate("G11", "independent verification votes", not g11_gaps, g11_detail, g11_gaps)
 
+    # G12: evidence reachability. A Hayabusa timeline holds ONLY events that
+    # matched a rule, so "absent from the timeline" is not "absent from the
+    # logs" — everything no rule matched is still sitting in the evtx. Two
+    # obligations follow:
+    #   (a) any claim of absence must be backed by a recorded search-back
+    #       against the ORIGINAL evtx (`hayabusa search`), or by an explicit
+    #       declaration that the corpus is unavailable; and
+    #   (b) a recorded search-back that found MORE in the raw corpus than the
+    #       timeline holds must be reconciled into the findings before the
+    #       report renders — that gap is where missed hosts and missed C2 live.
+    reach = _load_reachability(state_dir)
+    searchbacks = reach.get("searchbacks") or []
+    absence_claims = []
+    for rule in triage["rules"]:
+        text = rule.get("rationale") or ""
+        if ABSENCE_CLAIM_RE.search(text):
+            absence_claims.append(f"rule '{rule['rule_title']}' rationale claims absence")
+    for finding in findings["findings"]:
+        text = finding.get("summary") or ""
+        if ABSENCE_CLAIM_RE.search(text):
+            absence_claims.append(
+                f"finding {finding['id']} ({finding['title']}) summary claims absence"
+            )
+    unreconciled = [
+        f"IOC '{b['ioc']}': {b['raw_hits']} hit(s) in the raw evtx vs"
+        f" {b['timeline_hits']} in the timeline"
+        + (f" on {len(b['raw_hosts'])} host(s)" if b.get("raw_hosts") else "")
+        + " — reconcile the affected findings, then re-record with reconciled=true"
+        for b in searchbacks
+        if b["raw_hits"] > b["timeline_hits"] and not b.get("reconciled")
+    ]
+    g12_gaps = list(unreconciled)
+    corpus = reach.get("corpus")
+    if absence_claims and not searchbacks and not reach.get("declared_unavailable"):
+        g12_gaps.extend(
+            claim + " but no evtx search-back was recorded (run: reach --ioc ...,"
+            " or reach --none --reason ... if the corpus is unavailable)"
+            for claim in absence_claims
+        )
+    bits = []
+    if corpus:
+        bits.append(
+            f"{corpus['coverage_pct']}% of {corpus['corpus_events']:,} evtx events reach"
+            f" the timeline; {corpus['uncovered_pairs']:,} (channel, event id) pair(s)"
+            " never matched any rule"
+        )
+    else:
+        bits.append("no corpus coverage recorded")
+    bits.append(f"{len(searchbacks)} IOC search-back(s)")
+    if absence_claims:
+        bits.append(f"{len(absence_claims)} absence claim(s)")
+    if reach.get("declared_unavailable"):
+        bits.append(f"evtx corpus declared unavailable: {reach.get('unavailable_reason')}")
+    gate("G12", "evidence reachability beyond the timeline", not g12_gaps,
+         "; ".join(bits), g12_gaps)
+
     return {
         "ok": all(g["status"] == "PASS" for g in gates),
         "checked_at": _now(),
@@ -2100,6 +2177,212 @@ def _print_check(result: dict) -> None:
         if len(g["gaps"]) > 20:
             print(f"        ... and {len(g['gaps']) - 20} more")
     print(f"OVERALL: {'PASS' if result['ok'] else 'FAIL'}")
+
+
+def _load_reachability(state_dir: str) -> dict:
+    return _load_optional(state_dir, REACHABILITY, {
+        "corpus": None,
+        "searchbacks": [],
+        "declared_unavailable": False,
+        "unavailable_reason": "",
+    })
+
+
+def _scan_timeline_pairs(csv_path: str) -> tuple[set, int]:
+    """Return the (Channel, EventID) pairs present in the timeline CSV and the
+    row count. The timeline is the rule-match projection of the evtx corpus;
+    comparing its pairs against `hayabusa eid-metrics` output over the ORIGINAL
+    evtx shows how much of the corpus no rule can ever surface."""
+    pairs: set = set()
+    rows = 0
+    with open(csv_path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            rows += 1
+            channel = (row.get("Channel") or "").strip()
+            event_id = (row.get("EventID") or "").strip()
+            if channel or event_id:
+                pairs.add((channel, event_id))
+    return pairs, rows
+
+
+def _parse_eid_metrics(path: str) -> tuple[dict, int]:
+    """Parse `hayabusa eid-metrics` CSV output into {(channel, eid): events}.
+
+    Columns are Total,%,Channel,ID,Event. Channel names are the same
+    abbreviations the timeline uses, so the two sides compare directly.
+    """
+    corpus: dict = {}
+    total = 0
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+        reader = csv.DictReader(fh)
+        # Require the full eid-metrics signature: a Hayabusa TIMELINE csv also
+        # has a Channel column, and importing one as the corpus side would
+        # silently compare the timeline against itself (100% coverage, no gaps).
+        required = {"Total", "Channel", "ID"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            _fail(
+                f"{path} does not look like `hayabusa eid-metrics` output"
+                " (expected columns: Total,%,Channel,ID,Event)"
+            )
+        for row in reader:
+            try:
+                count = int((row.get("Total") or "0").replace(",", "").strip())
+            except ValueError:
+                continue
+            key = ((row.get("Channel") or "").strip(), (row.get("ID") or "").strip())
+            corpus[key] = corpus.get(key, 0) + count
+            total += count
+    return corpus, total
+
+
+def cmd_reach(args) -> None:
+    """Record raw-evtx reachability.
+
+    A Hayabusa timeline contains only events that matched a rule. Everything a
+    rule never matched is absent from it while still being present in the evtx,
+    so "not in the timeline" and "not in the logs" are different claims. This
+    command records the evidence needed to tell them apart:
+
+      --eid-metrics  compare `hayabusa eid-metrics` over the ORIGINAL evtx
+                     against the timeline, recording what no rule can surface
+      --ioc          record a `hayabusa search` search-back for one IOC,
+                     reconciling raw-corpus hits against timeline hits
+      --none         declare the evtx corpus unavailable (with a reason), which
+                     records the limitation instead of hiding it
+    """
+    _require_initialized(args.dir)
+    reach = _load_reachability(args.dir)
+
+    if args.none:
+        reason = (args.reason or "").strip()
+        if not reason:
+            _fail("--none requires --reason (why the original evtx corpus is unavailable)")
+        reach["declared_unavailable"] = True
+        reach["unavailable_reason"] = reason
+        reach["recorded_at"] = _now()
+        _save(args.dir, REACHABILITY, reach)
+        print(f"recorded: original evtx corpus unavailable — {reason}")
+        print("  absence claims will be reported as timeline-only and cannot be verified")
+        return
+
+    if args.list:
+        corpus = reach.get("corpus")
+        if corpus:
+            print(f"corpus coverage (from {corpus.get('source_path')}):")
+            print(f"  evtx corpus  : {corpus['corpus_events']:,} events"
+                  f" across {corpus['corpus_pairs']:,} (channel, event id) pairs")
+            print(f"  timeline     : {corpus['timeline_rows']:,} rows"
+                  f" across {corpus['timeline_pairs']:,} pairs")
+            print(f"  reachable    : {corpus['coverage_pct']}% of corpus events")
+            uncovered = corpus.get("uncovered") or []
+            print(f"  no rule ever fired on {corpus['uncovered_pairs']:,} pair(s)"
+                  f" = {corpus['uncovered_events']:,} events")
+            for entry in uncovered[:10]:
+                print(f"    {entry['events']:>12,}  {entry['channel']} / {entry['event_id']}")
+            if len(uncovered) > 10:
+                print(f"    ... and {len(uncovered) - 10} more")
+        else:
+            print("no corpus coverage recorded (run: reach --eid-metrics <csv>)")
+        backs = reach.get("searchbacks") or []
+        if backs:
+            print(f"\nIOC search-backs ({len(backs)}):")
+            for b in backs:
+                flag = "OK " if b.get("reconciled") else "GAP"
+                print(f"  [{flag}] {b['ioc']}: raw={b['raw_hits']} timeline={b['timeline_hits']}"
+                      f" raw_hosts={len(b.get('raw_hosts') or [])}")
+        else:
+            print("\nno IOC search-backs recorded")
+        if reach.get("declared_unavailable"):
+            print(f"\ndeclared unavailable: {reach.get('unavailable_reason')}")
+        return
+
+    if args.eid_metrics:
+        if not os.path.isfile(args.eid_metrics):
+            _fail(f"eid-metrics CSV not found: {args.eid_metrics}")
+        manifest = _load(args.dir, MANIFEST)
+        csv_path = manifest["dataset"]["path"]
+        if not os.path.isfile(csv_path):
+            _fail(f"timeline CSV missing, cannot compare coverage: {csv_path}")
+        corpus_pairs, corpus_events = _parse_eid_metrics(args.eid_metrics)
+        timeline_pairs, timeline_rows = _scan_timeline_pairs(csv_path)
+        uncovered = [
+            {"channel": ch, "event_id": eid, "events": n}
+            for (ch, eid), n in corpus_pairs.items()
+            if (ch, eid) not in timeline_pairs
+        ]
+        uncovered.sort(key=lambda e: -e["events"])
+        uncovered_events = sum(e["events"] for e in uncovered)
+        coverage = round(100.0 * timeline_rows / corpus_events, 2) if corpus_events else 0.0
+        reach["corpus"] = {
+            "source": "hayabusa eid-metrics",
+            "source_path": os.path.abspath(args.eid_metrics),
+            "corpus_events": corpus_events,
+            "corpus_pairs": len(corpus_pairs),
+            "timeline_rows": timeline_rows,
+            "timeline_pairs": len(timeline_pairs),
+            "coverage_pct": coverage,
+            "uncovered_pairs": len(uncovered),
+            "uncovered_events": uncovered_events,
+            # Bounded: the tail is a long list of one-off pairs, and the top
+            # entries are what an analyst actually needs to review.
+            "uncovered": uncovered[:200],
+            "recorded_at": _now(),
+        }
+        _save(args.dir, REACHABILITY, reach)
+        print(f"recorded corpus coverage: {coverage}% of {corpus_events:,} evtx events"
+              f" reach the timeline")
+        print(f"  {len(uncovered):,} of {len(corpus_pairs):,} (channel, event id) pairs"
+              f" never matched any rule = {uncovered_events:,} events")
+        if uncovered:
+            print("  largest unreachable pairs:")
+            for entry in uncovered[:5]:
+                print(f"    {entry['events']:>12,}  {entry['channel']} / {entry['event_id']}")
+        return
+
+    entries = _read_batch_stdin() if args.batch else None
+    if entries is None:
+        if not (args.ioc or "").strip():
+            _fail("reach requires one of: --eid-metrics, --ioc, --batch, --none, --list")
+        entries = [{
+            "ioc": args.ioc,
+            "raw_hits": args.raw_hits,
+            "raw_hosts": args.raw_hosts,
+            "timeline_hits": args.timeline_hits,
+            "tool": args.tool,
+            "note": args.note,
+            "reconciled": args.reconciled,
+        }]
+
+    recorded = 0
+    for entry in entries:
+        ioc = str(entry.get("ioc") or "").strip()
+        if not ioc:
+            _fail("each search-back entry requires 'ioc'")
+        if entry.get("raw_hits") is None:
+            _fail(f"search-back for {ioc} requires 'raw_hits' (hits in the ORIGINAL evtx)")
+        raw_hosts = entry.get("raw_hosts") or []
+        if isinstance(raw_hosts, str):
+            raw_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+        reach["searchbacks"] = [b for b in reach.get("searchbacks", []) if b.get("ioc") != ioc]
+        reach["searchbacks"].append({
+            "ioc": ioc,
+            "raw_hits": int(entry["raw_hits"]),
+            "raw_hosts": sorted(set(raw_hosts)),
+            "timeline_hits": int(entry.get("timeline_hits") or 0),
+            "tool": str(entry.get("tool") or "").strip(),
+            "note": str(entry.get("note") or "").strip(),
+            "reconciled": bool(entry.get("reconciled")),
+            "recorded_at": _now(),
+        })
+        recorded += 1
+    _save(args.dir, REACHABILITY, reach)
+    print(f"recorded {recorded} IOC search-back(s)")
+    for b in reach["searchbacks"][-recorded:]:
+        gap = b["raw_hits"] - b["timeline_hits"]
+        if gap > 0 and not b["reconciled"]:
+            print(f"  GAP {b['ioc']}: {b['raw_hits']} raw vs {b['timeline_hits']} timeline"
+                  f" (+{gap}) — reconcile the findings, then re-record with --reconciled")
 
 
 def cmd_check(args) -> None:
@@ -2160,6 +2443,11 @@ APPENDIX_LABELS = {
         "environment": "Environment profile",
         "env_none": "none available (explicitly declared by the operator)",
         "env_missing": "not recorded",
+        "reach": "Evtx reachability",
+        "reach_missing": "not measured — the timeline holds only rule matches, so absence of an event here does not mean absence in the evtx",
+        "reach_unavailable": "original evtx corpus unavailable ({reason}) — absence claims are timeline-only",
+        "reach_coverage": "{pct}% of {events} evtx events reach the timeline; {pairs} (channel, event id) pair(s) matched no rule",
+        "reach_searchbacks": "{n} IOC search-back(s) against the original evtx",
     },
     "ja": {
         "title": "## 付録: カバレッジと再現性",
@@ -2179,6 +2467,11 @@ APPENDIX_LABELS = {
         "environment": "環境プロファイル",
         "env_none": "情報なし（オペレーターが明示的に申告）",
         "env_missing": "未記録",
+        "reach": "Evtx 到達性",
+        "reach_missing": "未計測 — タイムラインにはルール一致イベントのみが含まれるため、ここに無いことは evtx に無いことを意味しません",
+        "reach_unavailable": "元の evtx コーパスが利用不可 ({reason}) — 不在の主張はタイムライン範囲に限られます",
+        "reach_coverage": "evtx {events} 件のうち {pct}% がタイムラインに到達。{pairs} 個の (チャネル, イベントID) はどのルールにも一致していません",
+        "reach_searchbacks": "元の evtx に対する IOC 再検索: {n} 件",
     },
 }
 
@@ -2258,6 +2551,26 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
     else:
         env_line = labels["env_missing"]
     lines += ["", f"- **{labels['environment']}**: {env_line}"]
+
+    reach = _load_optional(state_dir, REACHABILITY, None)
+    if not isinstance(reach, dict) or not (reach.get("corpus") or reach.get("searchbacks")
+                                           or reach.get("declared_unavailable")):
+        reach_line = labels["reach_missing"]
+    elif reach.get("declared_unavailable"):
+        reach_line = labels["reach_unavailable"].format(reason=reach.get("unavailable_reason") or "?")
+    else:
+        parts = []
+        corpus = reach.get("corpus")
+        if corpus:
+            parts.append(labels["reach_coverage"].format(
+                pct=corpus["coverage_pct"],
+                events=f"{corpus['corpus_events']:,}",
+                pairs=f"{corpus['uncovered_pairs']:,}"))
+        backs = reach.get("searchbacks") or []
+        if backs:
+            parts.append(labels["reach_searchbacks"].format(n=len(backs)))
+        reach_line = "; ".join(parts) or labels["reach_missing"]
+    lines += [f"- **{labels['reach']}**: {reach_line}"]
 
     lines += [
         "",
@@ -2397,6 +2710,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="progress summary (use to resume)")
     p.add_argument("--dir", required=True)
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("reach", help="record raw-evtx reachability (coverage + IOC search-backs)")
+    p.add_argument("--dir", required=True)
+    p.add_argument("--eid-metrics", help="`hayabusa eid-metrics` CSV over the ORIGINAL evtx corpus")
+    p.add_argument("--ioc", help="IOC that was searched back against the raw evtx")
+    p.add_argument("--raw-hits", type=int, help="hits for --ioc in the ORIGINAL evtx")
+    p.add_argument("--raw-hosts", help="comma-separated hosts the raw hits landed on")
+    p.add_argument("--timeline-hits", type=int, default=0, help="hits for --ioc in the timeline CSV")
+    p.add_argument("--tool", help="command used (e.g. 'hayabusa search -d ... -k ...')")
+    p.add_argument("--note", help="what the reconciliation changed")
+    p.add_argument("--reconciled", action="store_true",
+                   help="the findings now reflect the raw-corpus hits")
+    p.add_argument("--batch", action="store_true", help="read a JSON list of search-backs from stdin")
+    p.add_argument("--none", action="store_true", help="declare the original evtx corpus unavailable")
+    p.add_argument("--reason", help="why the corpus is unavailable (required with --none)")
+    p.add_argument("--list", action="store_true")
+    p.set_defaults(func=cmd_reach)
 
     p = sub.add_parser("check", help="run coverage gates (exit 0=PASS, 1=FAIL)")
     p.add_argument("--dir", required=True)

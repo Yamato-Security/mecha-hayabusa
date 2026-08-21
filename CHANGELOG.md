@@ -1,5 +1,13 @@
 # Changes
 
+## 1.1.0 [2026/08/21]
+
+**New Features:**
+
+- Added evtx reachability tracking (`state.py reach`) and gate G12, so an investigation can tell "absent from the timeline" apart from "absent from the logs". A Hayabusa CSV holds only events that matched a rule, so everything no rule matched is missing from it while still present in the evtx; on a 7,928-file / 36.7 GiB corpus only 5.4% of 59,884,494 events reached the timeline and 1,968 of 2,072 `(channel, event id)` pairs never matched any rule. `reach --eid-metrics` imports `hayabusa eid-metrics` output taken over the original evtx and records exactly which pairs are unreachable, and `reach --ioc` records a `hayabusa search` search-back so a known IOC can be reconciled against the raw corpus. (#45) (@YamatoSecurity)
+- Added gate G12, which fails when a triage rationale or finding summary asserts absence ("no evidence of", "left no trace", and the Japanese equivalents) without a recorded evtx search-back, and when a recorded search-back still finds more in the raw corpus than the timeline holds. That difference is where missed hosts hide: on the corpus above, a C2 domain present 505 times across three hosts in the raw evtx appeared exactly once in the timeline, and two of the three hosts were consequently left out of the finding. `reach --none --reason ...` records the limitation explicitly when the original evtx is unavailable. (#45) (@YamatoSecurity)
+- Added the measured coverage figure to the report appendix, so a reader sees how much of the evtx corpus the timeline could ever surface instead of assuming it is complete. (#45) (@YamatoSecurity)
+
 ## 1.0.1 [2026/08/20]
 
 **Bug Fixes:**
