@@ -123,36 +123,6 @@ class ReachabilityTests(unittest.TestCase):
         r = run_state("reach", "--dir", str(state), "--eid-metrics", str(metrics))
         return r, state
 
-    def test_forced_aggregate_mapping_is_recovered(self) -> None:
-        # Two channels and two ids, but the corpus admits only one mapping, so
-        # the row's pairs are determined and must not count as blind spots.
-        tl = self.make_timeline("forced.csv", [
-            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec ¦ Sys", "4624 ¦ 7045", "", "Count:9"]])
-        m = self.write_metrics("forced_m.csv", [["1", "50", "Sec", "4624", "a"],
-                                                ["1", "50", "Sys", "7045", "b"]])
-        r, state = self.measure(tl, m, "forced")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
-        self.assertEqual(corpus["uncovered_pairs"], 0)
-        self.assertEqual(corpus["unresolved_aggregate_groups"], 0)
-
-    def test_ambiguous_aggregate_is_reported_not_guessed(self) -> None:
-        # The corpus admits both mappings, so the row cannot be attributed. The
-        # count may over-estimate, and that must be said rather than hidden.
-        tl = self.make_timeline("amb.csv", [
-            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec ¦ Sys", "4624 ¦ 7045", "", "Count:9"]])
-        m = self.write_metrics("amb_m.csv", [["1", "25", "Sec", "4624", "a"],
-                                             ["1", "25", "Sec", "7045", "b"],
-                                             ["1", "25", "Sys", "4624", "c"],
-                                             ["1", "25", "Sys", "7045", "d"]])
-        r, state = self.measure(tl, m, "amb")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("OVER-estimate", r.stdout)
-        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
-        self.assertEqual(corpus["unresolved_aggregate_groups"], 1)
-        out = run_state("appendix", "--dir", str(state))
-        self.assertIn("over-estimate", out.stdout)
-
     def test_tab_separated_aggregate_values_are_understood(self) -> None:
         # hayabusa -S joins aggregated values with TAB instead of " ¦ ".
         tl = self.make_timeline("tabbed.csv", [
@@ -255,31 +225,68 @@ class ReachabilityTests(unittest.TestCase):
         out = self.reach("--list")
         self.assertIn("240 more", out.stdout)
 
-    def test_unambiguous_correlation_rows_are_recovered(self) -> None:
-        # A hayabusa count rule emits one derived row whose Channel and EventID
-        # hold every constituent joined by " ¦ ". Those lists are built
-        # independently, so pairing them up would invent pairs that never
-        # occurred, and taking the joined string literally made a legitimate
-        # timeline look incompatible with its own corpus.
-        agg = self.state_dir.parent / "agg.csv"
-        with agg.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(CSV_HEADER)
-            w.writerow(["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "HOST-A",
-                        "Sec", "4688", "1", "x"])
-            w.writerow(["2024-01-01 00:01:00.000 +00:00", "Corr", "high", "HOST-A ¦ HOST-B",
-                        "Sec", "4688 ¦ 4624", "", "Count:12"])
-        state2 = self.state_dir.parent / "agg_state"
-        self.assertEqual(run_state("init", "--csv", str(agg), "--dir", str(state2)).returncode, 0)
-        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
+    def test_correlation_rows_never_attest_a_pair(self) -> None:
+        # A correlation row has no RecordID: it summarises many events and its
+        # Channel/EventID are joined, independently-built lists. For a TEMPORAL
+        # correlation it may not even name every constituent, since only the
+        # first referenced rule's result is rendered. So it can never establish
+        # that a pair occurred -- only that one might have.
+        tl = self.make_timeline("corr.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "H1", "Sec", "4688", "1", "x"],
+            ["2024-01-01 00:01:00.000 +00:00", "Corr", "high", "H1 ¦ H2",
+             "Sec ¦ Sys", "4624 ¦ 1014", "", "Count:12"]])
+        r, state = self.measure(tl, self.metrics_path, "corr")
         self.assertEqual(r.returncode, 0, r.stderr)
-        # One channel with several ids is unambiguous: both pairs belong to Sec.
-        # Dropping the row would invent blind spots, since correlation
-        # references default to generate:false and the aggregate may be the
-        # only detection emitted for those events.
-        self.assertIn("1 correlation row(s)", r.stdout)
-        corpus = json.loads((state2 / "reachability.json").read_text())["corpus"]
-        self.assertEqual(corpus["unresolved_aggregate_groups"], 0)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["correlation_rows"], 1)
+        # Sec/4624 and Sys/1014 are named by the correlation row, so neither is
+        # definitely absent nor attested: they are undetermined.
+        self.assertEqual(corpus["possible_pairs"], 2)
+        self.assertIn("UNDETERMINED", r.stdout)
+
+    def test_undetermined_pairs_are_not_counted_as_absent(self) -> None:
+        # A Count:N row proves some of its candidates occurred, so putting them
+        # all in the definite set publishes a false machine-readable claim.
+        tl = self.make_timeline("amb.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1",
+             "Sec ¦ Sys", "4624 ¦ 7045", "", "Count:9"]])
+        m = self.write_metrics("amb_m.csv", [["1", "25", "Sec", "4624", "a"],
+                                             ["1", "25", "Sec", "7045", "b"],
+                                             ["1", "25", "Sys", "4624", "c"],
+                                             ["1", "25", "Sys", "7045", "d"]])
+        r, state = self.measure(tl, m, "amb")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 0)
+        self.assertEqual(corpus["possible_pairs"], 4)
+        out = run_state("appendix", "--dir", str(state))
+        self.assertIn("undetermined", out.stdout)
+
+    def test_correlation_row_without_an_id_makes_its_channel_undetermined(self) -> None:
+        # "Sec / -" says events on Sec occurred without naming which type, so
+        # no Sec pair can be called definitely absent.
+        tl = self.make_timeline("dash.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Corr", "high", "H1", "Sec", "-", "", "Count:5"]])
+        m = self.write_metrics("dash_m.csv", [["1", "100", "Sec", "4688", "a"]])
+        r, state = self.measure(tl, m, "dash")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["uncovered_pairs"], 0)
+        self.assertEqual(corpus["possible_pairs"], 1)
+
+    def test_an_event_row_must_name_exactly_one_identity(self) -> None:
+        tl = self.make_timeline("multi.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "R", "high", "H1", "Sec ¦ Sys", "4688", "7", "x"]])
+        r, _ = self.measure(tl, self.metrics_path, "multi")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("exactly one", r.stderr + r.stdout)
+
+    def test_incomplete_event_identity_is_refused(self) -> None:
+        tl = self.make_timeline("blank.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "R", "high", "H1", "", "", "1", "x"]])
+        r, _ = self.measure(tl, self.metrics_path, "blank")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("exactly one", r.stderr + r.stdout)
 
     def test_reason_may_not_forge_appendix_content(self) -> None:
         # --reason is rendered verbatim into the appendix; a newline would let
@@ -296,18 +303,6 @@ class ReachabilityTests(unittest.TestCase):
         r = self.reach("--eid-metrics", str(self.metrics_path))
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("sha256 mismatch", r.stderr + r.stdout)
-
-    def test_incomplete_event_identity_is_refused(self) -> None:
-        blank = self.state_dir.parent / "blank.csv"
-        with blank.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(CSV_HEADER)
-            w.writerow(["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "HOST-A", "", "", "1", "x"])
-        state2 = self.state_dir.parent / "blank_state"
-        self.assertEqual(run_state("init", "--csv", str(blank), "--dir", str(state2)).returncode, 0)
-        r = run_state("reach", "--dir", str(state2), "--eid-metrics", str(self.metrics_path))
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("incomplete event identity", r.stderr + r.stdout)
 
     def test_implausible_totals_are_refused(self) -> None:
         metrics = self.write_metrics("huge.csv", [["1" + "0" * 400, "0", "Sec", "9999", "x"]])

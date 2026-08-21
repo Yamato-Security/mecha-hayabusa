@@ -360,7 +360,9 @@ hayabusa eid-metrics -d /path/to/evtx -o "$STATE_DIR/work/eid-metrics.csv"
 python3 "$STATE_PY" reach --dir "$STATE_DIR" --eid-metrics "$STATE_DIR/work/eid-metrics.csv"
 ```
 
-This records what share of corpus events belong to a `(channel, event id)` **absent from the timeline** — the blind spots for this dataset. Review the largest ones before writing conclusions; that list is where unreachable evidence lives. The figure appears in the report appendix so a reader is not left assuming the timeline is complete.
+This records what share of corpus events belong to a `(channel, event id)` **not present in the timeline's event-identity fields**. Review the largest ones before writing conclusions; that list is where unreachable evidence lives. The figure appears in the report appendix so a reader is not left assuming the timeline is complete.
+
+**Read the claim narrowly.** It is a statement about which `(channel, event id)` values literally appear on rows carrying a RecordID — not about what the ruleset "could" detect. Correlation rows carry no RecordID and only summarise: their Channel and EventID are deduplicated lists built independently of each other, and a *temporal* correlation renders only the first referenced rule's result, so a row may name `Sec/4624` while `Sys/7045` was equally required and appears nowhere. Such rows therefore never attest a pair; the pairs they mention are reported as **undetermined**, and true absence lies between the stated figure and that figure plus the undetermined events.
 
 Two caveats the tool states rather than hides:
 
