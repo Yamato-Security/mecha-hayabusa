@@ -52,6 +52,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -603,6 +604,15 @@ def cmd_init(args) -> None:
     _save(state_dir, IOCS, {"iocs": []})
     _save(state_dir, HOSTS, {"hosts": []})
     _save(state_dir, ENVIRONMENT, {"entries": [], "declared_no_info": False})
+    # Reset with the rest: a measurement taken against the PREVIOUS dataset
+    # would otherwise survive into this one and be published in the appendix
+    # as if it described the timeline just loaded, with G0 reporting PASS.
+    _save(state_dir, REACHABILITY, {
+        "schema_version": REACHABILITY_SCHEMA_VERSION,
+        "corpus": None,
+        "declared_unavailable": False,
+        "unavailable_reason": "",
+    })
     # Truncate: a re-init after an interrupted run must not inherit stale
     # query-log or vote entries (they would resurface as phantom G5 failures
     # or as votes for verdicts that no longer exist).
@@ -2135,6 +2145,49 @@ def _load_reachability(state_dir: str) -> dict:
     })
 
 
+def _absence_bound(exact: float, *, widen_down: bool) -> float:
+    """Round one end of the absence range to 2dp without crossing an endpoint.
+
+    Two separate hazards, both of which `round()` walks into. First, rounding to
+    nearest narrows the published range: the honest direction is outward, so the
+    lower bound floors and the upper bound ceils. Second, a bound that is merely
+    near an endpoint must not be rendered AS that endpoint -- one represented
+    event in a ten-million-event corpus floors to "0.00% definitely absent",
+    which reads as no coverage gap at all, and one absent event ceils to
+    "100.00%", which asserts the timeline represents nothing while
+    represented_pairs says otherwise. Only an exactly-zero or exactly-total
+    count may print 0.0 or 100.0; anything strictly between is held at the
+    nearest displayable interior value.
+    """
+    if exact <= 0:
+        return 0.0
+    if exact >= 100:
+        return 100.0
+    scaled = exact * 100
+    value = (math.floor(scaled) if widen_down else math.ceil(scaled)) / 100
+    return min(99.99, max(0.01, value))
+
+
+def _reachability_matches_dataset(state_dir: str, corpus) -> bool:
+    """Return whether a stored measurement describes the timeline now loaded.
+
+    The corpus records the sha256 of the timeline it was measured against.
+    `init` clears the measurement with the rest of the state, but a state
+    directory can also be re-pointed at a different CSV by hand, and a figure
+    computed against the previous timeline must not be published as this
+    investigation's coverage. An unreadable or sha-less manifest is not
+    evidence of a mismatch, so those cases stay permissive.
+    """
+    if not isinstance(corpus, dict):
+        return False
+    manifest = _load_optional(state_dir, MANIFEST, None)
+    dataset = manifest.get("dataset") if isinstance(manifest, dict) else None
+    current = dataset.get("sha256") if isinstance(dataset, dict) else None
+    if not isinstance(current, str) or not current:
+        return True
+    return corpus.get("timeline_sha256") == current
+
+
 def _current_reachability_corpus(reach: dict, corpus) -> bool:
     """Return whether a stored corpus has the schema this code can render.
 
@@ -2243,10 +2296,30 @@ def _scan_timeline_pairs(csv_path: str) -> dict:
                 channel_parts = _split_timeline_values(raw_channel)
                 channels = {part.casefold() if part else "-" for part in channel_parts}
                 id_parts = _split_timeline_values(raw_id)
-                event_ids = {part for part in id_parts if part and part != "-"}
+                event_ids = {part.casefold() for part in id_parts
+                             if part and part != "-"}
                 open_event_id = any(not part or part == "-" for part in id_parts)
 
                 if record_id:
+                    # An open EventID on an ordinary row is not malformed input:
+                    # metrics.rs skips a record whose EventID key is absent, and
+                    # counts one whose value is JSON null under the literal
+                    # "null", so the displayed blank maps to either "no corpus
+                    # pair at all" or that one pair. Aborting the whole
+                    # measurement over it discards a real timeline; resolving it
+                    # like an open correlation row keeps the affected pairs
+                    # undetermined, which is what the ambiguity actually is.
+                    if len(channels) == 1 and not event_ids and open_event_id:
+                        correlation_groups.append({
+                            "line": reader.line_num,
+                            "channels": frozenset(channels),
+                            "event_ids": frozenset(),
+                            "open_event_id": True,
+                            "raw_channel": raw_channel.strip(),
+                            "raw_event_id": raw_id.strip(),
+                            "from_record_row": True,
+                        })
+                        continue
                     if len(channels) != 1 or len(event_ids) != 1 or open_event_id:
                         _fail(
                             f"{where}: a row with a RecordID must name exactly one"
@@ -2271,6 +2344,7 @@ def _scan_timeline_pairs(csv_path: str) -> dict:
                     "open_event_id": open_event_id,
                     "raw_channel": raw_channel.strip(),
                     "raw_event_id": raw_id.strip(),
+                    "from_record_row": False,
                 })
     except UnicodeDecodeError as exc:
         _fail(f"{csv_path} is not valid UTF-8: {exc}")
@@ -2280,7 +2354,8 @@ def _scan_timeline_pairs(csv_path: str) -> dict:
         "event_pairs": event_pairs,
         "correlation_groups": correlation_groups,
         "rows": rows,
-        "correlation_rows": len(correlation_groups),
+        "correlation_rows": sum(1 for group in correlation_groups
+                                if not group["from_record_row"]),
     }
 
 
@@ -2350,7 +2425,7 @@ def _resolve_correlation_groups(
             group_forced.update(
                 next(iter(edges)) for edges in by_channel.values() if len(edges) == 1
             )
-        if permitted - group_forced:
+        if permitted - group_forced and not group.get("from_record_row"):
             ambiguous_rows += 1
         forced.update(group_forced)
         permitted_by_group.append(permitted)
@@ -2360,7 +2435,8 @@ def _resolve_correlation_groups(
     return {
         "forced": forced,
         "ambiguous": ambiguous,
-        "resolved_rows": len(groups) - ambiguous_rows,
+        "resolved_rows": sum(1 for group in groups
+                             if not group.get("from_record_row")) - ambiguous_rows,
         "ambiguous_rows": ambiguous_rows,
     }
 
@@ -2369,13 +2445,17 @@ def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
     """Parse `hayabusa eid-metrics` CSV output into {(channel, eid): events}.
 
     Validated against what the exporter actually emits rather than repaired:
-    the five-column header, one row per (Channel, ID), and a plain positive
-    decimal Total. Anything else means the file is not eid-metrics output, and
-    guessing at it would silently change the measurement -- a stray byte became
-    a channel name, and a quoted "1,2" became 12.
+    the five-column header and a plain positive decimal Total. Anything else
+    means the file is not eid-metrics output, and guessing at it would silently
+    change the measurement -- a stray byte became a channel name, and a quoted
+    "1,2" became 12.
 
-    Channels are compared casefolded because Hayabusa's own subcommands
-    disagree on capitalisation; the original spelling is kept for display.
+    Both halves of the identity are compared casefolded, because metrics.rs
+    lowercases its key while the timeline prints the value as recorded; the
+    original spelling is kept for display. Rows are summed rather than required
+    to be unique: hayabusa groups on the raw channel but abbreviates at write
+    time, so four AppLocker sub-channels legitimately arrive as four rows all
+    displaying "AppLocker".
     """
     corpus: dict = {}
     display: dict = {}
@@ -2425,17 +2505,28 @@ def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
                 if count > MAX_EVENT_COUNT:
                     _fail(f"{where}: Total {count} exceeds the plausible maximum"
                           f" ({MAX_EVENT_COUNT:,}) — this is not an event count")
-                if not raw_channel or not event_id or not event_title:
-                    _fail(f"{where}: Channel, ID, and Event must all be non-empty")
-                key = (raw_channel.casefold(), event_id)
+                if not event_id or not event_title:
+                    _fail(f"{where}: ID and Event must both be non-empty")
+                # metrics.rs substitutes "-" only when the Channel KEY is absent;
+                # a present-but-empty value reaches the CSV as an empty cell. The
+                # timeline side already normalises its own empty channel to "-",
+                # so do the same here rather than refusing the file.
+                if not raw_channel:
+                    raw_channel = "-"
+                # metrics.rs lowercases BOTH halves of its key while the timeline
+                # prints them as recorded, so the id must be folded like the
+                # channel or two exports of one corpus look incompatible.
+                key = (raw_channel.casefold(), event_id.casefold())
+                # Abbreviation collapses distinct raw channels onto one displayed
+                # name (four AppLocker sub-channels -> "AppLocker"), and hayabusa
+                # groups on the RAW channel, so its own output legitimately
+                # repeats a displayed key. Summing is the correct reading: both
+                # sides already agree on the collapsed identity.
                 if key in corpus:
-                    _fail(
-                        f"{where}: duplicate (Channel, ID) {raw_channel}/{event_id}"
-                        " — eid-metrics emits one row per pair, so this file has"
-                        " been edited or merged"
-                    )
-                corpus[key] = count
-                display[key] = raw_channel
+                    corpus[key] += count
+                else:
+                    corpus[key] = count
+                    display[key] = (raw_channel, event_id)
                 total += count
     except UnicodeDecodeError as exc:
         _fail(f"{path} is not valid UTF-8: {exc}")
@@ -2449,7 +2540,8 @@ def _parse_eid_metrics(path: str) -> tuple[dict, int, dict]:
 def _identity_entries(keys: set, corpus_pairs: dict, display: dict) -> list[dict]:
     """Return pair identities in a stable, evidence-first order."""
     entries = [
-        {"channel": display.get(key, key[0]), "event_id": key[1],
+        {"channel": display.get(key, (key[0], key[1]))[0],
+         "event_id": display.get(key, (key[0], key[1]))[1],
          "events": corpus_pairs[key]}
         for key in keys
     ]
@@ -2518,6 +2610,12 @@ def cmd_reach(args) -> None:
                            if isinstance(corpus, dict) else None)
             print(f"  re-import it with: reach --eid-metrics"
                   f" {source_path or '<original-eid-metrics.csv>'}")
+        elif corpus and not _reachability_matches_dataset(args.dir, corpus):
+            print("recorded identity coverage was measured against a different"
+                  " timeline than the one currently loaded")
+            print("  it describes another dataset and is not reported;"
+                  f" re-import it with: reach --eid-metrics"
+                  f" {corpus.get('source_path') or '<original-eid-metrics.csv>'}")
         elif corpus:
             print(f"evtx-to-timeline identity coverage (from {corpus.get('source_path')}):")
             if corpus.get("source_sha256"):
@@ -2647,14 +2745,17 @@ def cmd_reach(args) -> None:
         if represented_events + undetermined_events + definite_absent_events != corpus_events:
             _fail("internal consistency check failed: partitioned event counts do not sum")
 
-        absent_pct_lower = round(
-            100.0 * definite_absent_events / corpus_events, 2
-        ) if corpus_events else 0.0
-        absent_pct_upper = round(
-            100.0 * (definite_absent_events + undetermined_events) / corpus_events, 2
-        ) if corpus_events else 0.0
-        if not 0 <= absent_pct_lower <= absent_pct_upper <= 100:
+        # Check the invariant on the exact values: rounding the bounds first
+        # lets saturation slip past it.
+        exact_lower = (100.0 * definite_absent_events / corpus_events) if corpus_events else 0.0
+        exact_upper = (100.0 * (definite_absent_events + undetermined_events)
+                       / corpus_events) if corpus_events else 0.0
+        if not 0 <= exact_lower <= exact_upper <= 100:
             _fail("internal consistency check failed: invalid absence percentage bounds")
+        absent_pct_lower = _absence_bound(exact_lower, widen_down=True)
+        absent_pct_upper = _absence_bound(exact_upper, widen_down=False)
+        if absent_pct_upper < absent_pct_lower:
+            absent_pct_upper = absent_pct_lower
 
         definite_absent = _identity_entries(
             definite_absent_keys, corpus_pairs, corpus_display
@@ -2786,6 +2887,7 @@ APPENDIX_LABELS = {
         "reach_missing": "not measured — the timeline is a detection artifact and does not establish identity coverage of the original evtx",
         "reach_unavailable": "original evtx corpus unavailable ({reason}) — identity representation was not measured",
         "reach_legacy": "recorded measurement uses an obsolete or incomplete state schema and is not reported — re-import the original eid-metrics CSV",
+        "reach_stale": "recorded measurement was taken against a different timeline than the one loaded and is not reported — re-import the original eid-metrics CSV",
         "reach_coverage": "{pct}% of {events} evtx events have a (channel, event id) definitely absent from the supplied timeline ({pairs} pair(s)); filtering can inflate this gap; eid-metrics sha256: {sha}",
         "reach_ambiguous": "absence from the supplied timeline is between {low}% and {high}%: {n} pair(s) = {events} events remain undetermined by ambiguous correlation mappings",
     },
@@ -2811,6 +2913,7 @@ APPENDIX_LABELS = {
         "reach_missing": "未計測 — タイムラインは検知用アーティファクトであり、元の evtx に対する識別子カバレッジは保証されません",
         "reach_unavailable": "元の evtx コーパスが利用不可 ({reason}) — 識別子の表現範囲は未計測です",
         "reach_legacy": "記録済みの計測は古い、または不完全なステート形式のため報告しません — 元の eid-metrics CSV を再取り込みしてください",
+        "reach_stale": "記録済みの計測は現在読み込まれているタイムラインとは別のタイムラインに対するものであるため報告しません — 元の eid-metrics CSV を再取り込みしてください",
         "reach_coverage": "evtx {events} 件のうち {pct}% は、提供されたタイムラインに (チャネル, イベントID) が確実に存在しないイベント（{pairs} 個）。フィルターによりこの差が過大になる場合があります。eid-metrics sha256: {sha}",
         "reach_ambiguous": "提供されたタイムラインでの不在率は {low}% 以上 {high}% 以下: {n} 個（{events} 件）は曖昧な相関マッピングのため未確定",
     },
@@ -2901,6 +3004,8 @@ def appendix_markdown(state_dir: str, lang: str = "en", result: dict | None = No
         corpus = reach.get("corpus")
         if corpus and not _current_reachability_corpus(reach, corpus):
             reach_line = labels["reach_legacy"]
+        elif corpus and not _reachability_matches_dataset(state_dir, corpus):
+            reach_line = labels["reach_stale"]
         elif not corpus:
             reach_line = labels["reach_unavailable"].format(
                 reason=reach.get("unavailable_reason") or "?"

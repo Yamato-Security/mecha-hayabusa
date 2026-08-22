@@ -75,6 +75,18 @@ class ReachabilityTests(unittest.TestCase):
             csv.writer(f).writerows([["Total", "%", "Channel", "ID", "Event"], *rows])
         return path
 
+    def assertNoCorpus(self, state_dir: pathlib.Path) -> None:
+        """A refused measurement must leave no corpus recorded.
+
+        `init` seeds an empty reachability.json so a re-init cannot inherit the
+        previous dataset's figure, so absence of the file is no longer the
+        signal -- absence of a corpus inside it is.
+        """
+        path = state_dir / "reachability.json"
+        if not path.exists():
+            return
+        self.assertIsNone(json.loads(path.read_text())["corpus"])
+
     # -- measurement -----------------------------------------------------
 
     def test_eid_metrics_import_computes_absent_pairs(self) -> None:
@@ -137,12 +149,23 @@ class ReachabilityTests(unittest.TestCase):
         corpus = json.loads((state / "reachability.json").read_text())["corpus"]
         self.assertEqual(corpus["definite_absent_pairs"], 2)  # only Sys/1014 and Shell-Core
 
-    def test_duplicate_metrics_pairs_are_refused(self) -> None:
-        m = self.write_metrics("dupe.csv", [["1", "50.0%", "Sec", "4688", "a"],
-                                            ["1", "50.0%", "SEC", "4688", "b"]])
+    def test_repeated_metrics_pairs_are_summed(self) -> None:
+        # eid-metrics groups on the RAW channel but abbreviates when writing, so
+        # channels that collapse to one displayed name (the four AppLocker
+        # sub-channels, the two Security-Mitigations ones) arrive as several
+        # rows sharing a displayed key. Refusing them rejects hayabusa's own
+        # unedited output; the rows describe one collapsed identity and sum.
+        m = self.write_metrics("dupe.csv", [["1", "10.0%", "Sec", "4688", "a"],
+                                            ["4", "40.0%", "SEC", "4688", "b"],
+                                            ["5", "50.0%", "Sec", "4624", "c"]])
         r = self.reach("--eid-metrics", str(m))
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("duplicate", r.stderr + r.stdout)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((self.state_dir / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["corpus_pairs"], 2)
+        self.assertEqual(corpus["corpus_events"], 10)
+        # Sec/4688 is in the timeline, so the summed pair counts as represented.
+        self.assertEqual(corpus["represented_pairs"], 2)
+        self.assertEqual(corpus["definite_absent_events"], 0)
 
     def test_non_utf8_metrics_are_refused(self) -> None:
         m = self.state_dir.parent / "latin.csv"
@@ -217,7 +240,7 @@ class ReachabilityTests(unittest.TestCase):
                                                   ["200", "100.0%", "Sys", "1014", "c"]])
         r = self.reach("--eid-metrics", str(metrics))
         self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((self.state_dir / "reachability.json").exists())
+        self.assertNoCorpus(self.state_dir)
 
     def test_every_absent_pair_is_persisted(self) -> None:
         rows = [["100", "22.2%", "Sec", "4688", "x"],
@@ -329,12 +352,135 @@ class ReachabilityTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("exactly one", r.stderr + r.stdout)
 
-    def test_incomplete_event_identity_is_refused(self) -> None:
+    def test_a_timeline_of_only_blank_identities_is_refused(self) -> None:
+        # Nothing to compare against: the columns exist but name no event.
         tl = self.make_timeline("blank.csv", [
             ["2024-01-01 00:00:00.000 +00:00", "R", "high", "H1", "", "", "1", "x"]])
         r, _ = self.measure(tl, self.metrics_path, "blank")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("exactly one", r.stderr + r.stdout)
+        self.assertIn("columns are present but empty", r.stderr + r.stdout)
+
+    def test_a_blank_event_id_does_not_abort_the_measurement(self) -> None:
+        # metrics.rs skips a record whose EventID key is absent and counts one
+        # whose value is JSON null under the literal "null", so a blank EventID
+        # beside a RecordID is a real row hayabusa can emit, not corrupt input.
+        # It must not discard the whole measurement.
+        tl = self.make_timeline("openid.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "H1", "Sec", "4688", "1", "x"],
+            ["2024-01-01 00:01:00.000 +00:00", "Beta", "high", "H1", "Sys", "", "2", "y"]])
+        r, state = self.measure(tl, self.metrics_path, "openid")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        # Sys/1014 cannot be called absent -- the blank row may be exactly it --
+        # so it is undetermined, while Shell-Core/9707 stays definitely absent.
+        self.assertEqual(corpus["undetermined_pairs"], 1)
+        self.assertEqual(
+            sorted((e["channel"], e["event_id"]) for e in corpus["undetermined"]),
+            [("Sys", "1014")])
+        self.assertEqual(
+            sorted((e["channel"], e["event_id"]) for e in corpus["definite_absent"]),
+            [("MS-Win-Shell-Core/Op", "9707"), ("Sec", "4624")])
+        # The row carries a RecordID, so it is not counted as a correlation row.
+        self.assertEqual(corpus["correlation_rows"], 0)
+
+    def test_empty_metrics_channel_is_compared_as_missing(self) -> None:
+        # metrics.rs writes "-" only when the Channel KEY is absent; a present
+        # but empty value reaches the CSV as an empty cell. The timeline side
+        # already normalises its blank channel to "-", so the two must meet.
+        tl = self.make_timeline("nochan.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "H1", "", "4688", "1", "x"]])
+        m = self.write_metrics("nochan_m.csv", [["7", "70.0%", "", "4688", "a"],
+                                                ["3", "30.0%", "Sys", "1014", "b"]])
+        r, state = self.measure(tl, m, "nochan")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["represented_pairs"], 1)
+        self.assertEqual(corpus["definite_absent_events"], 3)
+
+    def test_event_id_case_is_folded_like_the_channel(self) -> None:
+        # metrics.rs lowercases BOTH halves of its key; the timeline prints the
+        # value as recorded. A non-numeric id must not read as two identities.
+        tl = self.make_timeline("hexid.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "H1", "Sec", "0xC0FE", "1", "x"]])
+        m = self.write_metrics("hexid_m.csv", [["8", "80.0%", "Sec", "0xc0fe", "a"],
+                                               ["2", "20.0%", "Sys", "1014", "b"]])
+        r, state = self.measure(tl, m, "hexid")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["represented_pairs"], 1)
+        self.assertEqual(corpus["definite_absent_events"], 2)
+        # The corpus spelling is what gets displayed, not the folded key.
+        self.assertEqual([(e["channel"], e["event_id"]) for e in corpus["definite_absent"]],
+                         [("Sys", "1014")])
+
+    def test_a_tiny_gap_does_not_round_away_to_zero(self) -> None:
+        # 1 absent event in 10,500,000 is 0.0000095%, which round(,2) renders as
+        # "0.0% definitely absent" -- indistinguishable from full coverage.
+        m = self.write_metrics("tiny.csv", [["10499998", "100.0%", "Sec", "4688", "a"],
+                                            ["1", "0.0%", "Sec", "4624", "b"],
+                                            ["1", "0.0%", "Sys", "1014", "c"]])
+        r = self.reach("--eid-metrics", str(m))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((self.state_dir / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["definite_absent_events"], 1)
+        self.assertGreater(corpus["absent_pct_lower"], 0.0)
+
+    def test_a_tiny_remnant_does_not_round_up_to_everything(self) -> None:
+        # The mirror image: 1 represented event in 10,500,000 ceils to "100.0%
+        # definitely absent", asserting the timeline represents nothing.
+        m = self.write_metrics("huge_gap.csv", [["1", "0.0%", "Sec", "4688", "a"],
+                                                ["1", "0.0%", "Sec", "4624", "b"],
+                                                ["10499998", "100.0%", "Sys", "1014", "c"]])
+        r = self.reach("--eid-metrics", str(m))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((self.state_dir / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["represented_pairs"], 2)
+        self.assertLess(corpus["absent_pct_upper"], 100.0)
+
+    def test_a_total_gap_still_reads_as_a_total_gap(self) -> None:
+        # The endpoint guard must not fire when the endpoint is the truth.
+        tl = self.make_timeline("none.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "H1", "Sec", "4688", "1", "x"]])
+        m = self.write_metrics("none_m.csv", [["10", "100.0%", "Sec", "4688", "a"]])
+        r, state = self.measure(tl, m, "nogap")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        corpus = json.loads((state / "reachability.json").read_text())["corpus"]
+        self.assertEqual(corpus["absent_pct_lower"], 0.0)
+        self.assertEqual(corpus["absent_pct_upper"], 0.0)
+
+    def test_init_clears_a_previous_datasets_measurement(self) -> None:
+        # Re-pointing a state directory at another timeline must not inherit the
+        # old figure: it would be published in the appendix as this dataset's.
+        self.assertEqual(self.reach("--eid-metrics", str(self.metrics_path)).returncode, 0)
+        self.assertIsNotNone(
+            json.loads((self.state_dir / "reachability.json").read_text())["corpus"])
+        (self.state_dir / "manifest.json").unlink()
+        other = self.make_timeline("other.csv", [
+            ["2024-01-01 00:00:00.000 +00:00", "Alpha", "high", "H9", "Sec", "4688", "1", "x"]])
+        again = run_state("init", "--csv", str(other), "--dir", str(self.state_dir))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNoCorpus(self.state_dir)
+
+    def test_a_measurement_of_another_timeline_is_not_published(self) -> None:
+        # Defence in depth for the same hazard: a corpus whose recorded timeline
+        # hash is not the loaded dataset's describes some other investigation.
+        self.assertEqual(self.reach("--eid-metrics", str(self.metrics_path)).returncode, 0)
+        path = self.state_dir / "reachability.json"
+        stored = json.loads(path.read_text())
+        stored["corpus"]["timeline_sha256"] = "0" * 64
+        path.write_text(json.dumps(stored), encoding="utf-8")
+        listed = self.reach("--list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("different timeline", listed.stdout)
+        self.assertNotIn("evtx corpus  :", listed.stdout)
+        # The appendix is what a reader sees, so it must withhold the figure too.
+        for lang, marker in (("en", "different timeline"), ("ja", "別のタイムライン")):
+            appendix = run_state("appendix", "--dir", str(self.state_dir), "--lang", lang)
+            self.assertEqual(appendix.returncode, 0, appendix.stderr)
+            self.assertIn(marker, appendix.stdout)
+            self.assertNotIn("59,884,494", appendix.stdout)
+            self.assertNotIn("definitely absent from the supplied timeline",
+                             appendix.stdout)
 
     def test_reason_may_not_forge_appendix_content(self) -> None:
         # --reason is rendered verbatim into the appendix; a newline would let
@@ -429,7 +575,7 @@ class ReachabilityTests(unittest.TestCase):
         r, state = self.measure(tl, m, "missing_id")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("9999", r.stderr + r.stdout)
-        self.assertFalse((state / "reachability.json").exists())
+        self.assertNoCorpus(state)
 
     def test_id_only_correlation_value_absent_from_metrics_is_refused(self) -> None:
         # The channel may be unavailable on an aggregate row, but its advertised
@@ -443,7 +589,7 @@ class ReachabilityTests(unittest.TestCase):
         r, state = self.measure(tl, m, "id_only_bad")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("9999", r.stderr + r.stdout)
-        self.assertFalse((state / "reachability.json").exists())
+        self.assertNoCorpus(state)
 
     def test_each_correlation_group_must_project_onto_the_corpus(self) -> None:
         # Global channel/ID membership is insufficient: values from a different
@@ -464,7 +610,7 @@ class ReachabilityTests(unittest.TestCase):
         ])
         r, state = self.measure(tl, m, "per_group")
         self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((state / "reachability.json").exists())
+        self.assertNoCorpus(state)
 
     def test_sparse_corpus_forces_a_multi_by_multi_mapping(self) -> None:
         # Although both displayed dimensions have several values, the corpus
@@ -586,7 +732,7 @@ class ReachabilityTests(unittest.TestCase):
                               "--eid-metrics", str(metrics))
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn("duplicate", (r.stderr + r.stdout).casefold())
-                self.assertFalse((state / "reachability.json").exists())
+                self.assertNoCorpus(state)
 
     def test_shifted_padded_metrics_row_is_rejected_atomically(self) -> None:
         # Hayabusa emits percentages as one-decimal strings with a percent sign.
