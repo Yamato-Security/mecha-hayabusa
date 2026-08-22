@@ -367,12 +367,14 @@ This records what share of corpus events belong to a `(channel, event id)` **not
 - a normal event row carries a RecordID and names exactly one channel and one event ID; or
 - a correlation summary's candidate graph against the same-corpus metrics forces a pair. A one-channel or one-event-ID summary forces every displayed pair; a sparse many-channel/many-ID graph can also force an edge when it is the only candidate for a displayed channel or ID.
 
+A blank EventID on a direct RecordID-bearing row is normalized to the concrete `null` identity used by `eid-metrics`; a literal `-` remains a concrete EventID.
+
 When a correlation summary contains several channels **and** several event IDs, those values are independently deduplicated lists and do not directly reveal their pairing. The importer intersects that row's candidate graph with the corpus, records edges forced by a single-candidate channel or ID as represented, and keeps only the remaining optional edges **undetermined**. The reported representation gap has a lower bound that excludes undetermined events and an upper bound that includes them. A *temporal* correlation may also render only its first referenced rule's result, so another required identity can be absent from the displayed fields entirely. The metric consequently describes literal identity representation in this CSV, not what the ruleset could detect or whether a source event matched a rule.
 
 Two caveats the tool states rather than hides:
 
 - **Generate both from the same evtx, unfiltered.** `state.py` cannot tell an unfiltered timeline from one restricted by time, host, level or rule selection. A filtered run legitimately omits identities that an equivalent unfiltered timeline might represent. In that case, interpret the reported gap only as a property of the supplied file; it may overstate the representation gap of an unfiltered timeline.
-- **Every comparable identity projection must match.** If a real timeline pair is absent from metrics, or a correlation row has a concrete event ID with no compatible same-row corpus edge, the import is refused rather than silently discarding that value. Displayed channels must likewise have an edge unless that same row explicitly includes a missing EventID (`-`/blank), whose source record `eid-metrics` omits by definition.
+- **Every comparable identity projection must match.** If a real timeline pair is absent from metrics, or a correlation row has a concrete event ID with no compatible same-row corpus edge, the import is refused rather than silently discarding that value. Displayed channels must likewise have an edge unless that aggregate row contains an empty EventID component. Such an omitted aggregate projection relaxes only that channel requirement; it never makes unrelated concrete IDs on the channel candidates. On direct RecordID-bearing rows, blank maps to `null` and literal `-` remains literal.
 
 **If the original evtx is not available to you**, say so explicitly rather than quietly reasoning as if the CSV were complete:
 
