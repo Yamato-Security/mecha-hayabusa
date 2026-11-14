@@ -1,5 +1,12 @@
 # Changes
 
+## 1.1.0 [2026/08/21]
+
+**New Features:**
+
+- Added evtx identity-representation measurement (`state.py reach --eid-metrics`), so an investigation can quantify which `(channel, event id)` values from the collected evtx are not unambiguously represented in the supplied timeline instead of assuming the CSV is a complete copy. RecordID-bearing event rows and correlation pairs forced by the same-corpus candidate graph count as represented; remaining optional mappings produce a lower/upper range and a persisted list of undetermined pairs. On a 7,928-file / 36.7 GiB corpus, 1,959 of 2,072 pairs — 43,981,154 of 59,884,494 events (73.4%) — were absent from the timeline's identity fields, with no undetermined pairs. Both identity components use the same Unicode lowercase normalization as `eid-metrics`, rather than broader case folding, so distinct exporter keys such as `ß` and `ss` remain distinct; rows that channel abbreviation collapses onto one displayed name — the four AppLocker sub-channels, the two Security-Mitigations ones — are summed rather than read as a tampered file. Incompatible event pairs and concrete correlation projections are refused rather than recorded as a false figure. A blank EventID on a direct RecordID-bearing row maps to the concrete corpus identity `null`, a literal `-` remains literal, and an empty aggregate component never makes unrelated concrete IDs on its channel candidates. Percentage envelopes are derived from integer event counts and rounded outward; renderers use `<0.01%` / `>99.99%` notation for nonzero values below display precision instead of moving a bound inward. (#45) (@YamatoSecurity)
+- Added the measured figure and any ambiguity range to the report appendix, together with the caveat that filtering by time, host, level or rule can inflate the representation gap, and `reach --none --reason ...` to record explicitly that the original evtx was unavailable. The comparison establishes only identity representation in the supplied timeline; it does not establish that an event matched no rule, could never be surfaced, or is absent from the logs. `init` clears any recorded measurement along with the rest of the state. Before `reach --list` or the appendix publishes a result, the current timeline bytes are re-hashed and compared with the manifest's dataset hash and the measurement's recorded timeline hash; missing, unreadable, or mismatched provenance is withheld rather than reported as this investigation's coverage. (#45) (@YamatoSecurity)
+
 ## 1.0.1 [2026/08/20]
 
 **Bug Fixes:**
